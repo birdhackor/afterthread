@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Field,
@@ -15,6 +16,7 @@ from pydantic import (
     model_validator,
 )
 
+from afterthread import utf8
 from afterthread.config import get_settings
 from afterthread.models import (
     SQLITE_MAX_INT,
@@ -538,6 +540,105 @@ ToolRunOutcome = Literal[
     "ok", "failed", "output_overflow", "timeout", "start_failed", "refused", "error"
 ]
 
+# How a revise session ended, as the loop measured it: the budget that ended its
+# tool phase, and how it failed. They mirror ``llm.FinalizeTrigger`` /
+# ``llm.RunFailure`` rather than importing them (this module stays free of the
+# service layer); tests/test_llm_stats.py pins them equal, since a value missing
+# here would fail the poll or the tools list.
+ToolStoppedBy = Literal["rounds", "conversation"]
+ToolRunFailure = Literal[
+    "empty_response",
+    "invalid_output",
+    "upstream",
+    "request_timeout",
+    "deadline",
+    "not_configured",
+]
+
+
+BackendPath = Annotated[str, AfterValidator(utf8.encodable)]
+"""A path on the backend's own filesystem, as a response states it.
+
+Validated: the text is made encodable as UTF-8 (``afterthread.utf8.encodable``,
+the definition the services use too). A name on the path, read on Linux, decodes
+with a lone surrogate for each byte that is not UTF-8, and one such character
+fails the encode of the whole response. Not covered: such a path comes back
+with replacement characters where those bytes were, so it cannot be used as it
+is to open or copy anything -- that is as far as JSON text can carry it. This is
+not masking: backend paths are not masked, and only the characters that cannot
+be encoded are changed.
+
+A response field that states a backend path takes this type.
+"""
+
+
+class ToolDraftLast(BaseModel):
+    """How the latest round of a draft ended (see ``ToolDraft``).
+
+    ``outcome`` is null for a round saved just before it published, and
+    ``interrupted`` for a round that was marked running and left no record of
+    its end (recorded by the next round that began), whose ``finished_at`` is
+    then null. ``operator_action`` and ``summary`` are the model's own notes,
+    masked with the secrets known at the time of this read; ``summary`` is an
+    excerpt. ``omitted`` counts the workspace paths that round did not keep.
+    """
+
+    stopped_by: ToolStoppedBy | None
+    failure: ToolRunFailure | None
+    outcome: Literal["published", "not_published", "failed", "interrupted"] | None
+    finished_at: str | None
+    operator_action: str | None
+    summary: str | None
+    omitted: int
+
+
+class ToolDraft(BaseModel):
+    """A tool's unfinished revision (its draft), as the tools list shows it.
+
+    ``state`` is read from the draft each time: ``running`` (a round of this
+    backend is working on it), ``unusable`` (its manifest cannot be read or is out
+    of shape, or its files are missing: it can only be discarded), ``publishing``
+    (a publish from it is in progress), ``published`` (that publish went through:
+    the version is the row's ``current_vid``), ``unknown`` (a publish from it was
+    started and whether it went through is not known), ``stale`` (``current`` is
+    no longer ``base_vid``) or ``open``. ``interrupted``: a round marked as running
+    is not running any more.
+
+    ``attempts`` is how many rounds the draft has been through. ``path`` is where
+    its files are, for the operator to open or copy (a ``BackendPath``); for an
+    unusable draft, the draft directory itself. ``draft_dir`` is the whole draft
+    directory, which a discard removes and which may hold more than the paths
+    listed here. ``kept`` are the previous files directories a continuation left
+    in the draft -- one that changed during its round, or one not confirmed
+    removable -- each a path, as long as it is not seen gone; empty when the
+    manifest cannot be read. ``discard_token`` stands for the
+    draft as it is now, whatever its manifest holds. It authorizes a discard only
+    when every look it is taken from succeeds or sees nothing there, both when it
+    is shown and when the discard looks again under the lock; otherwise it is for
+    display only, and a discard by it removes nothing.
+    ``draft_id``, ``generation``, ``attempts``, ``base_vid`` and ``last`` are null
+    when the manifest cannot be read; an unusable draft whose files are missing
+    still has them.
+    """
+
+    draft_id: str | None
+    generation: int | None
+    attempts: int | None
+    state: Literal["running", "unusable", "publishing", "unknown", "published", "stale", "open"]
+    interrupted: bool
+    base_vid: str | None
+    path: BackendPath
+    draft_dir: BackendPath
+    kept: list[BackendPath]
+    discard_token: str
+    last: ToolDraftLast | None
+
+
+class ToolDraftDiscardResponse(BaseModel):
+    """The draft was discarded; ``residual_path`` is what could not be removed, or null."""
+
+    residual_path: BackendPath | None
+
 
 class ToolLastRun(BaseModel):
     """A list row's newest run record (web-v6 §9), or null when it has none.
@@ -566,9 +667,16 @@ class ToolSummary(BaseModel):
     (bad manifest, name mismatch, missing entry file); such a package is listed
     so it can be deleted, but is never advertised to the model or executable.
 
+    ``name`` is the package directory's name, made encodable as UTF-8 (on Linux,
+    the bytes of a name that do not decode as UTF-8 come back as replacement
+    characters). A name that is not a tool name -- such a one among them -- is
+    always on a ``valid=False`` row, and every per-tool route refuses it (422):
+    that row is deleted on disk, not here.
+
     The summary text itself is fetched per tool on demand
     (``ToolSummaryDetail``), since it is far too long for a list row.
     ``last_run`` is the tool's newest run record, null when it has none.
+    ``draft`` is the tool's unfinished revision, null when it has none.
     """
 
     name: str
@@ -579,6 +687,7 @@ class ToolSummary(BaseModel):
     current_vid: str | None
     lineage: Literal["sole", "usable", "broken"]
     last_run: ToolLastRun | None = None
+    draft: ToolDraft | None = None
 
 
 class ToolListResponse(BaseModel):
@@ -590,14 +699,14 @@ class ToolListResponse(BaseModel):
 class ToolDeleteResponse(BaseModel):
     """Whether DELETE removed the files or retained a hidden parked tree.
 
-    ``retained_path`` is the exact operator-facing path when ``outcome`` is
-    ``retained``; it is null after physical removal. ``runs_deleted`` says whether
+    ``retained_path`` is the operator-facing path (a ``BackendPath``) when ``outcome``
+    is ``retained``; it is null after physical removal. ``runs_deleted`` says whether
     the tool's run records went with it (web-v6 §6.4); false leaves them to the
     purge's orphan scope.
     """
 
     outcome: Literal["removed", "retained"]
-    retained_path: str | None
+    retained_path: BackendPath | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
     runs_deleted: bool
 
@@ -606,7 +715,7 @@ class ToolDiscardResponse(BaseModel):
     """Whether discard removed the former version or retained its files."""
 
     outcome: Literal["removed", "retained"]
-    retained_path: str | None
+    retained_path: BackendPath | None
     retention_reason: Literal["durability_unconfirmed", "cleanup_failed"] | None
 
 
@@ -747,6 +856,13 @@ class ToolInstallRequest(BaseModel):
 _REVISE_RUN_IDS_MAX = 3
 
 
+# A draft's id, as the draft store mints it: 32 lowercase hex digits. The same
+# shape as ``tool_drafts.DRAFT_ID_PATTERN``, spelled here rather than importing the
+# tool subsystem into the schema layer; a test pins the two equal.
+_DRAFT_ID_PATTERN = r"^[0-9a-f]{32}$"
+_DRAFT_PAIR_INCOMPLETE = "draft_id and draft_generation go together: give both or neither"
+
+
 class ToolReviseRequest(BaseModel):
     """Payload for an AI revise job (D40): what the user wants changed.
 
@@ -764,6 +880,12 @@ class ToolReviseRequest(BaseModel):
     bound on the request itself); within it a repeated id is attached once. Each
     id is bounded like every request int bound into SQLite
     (``models.SQLITE_MAX_INT``): past it, the lookup would raise, not miss.
+
+    ``draft_id`` with ``draft_generation`` continues the tool's draft, as the page
+    saw it: both or neither (422 otherwise). Then ``feedback`` is this round's
+    note and ``run_ids`` the records newly attached, both optional -- continuing
+    is something to do on its own -- and ``expected_vid`` is the draft's
+    ``base_vid``.
     """
 
     feedback: str | None = Field(default=None, max_length=_MAX_AI_INPUT_CHARS)
@@ -771,6 +893,8 @@ class ToolReviseRequest(BaseModel):
     run_ids: list[Annotated[int, Field(ge=1, le=SQLITE_MAX_INT)]] = Field(
         default_factory=list, max_length=_REVISE_RUN_IDS_MAX
     )
+    draft_id: str | None = Field(default=None, pattern=_DRAFT_ID_PATTERN)
+    draft_generation: int | None = Field(default=None, ge=1)
 
     @field_validator("feedback")
     @classmethod
@@ -786,13 +910,29 @@ class ToolReviseRequest(BaseModel):
 
     @model_validator(mode="after")
     def _something_to_do(self) -> ToolReviseRequest:
-        if self.feedback is None and not self.run_ids:
+        if (self.draft_id is None) != (self.draft_generation is None):
+            raise ValueError(_DRAFT_PAIR_INCOMPLETE)
+        if self.draft_id is None and self.feedback is None and not self.run_ids:
             raise ValueError("feedback or run_ids is required")
         return self
 
 
+class ToolDraftPublishRequest(BaseModel):
+    """Payload for publishing a tool's draft as it is, without a model.
+
+    The draft as the page saw it -- ``draft_id`` and ``draft_generation`` -- and
+    ``expected_vid``, the draft's ``base_vid``, compared with ``current`` after the
+    global slot is taken like every version-specific write. All three are required.
+    """
+
+    draft_id: str = Field(pattern=_DRAFT_ID_PATTERN)
+    draft_generation: int = Field(ge=1)
+    expected_vid: str = Field(pattern=_TOOL_VID_PATTERN)
+
+
 class ToolInstallAccepted(BaseModel):
-    """202 body for a queued install or revise: the id to poll."""
+    """202 body for a queued tool job -- an install, a revise, a health check, a
+    draft's publish: the id to poll."""
 
     job_id: str
 
@@ -828,8 +968,61 @@ class ToolVerification(BaseModel):
     finished: bool
 
 
+class ToolJobDraft(BaseModel):
+    """What became of a revise round's draft (see ``ToolJobStatus.draft``).
+
+    ``saved``: the draft holds this round's work. ``reason`` says why it does not,
+    or, on a published revise, that the draft could not be taken away.
+    ``attempts`` is how many rounds the draft has been through, for the card's
+    "round N". ``retained_path`` is where the round's work is kept outside the
+    draft, when that place is known: with ``saved`` false the work is there and
+    not in the draft; with ``saved`` true the draft's manifest was not confirmed
+    on disk, so the work was left there as well. It is the round's staging
+    directory, or a version directory under ``versions/`` that ``current`` does
+    not name, into which a publish that failed part way had moved the work.
+    """
+
+    saved: bool
+    draft_id: str | None
+    generation: int | None
+    attempts: int | None
+    reason: str | None
+    retained_path: BackendPath | None
+
+
+class ToolJobDraftPublish(BaseModel):
+    """What a ``publish_draft`` job did with the draft it published (see ``ToolJobStatus``).
+
+    ``draft_id`` is that draft. ``generation`` is the draft's generation as the job
+    left it: after the job's last write to its manifest -- the ``publishing`` mark,
+    or the write taking that mark back -- or as it was judged when the job wrote
+    nothing to it. A page compares it with the draft the tools list shows.
+
+    ``removed``: ``draft/`` was seen gone after the publish; only a published job
+    has it true. ``reason``, on a published job, is why the draft stays -- it holds
+    what the version does not (and the paths not brought in, when any), it holds
+    more than what was published or something else, that could not be told, or
+    its removal did not complete; null when it was removed. On a job that
+    published nothing, it is set only when the job's ``publishing`` mark could not
+    be taken back and stays on the draft.
+
+    ``retained_path`` is where the copy the job tried to publish is kept, when the
+    publish failed: its staging directory, when the draft is not seen to still
+    hold what that copy holds and the publisher did not refuse that directory as
+    not the one it was given; or the version directory under ``versions/`` --
+    which ``current`` does not name -- that the failed publish had moved it into.
+    Null otherwise.
+    """
+
+    draft_id: str
+    generation: int
+    removed: bool
+    reason: str | None
+    retained_path: BackendPath | None
+
+
 class ToolJobStatus(BaseModel):
-    """One install/revise job's visible state, as polled by the 工具 page.
+    """One tool job's visible state, as polled by the 工具 page.
 
     ``state`` walks queued -> running -> succeeded | failed. ``error`` is the
     friendly zh-TW failure text (failed only); ``tool_name``/``summary`` are
@@ -849,22 +1042,51 @@ class ToolJobStatus(BaseModel):
     the link so the AI 日誌 page can refuse to resolve it (R9-1); the backend
     cannot catch this one alone, because it never SERVES a stale id.
 
-    One model for BOTH job kinds (D40 renamed it from ``ToolInstallJobStatus``
-    without touching a field): an install writes a package into the tools
-    directory and a revise adds a version to one and moves ``current``, and both
-    report through one job table and one poll endpoint. ``env_keys`` names
+    One model for every job kind: an install writes a package into the tools
+    directory, a revise or a draft's publish adds a version to one and moves
+    ``current``, and every kind reports through one job table and one poll
+    endpoint (``routers.tools.tool_job_status``). ``env_keys`` names
     assignments from a builder-written ``.env`` that the backend stripped;
     values never enter the result.
 
-    ``kind`` says which job it is: ``install``, ``revise``, or ``health_check``
-    (跑一次範例, web-v6 §10). ``verification`` is the run of the version's
-    examples -- a health check's whole result, or the check that follows a
-    published revise -- and is filled in while the job runs.
+    ``kind`` says which job it is: ``install``, ``revise``, ``health_check``
+    (跑一次範例), or ``publish_draft`` -- a tool's draft published as it is, with
+    no model. ``verification`` is the run of the version's examples --
+    a health check's whole result, or the check that follows a published revise
+    or draft -- and is filled in while the job runs.
 
     ``outcome`` (web-v6 §8.3) is how a TERMINAL job ended, finer than ``state``:
     ``published``, ``not_published`` (the builder itself declined to publish --
     possibly an outside cause, possibly a fix it could not make; the card says
     neither), or ``failed``. Null while queued/running.
+
+    A finished revise whose builder session ran also says how that session ended,
+    as the backend MEASURED it (``llm.StructuredRunStats``), never as the model
+    tells it: ``stopped_by`` is the budget that ended the tool phase (``rounds``
+    -- ``rounds_used`` reached ``max_rounds`` -- or ``conversation``, the
+    conversation size; null when neither did), ``failure`` how the session failed
+    (``empty_response``, ``invalid_output``, ``upstream``, ``request_timeout`` --
+    a single request timed out: the SDK's per-request ``OPENAI_TIMEOUT_SECONDS``,
+    or a timeout the request raised itself, not the session's own time --,
+    ``deadline`` -- the whole session's time ran out --, ``not_configured``),
+    null when it returned an answer. Both can be set at once: the round budget
+    forced the final answer, and that answer came back empty. ``handoff`` and
+    ``operator_action`` are the model's own notes (what is done and left; what
+    the operator must do by hand), already masked, for display only. All six are
+    null for an install, a health check, a revise that failed before its session
+    started, and a job that ended in an unexpected error.
+
+    ``draft`` is what became of the round's draft (``ToolJobDraft``): null when
+    the round had nothing to keep, when it published and its draft was taken
+    away, when its commands or writes could not be confirmed stopped (nothing is saved then;
+    ``error`` names the workspace kept in place), and wherever the six above are
+    null -- a ``publish_draft`` job included.
+
+    ``draft_publish`` is what a ``publish_draft`` job did with the draft it
+    published (``ToolJobDraftPublish``); null for every other kind, while the job
+    runs, and for one that ended in the unexpected-error backstop. Such a job
+    calls no model, so ``summary``, ``llm_log_id`` and the six above are null,
+    ``env_keys`` is empty, and ``outcome`` is ``published`` or ``failed``.
     """
 
     job_id: str
@@ -878,8 +1100,16 @@ class ToolJobStatus(BaseModel):
     llm_log_process: str | None
     env_keys: list[str]
     outcome: Literal["published", "not_published", "failed"] | None
-    kind: Literal["install", "revise", "health_check"] = "install"
+    kind: Literal["install", "revise", "health_check", "publish_draft"] = "install"
     verification: ToolVerification | None = None
+    stopped_by: ToolStoppedBy | None = None
+    failure: ToolRunFailure | None = None
+    rounds_used: int | None = None
+    max_rounds: int | None = None
+    handoff: str | None = None
+    operator_action: str | None = None
+    draft: ToolJobDraft | None = None
+    draft_publish: ToolJobDraftPublish | None = None
 
 
 class ToolSettingsEntry(BaseModel):
@@ -1015,9 +1245,10 @@ class ToolRunPurgeRequest(BaseModel):
 
     Every condition narrows: ``tool`` (one package name), ``outcome`` (``ok`` or
     ``not_ok`` -- anything but a success, refusals included), ``before`` (records
-    that started before this instant), ``orphans_only`` (records whose package no
-    longer exists). ``before`` is absolute so that the preview and the
-    confirmation count the same records; the page computes it once.
+    that started before this instant), ``orphans_only`` (records whose package is
+    seen gone: a look that fails makes no orphan, nor does a link at the name
+    that leads to a directory). ``before`` is absolute so that the preview and
+    the confirmation count the same records; the page computes it once.
 
     ``dry_run`` (the default) only counts. A real run must carry the ``max_id``
     its preview returned and deletes nothing newer than it.
@@ -1060,8 +1291,10 @@ class ToolRunStatsEntry(BaseModel):
 class ToolRunStats(BaseModel):
     """Run-record counts for the 工具 page header (web-v6 §7).
 
-    ``orphans`` counts records whose package no longer exists (zero while
-    TOOLS_DIR is unset, when no name can be judged).
+    ``orphans`` counts records whose package is seen gone -- a look that fails
+    does not count, nor does a link at the name that leads to a directory -- and
+    is zero while TOOLS_DIR is unset or not a directory, when no name can be
+    judged.
     """
 
     total: int

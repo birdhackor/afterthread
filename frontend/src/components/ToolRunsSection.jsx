@@ -20,10 +20,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { useState } from "react";
 import { apiDelete, apiGet } from "../api/client.js";
+import { toolApiPath } from "../api/toolPaths.js";
 import { SECTION_MAX_LENGTH } from "../constants/sections.js";
 import { formatDuration, formatTimestamp } from "../utils/format.js";
 import { codePointLength } from "../utils/text.js";
 import { canRunExamples, verificationStateText } from "../utils/toolChecks.js";
+import { recordFixView } from "../utils/toolDraft.js";
 import {
 	runDetailSections,
 	runHasDetails,
@@ -40,6 +42,7 @@ import {
 } from "../utils/toolRunsPurge.js";
 import { logLinkSearch } from "../utils/toolSummary.js";
 import { CharCounter } from "./CharCounter.jsx";
+import { ReviseBlockedNote } from "./ReviseBlockedNote.jsx";
 import { ToolRunsPurgeDialog } from "./ToolRunsPurgeDialog.jsx";
 
 // Bounded, whitespace-preserving box for a body (up to 16,000 chars of stderr):
@@ -65,31 +68,58 @@ const STALE_LIST_NOTE =
 // whose contents the operator does not want kept) from its detail, or many
 // from the 清除紀錄 menu, which previews before it deletes (web-v6 §7).
 //
-// `onFix(runIds, feedback?)` is the one-click fix (web-v6 §8): null when the tool
-// has no version a revise could start from, `fixBlocked` the page's gate for
-// every AI write. Only a record the backend marked `fixable` offers it -- and
-// `fixable` is the backend's judgement AT FETCH TIME, so the buttons also wait
-// while this list is refetching or after a refetch failed: the copy on screen
-// may predate a fix that already published (a re-expanded row renders its
-// cached list first), and a click would pay for a builder session on a record
-// the backend no longer offers. The same rule as 送出修訂's displayedMayBeStale.
+// `onFix(runIds)` is the one-click fix and `onSendNoted` sends its 加上說明…
+// dialog (below): both null when the tool has no version a revise could start
+// from, and a record offers neither unless both are given. `fixBlocked` is the
+// page's gate for every AI write. Only a record the backend marked `fixable`
+// offers the fix -- and `fixable` is the backend's judgement AT FETCH TIME, so the
+// buttons also wait while this list is refetching or after a refetch failed, and
+// so does the dialog's submit: the copy on screen may predate a fix that already
+// published (a re-expanded row renders its cached list first), and a click would
+// pay for a builder session on a record the backend no longer offers. The same
+// rule as 送出修訂's displayedMayBeStale.
 //
 // The section also says how the current version did on its examples.json
 // (web-v6 §9) and offers 跑一次範例 (`onCheck`, a job in the same gate).
+//
+// `recordFix` is what a record's fix is for the tool's draft as the row shows it now
+// (recordFixView): with a draft that can be continued, 接續修正（附上這筆） -- the
+// round continues the draft and attaches the record, and 加上說明… adds words to
+// that round; with a draft in any other state, the fix is off and
+// `recordFix.blockedReason` says why. The reason turns off the record's two buttons
+// and is said under each record that has them, since a list of records is as long
+// as the operator's failures and one sentence above it would soon be a screen away
+// from the control it explains.
+//
+// The one-click fix calls `onFix(runIds)`, and the page sends what recordFixView
+// says for the row at the click. 加上說明… keeps `recordFix` as it is when its dialog
+// opens: the dialog's words come from it, and its submit sends that fix -- the draft
+// it continued then, or a revise that starts over -- with the record and the words,
+// through `onSendNoted(target, feedback)`, whatever the list shows by then
+// (toolDraft.reviseVariables). 跑一次範例 is not a revise and answers to `fixBlocked`
+// alone.
 export function ToolRunsSection({
 	name,
 	expanded,
 	onFix = null,
+	onSendNoted = null,
 	fixBlocked = false,
+	recordFix = recordFixView(null),
 	isSubmittingFix = false,
 	onCheck = null,
 	isSubmittingCheck = false,
 }) {
 	const [purgeTarget, setPurgeTarget] = useState(null);
-	const [noteRun, setNoteRun] = useState(null);
+	// The record a 加上說明… dialog was opened for and the fix it opened on
+	// ({ run, fix }), and whether that dialog is open. The pair is replaced at the
+	// next open, not cleared at the close, so the dialog's title and text stay as
+	// they were while it closes.
+	const [note, setNote] = useState(null);
+	const [noteOpen, setNoteOpen] = useState(false);
 	const { data, error, isError, isFetching } = useQuery({
 		queryKey: toolRunsQueryKey(name),
-		queryFn: () => apiGet(`/api/tools/${name}/runs?limit=${TOOL_RUNS_LIMIT}`),
+		queryFn: () =>
+			apiGet(`${toolApiPath(name, "runs")}?limit=${TOOL_RUNS_LIMIT}`),
 		enabled: expanded,
 	});
 
@@ -139,7 +169,10 @@ export function ToolRunsSection({
 			</Stack>
 		);
 	}
-	const blocked = fixBlocked || isFetching || isError;
+	// This list's records were judged `fixable` when it was read, so nothing is
+	// sent from it while it is being read again or the read failed.
+	const listBlocked = fixBlocked || isFetching || isError;
+	const blocked = listBlocked || recordFix.blockedReason !== null;
 	return (
 		<Stack gap="xs" pt="xs">
 			{/* Reached with data in hand: a BACKGROUND refetch failed and left the
@@ -185,24 +218,34 @@ export function ToolRunsSection({
 					name={name}
 					run={run}
 					fix={
-						run.fixable && onFix
+						run.fixable && onFix && onSendNoted
 							? {
 									blocked,
+									label: recordFix.label,
+									blockedReason: recordFix.blockedReason,
 									submitting: isSubmittingFix,
 									now: () => onFix([run.id]),
-									withNote: () => setNoteRun(run),
+									withNote: () => {
+										setNote({ run, fix: recordFix });
+										setNoteOpen(true);
+									},
 								}
 							: null
 					}
 				/>
 			))}
 			<FixNoteModal
-				run={noteRun}
-				blocked={blocked}
-				onClose={() => setNoteRun(null)}
+				opened={noteOpen}
+				fix={note?.fix ?? null}
+				blocked={listBlocked}
+				onClose={() => setNoteOpen(false)}
 				onSubmit={(feedback) => {
-					onFix?.([noteRun.id], feedback);
-					setNoteRun(null);
+					const target = {
+						continuation: note.fix.continuation,
+						runIds: [note.run.id],
+					};
+					setNoteOpen(false);
+					onSendNoted?.(target, feedback);
 				}}
 			/>
 			<ToolRunsPurgeDialog
@@ -251,7 +294,7 @@ function ToolRunRow({ name, run, fix }) {
 							loading={fix.submitting}
 							onClick={fix.now}
 						>
-							請 AI 修正
+							{fix.label}
 						</Button>
 						<Button
 							size="compact-xs"
@@ -261,6 +304,7 @@ function ToolRunRow({ name, run, fix }) {
 						>
 							加上說明…
 						</Button>
+						<ReviseBlockedNote reason={fix.blockedReason} />
 					</>
 				) : null}
 			</Group>
@@ -389,8 +433,12 @@ function ToolRunDetail({ name, run, expanded }) {
 }
 
 // 加上說明… (web-v6 §8.1): the same fix, with words. The record rides along; the
-// note is optional, and bounded like every other AI input.
-function FixNoteModal({ run, blocked, onClose, onSubmit }) {
+// note is optional, and bounded like every other AI input. Its title and words
+// follow `fix`, the record's fix as the dialog opened on it (recordFixView): a round
+// that continues the draft says so. A list read again behind the open dialog does not
+// change them, as it does not change what is sent; `blocked` is the write gate and
+// this list's own reading, not the draft.
+function FixNoteModal({ opened, fix, blocked, onClose, onSubmit }) {
 	const [note, setNote] = useState("");
 	const tooLong = codePointLength(note.trim()) > SECTION_MAX_LENGTH;
 	// Every way out clears the draft, so the next record never opens with a note
@@ -400,17 +448,9 @@ function FixNoteModal({ run, blocked, onClose, onSubmit }) {
 		onClose();
 	};
 	return (
-		<Modal
-			opened={run !== null}
-			onClose={close}
-			title="請 AI 修正這次失敗"
-			centered
-		>
+		<Modal opened={opened} onClose={close} title={fix?.noteTitle} centered>
 			<Stack gap="sm">
-				<Text size="sm">
-					這次失敗的參數與錯誤輸出會一起交給 AI。想補充背景（例如這個 API
-					最近改了什麼）就寫在下面，可以留空。
-				</Text>
+				<Text size="sm">{fix?.noteIntro}</Text>
 				<div>
 					<Textarea
 						label="補充說明（選填）"
@@ -435,7 +475,7 @@ function FixNoteModal({ run, blocked, onClose, onSubmit }) {
 							onSubmit(feedback);
 						}}
 					>
-						送出修正
+						{fix?.noteSubmit}
 					</Button>
 				</Group>
 			</Stack>

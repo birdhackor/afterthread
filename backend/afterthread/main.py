@@ -89,16 +89,18 @@ def _configure_secret_redaction() -> None:
     subsystem to learn what those secrets are (that would couple the log store to
     tools/tool_builder). Instead it exposes ``set_secret_provider`` and this --
     the application entrypoint, the one place that already knows the whole
-    dependency graph -- injects ``tools.known_secret_values``. This mirrors
+    dependency graph -- injects ``tools.known_secrets_for_log``. This mirrors
     ``_configure_app_logging``'s stance exactly: a library-style module decides
     only HOW it behaves; the app decides the wiring, here, once, at import time
     (before ``app = FastAPI(...)``), so redaction is in effect for every
     interaction the process ever records.
 
-    Safe by construction: llm_log calls the provider inside its own
-    ``except Exception`` guard (the no-observer-failure invariant), so this
-    wiring can only ever ADD redaction and never put the recorder at risk, even
-    if ``known_secret_values`` were to fail.
+    Safe by construction: the provider never raises -- it answers whether the
+    values it gives are all of them -- and llm_log calls it inside its own
+    ``except Exception`` guard as well (the no-observer-failure invariant), so
+    this wiring never puts the recorder at risk. A list that is not whole makes
+    llm_log store, in place of each body, a marker saying the body was not recorded
+    (``llm_log._UNCHECKED_MARKER``), never a body checked against part of the list.
 
     The same inversion wires the tool-call ARGS redactor (M4): ``llm.py`` cannot import
     the tool subsystem (tools.py imports llm for LlmTool -- a cycle), so it exposes
@@ -107,7 +109,7 @@ def _configure_secret_redaction() -> None:
     slice. Unlike the observer-direction llm_log provider, that redactor is on the
     recorder-feeding preview path and fails CLOSED (redact-or-nothing).
     """
-    llm_log.set_secret_provider(tools_service.known_secret_values)
+    llm_log.set_secret_provider(tools_service.known_secrets_for_log)
     llm.set_tool_args_redactor(tools_service.redact_known_secrets)
 
 
@@ -196,6 +198,26 @@ async def _validation_exception_handler(
     """
     detail = _strip_input_keys(jsonable_encoder(exc.errors()))
     return JSONResponse(status_code=422, content={"detail": detail})
+
+
+@app.exception_handler(tools_service.OperatorFacingError)
+async def _operator_facing_error_handler(
+    _request: Request, exc: tools_service.OperatorFacingError
+) -> JSONResponse:
+    """500 carrying the failure's own message, for a failure written for the operator.
+
+    ``tools.OperatorFacingError``'s message names only paths, tool names, type
+    names and what to do next, so it goes out as it is, under the class's
+    ``code``, in the shape the frontend's error parsing reads
+    (``detail.code``/``detail.message``): a route that meets one -- the tools
+    list, the run records, the settings, an AI request -- says what to fix
+    instead of a bare 500. Without its closing full stop, since a page may go on
+    after the message (the tools list's note on a stale list does). Every other
+    exception keeps the plain 500.
+    """
+    _logger.warning("%s: %s", exc.code, exc)
+    message = str(exc).removesuffix("。")
+    return JSONResponse(status_code=500, content={"detail": {"code": exc.code, "message": message}})
 
 
 app.include_router(items.router, prefix="/api")

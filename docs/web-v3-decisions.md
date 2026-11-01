@@ -62,6 +62,7 @@
 - **已記錄殘餘限制**：使用者若仍把 key 貼在 instructions（不用欄位），且該值不匹配任何已知秘密，仍會被記錄——文件引導用欄位是第一線，遮蔽是已知值的兜底。
 - **第二輪對抗式複審（fd5acba 後）**：1 High + 7 Medium，裁決 7 修 1 won't-fix：
   1. **H1 秘密經 run_shell echo 進 live 對話再流入 summary/job state**（recorder 只遮快照不改 live messages）→ 修類：tools.py 共用 `redact_known_secrets()` 套在 runtime 工具輸出、builder 全部 meta-tool 輸出（進對話前遮，模型只看得到遮蔽標記）、InstallOutcome summary/error 存 job 前。
+     - **更正（`docs/web-v7-decisions.md` 的 D55）**：「模型只看得到遮蔽標記」只對被遮蔽的那段文字本身成立。遮蔽之後才接上的前綴、標題或標記，能和輸出拼出已知值；這要登記的值本身含那段後端文字才會發生。
   2. **422 經 Pydantic `input` 回射 secret_value** → app 層 RequestValidationError handler 全域遞迴剝除 `input`（防未來任何敏感欄位的整類修法）。
   3. **schema 允許 <6 字元但遮蔽器跳過** → schema 對齊 ≥6 + FE 鏡像。
   4. **重疊秘密遮蔽順序**（先短後長留尾巴）→ 長度遞減排序替換（兩處遮蔽器皆改）。

@@ -14,7 +14,9 @@ version identity; a call runs that exact version with its directory as cwd.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import contextlib
+import errno
 import fcntl
 import io
 import json
@@ -25,21 +27,23 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import IO, Any, Literal
+from typing import IO, Any, ClassVar, Literal
 from uuid import uuid4
 
 from dotenv import dotenv_values
 from starlette.concurrency import run_in_threadpool
 
+from afterthread import utf8
 from afterthread.config import get_settings
 from afterthread.services import llm_log
 from afterthread.services.llm import LlmTool, current_interaction, tool_exception_text
@@ -52,8 +56,9 @@ _logger = logging.getLogger("afterthread.tools")
 # A package (and directory) name: lowercase alnum start, then up to 63 more of
 # alnum/underscore/hyphen. Admits no ".", "/", or whitespace, so a traversal
 # name (``".."``, ``"../evil"``, ``"/etc/x"``) can never match -- the regex is
-# the first line of the path-traversal defense, backed by the resolved-path
-# containment check in ``_resolve_package_dir``.
+# the first line of the path-traversal defense, backed by the check in
+# ``_resolve_package_dir_no_alias`` that what the resolve gave is exactly
+# ``<tools_dir>/<name>``.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _VID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$")
 _META_DIRNAME = ".afterthread.meta"
@@ -174,6 +179,10 @@ _AI_META_FILENAME = ".ai_meta.json"
 # property (at the same ratio) every other capped read in this module has.
 _AI_META_MAX_BYTES = 256 * 1024
 
+# The shape ``datetime.now(UTC).isoformat()`` gives: the ``updated_at`` a summary
+# sidecar is written with (``store_summary_meta``).
+_UTC_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?\+00:00\Z")
+
 # Legacy flat-layout state name retained for migration and builder-content policy.
 # The live toggle now belongs to package-layer
 # ``.afterthread.meta/state.json`` and never falls back to ``tool.json``.
@@ -254,11 +263,34 @@ _TOOL_SUMMARY_CAP = 8000
 # apart from a truncated item section or a truncated log body.
 _OUTPUT_TRUNCATION_MARKER = "…[工具輸出過長已截斷]"
 
-# How long the bounded reader is given to drain pipes and reap AFTER the process
-# group has already been SIGKILLed on timeout. The group is dead, so this
-# returns effectively immediately; it exists only so a wedged pipe can never
-# turn cleanup itself into a hang.
+# The one time limit of the teardown in ``_communicate_bounded``, counted from the
+# moment it starts. With ``on_reaped``, it bounds the re-sent group kill, the watch
+# for the group to be gone, and the join of the reader/writer threads; the reap of
+# the leader has no bound. One limit is enough because once the group is gone no
+# member holds a write end of the pipes, so the readers hit EOF and the join
+# completes at once -- the waits need no adding up. Without ``on_reaped`` it bounds
+# only the join, and each thread is given the whole limit, purely so a wedged pipe
+# can never turn cleanup itself into a hang.
 _REAP_TIMEOUT_SECONDS = 5.0
+
+# Whether one SIGKILL to a process group can miss a member forked while it is
+# being sent. XNU's ``killpg`` first collects the group's members and then
+# signals them one by one, so a child that a member forks meanwhile is on no list
+# and is never signalled. Linux misses none: ``copy_process`` holds a group signal
+# that arrives during a fork for the new child as well. Where a miss is possible,
+# the teardown in ``_communicate_bounded`` sends the kill again
+# (``_resend_group_kill``).
+_GROUP_KILL_CAN_MISS_A_FORK = sys.platform == "darwin"
+
+# The pause between those re-sent kills. A send reaches every member alive when it
+# is sent, so another is needed only for those forked while the one before it was
+# being delivered -- a count the pause does little to change. What the pause sets
+# is how long the sends take, and what a loop that runs to the time limit costs --
+# a member stuck in an uninterruptible wait in the kernel keeps answering signal 0
+# however often it is sent SIGKILL. At one millisecond the first is a few
+# milliseconds, and the second one round of two cheap system calls for each
+# millisecond of the limit.
+_GROUP_KILL_RESEND_SECONDS = 0.001
 
 # Poll interval for the NON-reaping wait that watches the tool leader for exit
 # (see _communicate_bounded). We cannot block in ``proc.wait`` there: reaping the
@@ -266,7 +298,8 @@ _REAP_TIMEOUT_SECONDS = 5.0
 # instead poll ``os.waitid`` with WNOWAIT (detect exit WITHOUT reaping) under our
 # own deadline. The only cost of polling over blocking is up to ONE interval of
 # added latency detecting a natural exit; 25 ms is imperceptible for a local tool
-# call yet keeps the poll loop's CPU wake-ups negligible.
+# call yet keeps the poll loop's CPU wake-ups negligible. The teardown's watch for
+# the group to be gone (``_group_seen_gone_by``) polls at the same pace.
 _WAIT_POLL_SECONDS = 0.025
 
 # Chunk size for the bounded incremental pipe reads (see _communicate_bounded).
@@ -428,11 +461,62 @@ def tools_dir() -> Path | None:
     ``VersionRoot`` one spelling. It deliberately does not resolve a package
     child: package/version symlink refusals still inspect their own final
     components before anything follows them.
+
+    Resolved with errors raised, except where a look on the way sees nothing
+    there. Components which do not exist yet are kept as written
+    (``ALLOW_MISSING``), so a tools directory not created yet still has its
+    path. A component that is a file (``ENOTDIR``) means as surely that no
+    directory is there: the configured path is returned as it is, made absolute
+    only -- not resolved, its ``..`` kept -- so every look under it sees nothing
+    there too. Any other failure of a look on the way -- a directory above it
+    that cannot be searched, a link loop, an I/O error -- raises
+    ``ToolsDirUnresolvedError``: a lookup that skipped it would read a link it
+    could not see as no link, fold the ``..`` after it as text, and answer with
+    another directory. It is never turned into None, which means the feature is
+    off.
     """
     raw = get_settings().tools_dir.strip()
     if not raw:
         return None
-    return Path(raw).expanduser().resolve()
+    configured = os.path.expanduser(raw)
+    try:
+        try:
+            return Path(os.path.realpath(configured, strict=os.path.ALLOW_MISSING))
+        except NotADirectoryError:
+            return Path(configured).absolute()
+    except OSError as exc:
+        raise ToolsDirUnresolvedError(configured, type(exc).__name__) from exc
+
+
+class OperatorFacingError(Exception):
+    """A failure whose message is written for the operator, to be shown as it is.
+
+    The message names only paths, tool names, failure type names and what to do
+    next: never a value, never a failure's own text. The API answers one as a 500
+    carrying that message under ``code`` (``main``), and an install or revise job
+    that ends on one shows it as the job's error (``tool_builder._run_job``).
+    """
+
+    code: ClassVar[str]
+
+
+class ToolsDirUnresolvedError(OperatorFacingError):
+    """The configured tools directory's path could not be looked up (``tools_dir``).
+
+    ``path`` is the configured path, ``error`` the failure's type name, never its
+    text. The message names those two and what to do next.
+    """
+
+    code = "tools_dir_unresolved"
+
+    def __init__(self, path: str, error: str) -> None:
+        self.path = path
+        self.error = error
+        super().__init__(
+            f"無法解析工具目錄的設定路徑 {_utf8_safe(path)}（{error}）。"  # noqa: RUF001
+            "請檢查這個路徑上層各目錄的權限、連結與磁碟狀態後重試，"  # noqa: RUF001
+            "或清空 TOOLS_DIR 設定（工具功能隨之關閉）。"  # noqa: RUF001
+        )
 
 
 _REQUEST_TOOLS_LOCK_FD: ContextVar[int | None] = ContextVar("_REQUEST_TOOLS_LOCK_FD", default=None)
@@ -547,9 +631,10 @@ def acquire_shared_tools_lock() -> int | None:
     """Take the request-wide shared lock, blocking only behind a destroyer.
 
     ``None`` means the feature is unconfigured or its root does not exist, in
-    which case no installed tool can be advertised. The router calls this on a
-    worker before scanning/advertising and holds the returned descriptor through
-    the complete LLM request.
+    which case no installed tool can be advertised. A coroutine takes it through
+    ``acquire_shared_tools_lock_async``: the router does so before
+    scanning/advertising and holds the returned descriptor through the complete
+    LLM request.
     """
 
     base = tools_dir()
@@ -565,10 +650,83 @@ def acquire_shared_tools_lock() -> int | None:
 
 
 def release_tools_lock(fd: int | None) -> None:
-    """Close one parent reference; the kernel releases on the last reference."""
+    """Close one parent reference; the kernel releases on the last reference.
+
+    A close never waits behind another holder, so a coroutine calls it directly
+    in its ``finally``: an await there can be stopped before it runs by a
+    cancellation still in force (an anyio scope's), which would leave the
+    reference open.
+    """
 
     if fd is not None:
         os.close(fd)
+
+
+class _LockHandover:
+    """Where a worker thread hands a lock descriptor to the coroutine waiting for it.
+
+    Whichever side comes second closes it: the worker, when the waiter has
+    already given up by the time it has the descriptor; the waiter, when it
+    gives up after the worker handed it over. Both answer under one
+    ``threading.Lock``, so exactly one of them closes it, in either order.
+    ``close`` is how (``release_tools_lock``).
+    """
+
+    def __init__(self, close: Callable[[int], None] = release_tools_lock) -> None:
+        self._guard = threading.Lock()
+        self._abandoned = False
+        self._handed: int | None = None
+        self._close = close
+
+    def hand_over(self, fd: int | None) -> int | None:
+        """The worker's side: ``fd`` for the waiter, or None, having closed ``fd``,
+        when the waiter has already given up."""
+        if fd is None:
+            return None
+        with self._guard:
+            if not self._abandoned:
+                self._handed = fd
+                return fd
+        self._close(fd)
+        return None
+
+    def abandon(self) -> None:
+        """The waiter's side, giving up: nothing is handed over from now on, and a
+        descriptor already handed over is closed."""
+        with self._guard:
+            self._abandoned = True
+            fd, self._handed = self._handed, None
+        if fd is not None:
+            self._close(fd)
+
+
+async def acquire_shared_tools_lock_async() -> int | None:
+    """``acquire_shared_tools_lock`` for a coroutine: taken on a worker thread, and
+    handed back however the wait ends.
+
+    The worker and the waiter meet in a ``_LockHandover``, and whichever comes
+    second closes the descriptor. A wait that ends before the worker hands it
+    over -- a plain ``Task.cancel`` ends it at once, the worker perhaps still
+    waiting for the lock -- leaves the worker to close what it takes; a wait that
+    ends after closes it itself. A cancellation that waits for the worker (an
+    anyio scope's) does not end the wait: the descriptor is returned, and the
+    caller's next await raises inside the ``try`` that releases it. A failure of
+    the acquisition itself goes out as it is, with no descriptor: the acquisition
+    closes its own.
+
+    The caller owns a returned descriptor: it enters the ``try`` whose
+    ``finally`` calls ``release_tools_lock`` before any other await.
+    """
+    handover = _LockHandover()
+
+    def _acquire() -> int | None:
+        return handover.hand_over(acquire_shared_tools_lock())
+
+    try:
+        return await run_in_threadpool(_acquire)
+    except BaseException:
+        handover.abandon()
+        raise
 
 
 @contextlib.contextmanager
@@ -649,10 +807,7 @@ def _valid_entry(entry: Any) -> bool:
 def _is_within(base: Path, candidate: Path) -> bool:
     """True when the RESOLVED ``candidate`` lies at or under the RESOLVED ``base``.
 
-    ``relative_to`` raises ValueError when it does not -- the containment test
-    used both to validate an entry file (it must live inside its package) and to
-    hard-block a package path that escapes ``tools_dir`` (a symlink, a traversal
-    name that somehow reached here).
+    ``relative_to`` raises ValueError when it does not.
     """
     try:
         candidate.relative_to(base)
@@ -711,24 +866,74 @@ def _read_regular_file_capped(path: Path, cap: int) -> str | None:
     OWNERSHIP of the fd, so once it succeeds its context manager owns the close;
     ``fd_owned`` tracks the handoff so the ``finally`` closes the raw fd on exactly
     the paths that never reached ``fdopen`` (never a double close).
+
+    The read itself is ``_read_regular_text_capped``, which also says why there is
+    no text; this keeps only the text, so missing, refused and failed are all None.
+    """
+    return _read_regular_text_capped(path, cap).text
+
+
+@dataclass(frozen=True, slots=True)
+class _CappedText:
+    """One ``_read_regular_text_capped``: the text, or why there is none.
+
+    ``text`` is None exactly when ``refusal`` is set:
+
+    * ``"absent"`` -- the open found nothing there (``ENOENT``, ``ENOTDIR``);
+    * ``"not_regular"`` -- what is there is not read: the final component is a
+      link the open would not follow (a ``lstat`` saw the link itself), or
+      ``fstat`` of what opened is not a regular file;
+    * ``"failed"`` -- any other failure to open, look at or read it, the
+      ``ELOOP`` of a link loop above it included; ``error`` is its type name.
+
+    ``identity`` is ``(st_dev, st_ino, st_mtime_ns, st_ctime_ns, st_size)`` from
+    the ``fstat`` of the descriptor the text was read from.
+    """
+
+    text: str | None
+    refusal: Literal["absent", "not_regular", "failed"] | None = None
+    error: str | None = None
+    identity: tuple[int, int, int, int, int] | None = None
+
+
+def _is_link_itself(path: Path) -> bool:
+    """Whether a ``lstat`` of ``path`` sees a link; False when the look fails."""
+    try:
+        return stat.S_ISLNK(os.lstat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _read_regular_text_capped(path: Path, cap: int) -> _CappedText:
+    """``_read_regular_file_capped``'s read, saying why it has no text (``_CappedText``).
+
+    The same open flags, the same regular-file gate, the same decoding and the
+    same ``cap + 1`` bound; only the answer is fuller. An ``ELOOP`` from the open
+    is a link the open refused to follow only when a ``lstat`` sees the final
+    component is one; a loop among the directories above it is a failure.
     """
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    except OSError:
-        # Missing (ENOENT), a symlinked leaf O_NOFOLLOW refused (ELOOP), a FIFO
-        # with no writer on some platforms, a permission error, ... -- every open
-        # failure degrades to None rather than raising into the caller.
-        return None
+    except FileNotFoundError, NotADirectoryError:
+        return _CappedText(None, "absent")
+    except OSError as exc:
+        # A symlinked leaf O_NOFOLLOW refused (ELOOP), a FIFO with no writer on
+        # some platforms, a permission error, ...: never raised into the caller.
+        if exc.errno == errno.ELOOP and _is_link_itself(path):
+            return _CappedText(None, "not_regular")
+        return _CappedText(None, "failed", type(exc).__name__)
     fd_owned = True  # we own the raw fd until fdopen takes it over
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return _CappedText(None, "not_regular")
+        identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
         handle = os.fdopen(fd, encoding="utf-8", errors="replace")
         fd_owned = False  # fdopen now owns fd; closing the handle closes it
         with handle:
-            return handle.read(cap + 1)
-    except OSError:
-        return None
+            return _CappedText(handle.read(cap + 1), identity=identity)
+    except OSError as exc:
+        return _CappedText(None, "failed", type(exc).__name__)
     finally:
         if fd_owned:
             os.close(fd)
@@ -1118,8 +1323,49 @@ def _manifest_identity(directory: Path) -> tuple[int, int, int] | None:
     return (info.st_dev, info.st_ino, info.st_ctime_ns)
 
 
+# Why a manifest holding such a string is invalid (``_holds_unencodable_text``).
+_MANIFEST_UNENCODABLE = (
+    "tool.json has a string that cannot be encoded as UTF-8 (an unpaired \\uD800-\\uDFFF escape)"
+)
+
+
+def _holds_unencodable_text(value: object) -> bool:
+    """Whether a parsed JSON value holds a string -- a key or a value, at any depth
+    -- that cannot be encoded as UTF-8.
+
+    ``json.loads`` turns an unpaired ``\\uD800``-``\\uDFFF`` escape into a lone
+    surrogate: a legal ``str`` that a strict UTF-8 encode refuses, so one of them in
+    a manifest fails whatever it rides in -- the tools listing, the tool spec of
+    every AI request that advertises the tool. A text read from a file decodes
+    with replacement and holds none; only such an escape brings one. The value is
+    walked with a list of what is left to look at, so its depth costs no
+    recursion.
+    """
+    pending: list[object] = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            try:
+                item.encode("utf-8")
+            except UnicodeEncodeError:
+                return True
+        elif isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(item)
+    return False
+
+
 def _scan_tool_content(root: BuildRoot | VersionRoot, expected_name: str) -> _ContentScan:
-    """One implementation of manifest, entry, containment, and content rules."""
+    """One implementation of manifest, entry, containment, and content rules.
+
+    The scan of an installed version (``scan_installed``) and the check of a build
+    before it is published (``validate_tool_content``) are both this function, so
+    a manifest one refuses the other refuses too: among others, one holding a
+    string that cannot be encoded as UTF-8 (``_holds_unencodable_text``), whose
+    description is then not taken.
+    """
 
     directory = root.path
 
@@ -1161,6 +1407,8 @@ def _scan_tool_content(root: BuildRoot | VersionRoot, expected_name: str) -> _Co
         return invalid("tool.json is not valid JSON")
     if not isinstance(raw, dict):
         return invalid("tool.json is not a JSON object")
+    if _holds_unencodable_text(raw):
+        return invalid(_MANIFEST_UNENCODABLE)
 
     name_field = raw.get("name")
     if not isinstance(name_field, str) or not _NAME_RE.fullmatch(name_field):
@@ -1267,45 +1515,206 @@ def _scan_all() -> list[_PackageScan]:
     ]
 
 
-def _find_embedded_secret_file(build_root: BuildRoot) -> str | None:
-    """Relative path of the first staged file that embeds a known secret VALUE, or None.
+# --- embedded-secret scan ------------------------------------------------------
 
-    The install-only H3 gate. A builder session has real shell capability (run_shell,
-    D21), so it could read another tool's ``.env`` -- or any file the service uid can --
-    and bake a live key into the package it is producing. The manifest is the
-    persistence-and-broadcast vector (served via /api/tools and re-sent in EVERY future
-    LLM tool spec), and every implementation file is a persisted plaintext copy, so
-    before promotion EVERY regular file is scanned for any known secret value (>=
-    _MIN_SECRET_LEN, the redactor floor). A hit REJECTS the install (the caller names the
-    offending relative path) rather than redacting: an embedded key is malformed by
-    design, and masking would silently alter the schema the model built. The in-flight
-    install secret is registered for the whole build (run_install), so it is covered here
-    too -- and validate runs BEFORE promote writes the secret into the package ``.env``,
-    so this never trips on the backend's own later injection.
+# How many characters of a file one read of the embedded-secret scan takes. Each
+# read is searched together with the end of the read before it, so this bounds
+# the memory a file costs the scan, not what the scan can find in it.
+_SECRET_SCAN_CHUNK_CHARS = 64 * 1024
 
-    Each file is read through the ONE bounded, FIFO/symlink-hardened helper (cap =
-    _MANIFEST_MAX_BYTES); a non-regular/unreadable file comes back None and is skipped.
-    ``os.walk`` does not follow directory symlinks and the read's O_NOFOLLOW refuses a
-    symlinked leaf, so the scan can never be walked out of the package. Files are visited
-    in a deterministic sorted order so the named offender is stable. Cost is one substring
-    pass per known secret per file -- fine for the few small files a package holds.
+# Where in a tree a known secret was found: a regular file's content, an entry's
+# relative path (its own name, or a directory above it), or a symlink's target
+# string. Hits on one path are listed in this order.
+type SecretHitKind = Literal["content", "name", "link_target"]
+_SECRET_HIT_KIND_ORDER: dict[str, int] = {"content": 0, "name": 1, "link_target": 2}
+
+# Why the scan did not search an entry's content (or a symlink's target):
+# ``not_regular`` -- neither a directory, a link nor a regular file, such as a FIFO,
+# socket or device, which is never read -- or ``unreadable``, when an ``OSError``
+# stopped the open or the read.
+type SecretScanSkipReason = Literal["not_regular", "unreadable"]
+
+
+@dataclass(frozen=True, slots=True)
+class SecretHit:
+    """One place a known secret value was found, by path relative to the root."""
+
+    path: str
+    kind: SecretHitKind
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanSkip:
+    """An entry whose content, or symlink target, the scan did not search."""
+
+    path: str
+    reason: SecretScanSkipReason
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanDone:
+    """A scan that went through the whole tree: every hit, and every skipped entry.
+
+    No hits means no searched place holds a known secret. ``skipped`` is what was
+    not searched; whether that is acceptable is the caller's call.
     """
-    secrets = _redaction_secrets()
-    if not secrets:
-        return None
-    base = build_root.path.resolve()
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames.sort()
-        filenames.sort()
-        here = Path(dirpath)
-        for filename in filenames:
-            path = here / filename
-            text = _read_regular_file_capped(path, _MANIFEST_MAX_BYTES)
-            if text is None:
-                continue
-            if any(secret in text for secret in secrets):
-                return str(path.relative_to(base))
-    return None
+
+    hits: tuple[SecretHit, ...]
+    skipped: tuple[SecretScanSkip, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SecretScanFailed:
+    """A scan that could not finish, so nothing is known about the tree.
+
+    It deliberately has no ``hits``: a caller must tell it apart from
+    ``SecretScanDone`` before it can read any, so a failed scan cannot pass for a
+    clean one. ``reason`` is the exception's class name only, because an error's
+    text can carry a path and a path can embed a secret.
+    """
+
+    reason: str
+
+
+type SecretScan = SecretScanDone | SecretScanFailed
+
+
+def scan_embedded_secrets(
+    root: Path | BuildRoot, secrets: Iterable[str] | None = None
+) -> SecretScan:
+    """Which paths in the tree under ``root`` embed a known secret value.
+
+    A builder session has a real shell (run_shell), so it can read another tool's
+    ``.env`` -- or any file the service uid can -- and bake a live key into what it
+    produces: into a file, a file or directory name, or a symlink's target. This
+    finds every such place. ``secrets`` defaults to the values known now
+    (``_redaction_secrets``). Whichever list it is, it is looked for in its match
+    forms (``_match_forms``): a value shorter than ``_MIN_SECRET_LEN``, the
+    redactor's floor, is never looked for, and a value at the floor is looked for
+    as given and with its line breaks normalized, whatever the length of that
+    form.
+
+    What it checks:
+
+    * every entry's relative path, which carries its own name and every directory
+      above it, so an entry under a directory named after a secret is a hit too;
+    * every symlink's target string, read with ``os.readlink``; the link is never
+      followed, opened or descended into;
+    * the whole content of every regular file. Each ``_SECRET_SCAN_CHUNK_CHARS``
+      read is searched together with the last "longest form looked for, minus
+      one" characters before it, so a value split across two reads is still found
+      whole, while memory stays at one read plus that overlap however large the
+      file is. Files are opened like ``_read_regular_file_capped`` opens them
+      (``O_NOFOLLOW``, ``O_NONBLOCK``, ``S_ISREG`` on the descriptor), without
+      its cap. With no secret to look for, no file is opened.
+
+    What it returns: ``SecretScanDone`` with every hit, sorted by path and then
+    kind so callers and messages are stable, and every entry whose content went
+    unsearched -- ``not_regular`` for one that is neither a directory, a link nor
+    a regular file (a FIFO, socket or device, never read), ``unreadable`` when an
+    ``OSError`` stopped the open or read of a file or the read of a link. A
+    ``SecretScanFailed`` instead when the scan could not finish: the known-secret
+    lookup raised, or the walk did -- a directory that cannot be listed, an entry
+    that cannot be classified, a read failing with anything other than
+    ``OSError``.
+
+    Content is decoded as UTF-8 with replacement and universal newlines, as
+    ``_read_regular_file_capped`` decodes it: a value holding a carriage return is
+    found there through its normalized form, and content that differs from a value
+    only in its line breaks counts as holding it.
+
+    What it does not cover: a value stored in another encoding is not found; the
+    root itself is listed as given, link or not; and the tree can change after the
+    scan returns -- keeping writers away is the caller's job.
+    """
+    path = root.path if isinstance(root, BuildRoot) else root
+    try:
+        values = _redaction_secrets() if secrets is None else list(secrets)
+        return _scan_tree(path, _match_forms(values))
+    except Exception as exc:
+        return SecretScanFailed(type(exc).__name__)
+
+
+def _scan_tree(root: Path, secrets: list[str]) -> SecretScanDone:
+    """The walk behind ``scan_embedded_secrets``. Raises whatever fails the scan.
+
+    A directory that cannot be listed raises out of ``os.scandir``; an ``OSError``
+    on one file or link is caught where it happens and recorded as a skip.
+    """
+    hits: list[SecretHit] = []
+    skipped: list[SecretScanSkip] = []
+    overlap = max((len(secret) for secret in secrets), default=1) - 1
+    pending: list[tuple[str, str]] = [(os.fspath(root), "")]
+    while pending:
+        directory, prefix = pending.pop()
+        with os.scandir(directory) as listing:
+            entries = sorted(listing, key=lambda entry: entry.name)
+        for entry in entries:
+            relative = prefix + entry.name
+            if any(secret in relative for secret in secrets):
+                hits.append(SecretHit(relative, "name"))
+            if entry.is_symlink():
+                if not secrets:
+                    continue
+                try:
+                    target = os.readlink(entry.path)
+                except OSError:
+                    skipped.append(SecretScanSkip(relative, "unreadable"))
+                    continue
+                if any(secret in target for secret in secrets):
+                    hits.append(SecretHit(relative, "link_target"))
+            elif entry.is_dir(follow_symlinks=False):
+                pending.append((entry.path, relative + "/"))
+            elif not entry.is_file(follow_symlinks=False):
+                skipped.append(SecretScanSkip(relative, "not_regular"))
+            elif secrets:
+                found = _search_file(entry.path, secrets, overlap)
+                if isinstance(found, bool):
+                    if found:
+                        hits.append(SecretHit(relative, "content"))
+                else:
+                    skipped.append(SecretScanSkip(relative, found))
+    hits.sort(key=lambda hit: (hit.path, _SECRET_HIT_KIND_ORDER[hit.kind]))
+    skipped.sort(key=lambda skip: skip.path)
+    return SecretScanDone(tuple(hits), tuple(skipped))
+
+
+def _search_file(path: str, secrets: list[str], overlap: int) -> bool | SecretScanSkipReason:
+    """Whether the regular file at ``path`` holds one of ``secrets``, read to the end.
+
+    Each read is searched with the last ``overlap`` characters of the previous one
+    in front of it. A file that turns out not to be regular once open, or an
+    ``OSError`` on the open or a read, comes back as the reason it was skipped;
+    any other exception propagates and fails the scan.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except OSError:
+        return "unreadable"
+    fd_owned = True  # until fdopen takes the descriptor over
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "not_regular"
+        handle = os.fdopen(fd, encoding="utf-8", errors="replace")
+        fd_owned = False
+        with handle:
+            carried = ""
+            while chunk := handle.read(_SECRET_SCAN_CHUNK_CHARS):
+                window = carried + chunk
+                if any(secret in window for secret in secrets):
+                    return True
+                carried = window[max(len(window) - overlap, 0) :]
+        return False
+    except OSError:
+        return "unreadable"
+    finally:
+        if fd_owned:
+            os.close(fd)
+
+
+def _secret_scan_failed_error(reason: str) -> str:
+    """The publish refusal for a scan that could not finish; it never says "secret found"."""
+    return f"秘密掃描失敗（{reason}），無法確認工具包裡沒有已知的秘密值。"  # noqa: RUF001
 
 
 def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | None:
@@ -1326,7 +1735,13 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
 
     The embedded-secret gate (H3) is likewise install-only: it must BLOCK a package
     that baked a known key into any file, but is never re-run on installed packages
-    (whose ``.env`` legitimately holds the injected secret post-install).
+    (whose ``.env`` legitimately holds the injected secret post-install). It runs
+    ``scan_embedded_secrets``, so it reads every file whole and checks every path
+    and symlink target. A scan that could not finish refuses the package too, and
+    so does an entry it could not read, and a known-secret list some ``.env``
+    could not be read into (``KnownSecretsIncomplete``, whose message names it and
+    what to check); each message says what went unchecked, never that a secret
+    was found.
     """
     error = _scan_tool_content(build_root, expected_name).error
     if error is not None:
@@ -1342,43 +1757,54 @@ def validate_tool_content(build_root: BuildRoot, expected_name: str) -> str | No
         oversized = False
     if oversized:
         return "`.env` is too large"
-    # Install-only embedded-secret gate (H3): reject a package that baked a known secret
-    # value into any file, naming the offending relative path (never the value itself).
-    # The path is itself run through the redactor before it lands in the message, in case
-    # a builder wrote a file whose very NAME embeds an expanded ``$SECRET`` -- so the
-    # rejection can never echo the value even via the path.
-    offender = _find_embedded_secret_file(build_root)
-    if offender is not None:
-        return f"{redact_known_secrets(offender)} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    # Install-only embedded-secret gate: reject a package that embeds a known secret
+    # value anywhere -- a file's content, a path, a symlink target -- naming the first
+    # offending relative path, never the value. The path is masked before it lands in
+    # the message, because a builder can write a file whose very NAME is an expanded
+    # ``$SECRET``. One snapshot of the known secrets serves the scan and the mask, so
+    # the value a hit was found by is the one masked out of its path. The path is
+    # shown as ``_masked_as_shown`` shows a text: masked first, then its lone
+    # surrogates replaced -- a name that is not UTF-8 is read back with them, and the
+    # message must encode to be shown -- and then checked again, since the three
+    # U+FFFD the scrub writes for one can complete a known value.
+    try:
+        secrets = _redaction_secrets()
+    except KnownSecretsIncomplete as exc:
+        # Which ``.env`` could not be read, and what to check: the operator's next step.
+        return f"無法確認工具包裡沒有已知的秘密值。{exc}"
+    except Exception as exc:
+        return _secret_scan_failed_error(type(exc).__name__)
+    scan = scan_embedded_secrets(build_root, secrets)
+    if isinstance(scan, SecretScanFailed):
+        return _secret_scan_failed_error(scan.reason)
+    if scan.hits:
+        offender = _masked_as_shown(scan.hits[0].path, secrets)
+        return f"{offender} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    # An entry the scan could not read is content nobody checked: refused like a
+    # failed scan, naming the first one -- whatever it holds would be published
+    # unseen, and nothing after this reads it again. A FIFO, socket or device
+    # (``not_regular``) is not refused: it has no stored content to hold a value,
+    # and its name was checked like every other entry's. Its path is shown the same
+    # way.
+    unread = [skip.path for skip in scan.skipped if skip.reason == "unreadable"]
+    if unread:
+        unchecked = _masked_as_shown(unread[0], secrets)
+        return f"{unchecked} 無法讀取，無法確認裡面沒有已知的秘密值。"  # noqa: RUF001
     return None
 
 
 # --- AI summary sidecar (D40) ------------------------------------------------
 
 
-def _utf8_safe(text: str) -> str:
-    """Replace any lone (unpaired) Unicode surrogate in ``text`` with U+FFFD.
-
-    A three-line duplicate of ``llm_log._utf8_safe``, which is the CANONICAL
-    twin -- read its docstring for why ``surrogatepass``-encode + ``replace``-
-    decode is the only pairing that actually yields U+FFFD. Duplicated rather
-    than imported for the SAME leaf/layering reason ``_REDACTION_MARKER`` is
-    (llm_log is a leaf observability module that must not import this capability
-    module, and the reverse edge would create exactly the coupling both modules'
-    docstrings forbid); ``tests/test_tools.py`` pins the two behaviorally equal
-    on a probe set so they cannot silently drift.
-
-    Why version metadata needs it at all: ``origin.json`` and ``summary.json``
-    are plain JSON files the operator is explicitly allowed to hand-edit, and
-    ``"\\ud800"`` is a JSON-LEGAL escape that ``json.loads`` accepts happily --
-    producing a ``str`` that is NOT UTF-8 encodable. Left alone it breaks both
-    boundaries: on the WRITE side ``json.dumps(...).encode("utf-8")`` raises
-    ``UnicodeEncodeError`` (a 500 out of a PATCH that should have answered False
-    -> 404), and on the READ side it sails into the summary response and blows
-    up in Starlette's strict ``JSONResponse.render`` encode -- a 500 on a GET
-    that exists to DEGRADE corrupt metadata, not to die on it.
-    """
-    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
+# Text made encodable as UTF-8: the definition the API schemas use too
+# (``afterthread.utf8.encodable``, also what ``BackendPath`` checks), so a path
+# written here and a path a response states come out alike. Version metadata
+# needs it because ``origin.json`` and ``summary.json`` are plain JSON the
+# operator may hand-edit, and ``"\\ud800"`` in one loads as a lone surrogate:
+# left alone it fails the UTF-8 encode of the next write (a 500 out of a PATCH
+# that should have answered False -> 404) and of the summary response that serves
+# it (a 500 on a GET that exists to degrade corrupt metadata).
+_utf8_safe = utf8.encodable
 
 
 def _utf8_safe_meta(meta: dict[str, Any]) -> dict[str, Any]:
@@ -1484,35 +1910,324 @@ def _meta_str(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _redacted(value: str | None) -> str | None:
-    """One sidecar string VALUE, masked THEN surrogate-scrubbed; None stays None.
+def _written_literal(text: str) -> str:
+    """``text`` as a JSON file this backend writes holds it, without its quotes.
 
-    The whole redaction surface of the sidecar, now that ``write_tool_meta``
-    builds the file from a fixed schema instead of serializing a caller's dict:
-    exactly three string VALUES can carry operator/LLM text, and this is applied
-    to each of them by name.
-
-    Redact BEFORE the scrub, the same order ``llm_log._stored_body`` runs its two
-    passes in: the redactor must match the REGISTERED value against untouched
-    text, and the scrub must not be undone afterwards (it only ever replaces a
-    lone surrogate with U+FFFD, which carries nothing to mask).
-
-    The scrub is what keeps the write path's own encode from raising: an LLM
-    reply or a hand-edited field can carry a lone surrogate, which is a legal
-    ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather than REFUSING is
-    the adjudicated choice -- one bad code point is a display-level defect in a
-    summary that is otherwise a genuine, useful explanation, and refusing would
-    lose the whole generation over it (and, on the install hook's placeholder
-    path, leave the operator with no sidecar and no 重新產生 button at all).
-    U+FFFD is exactly what the reader would show anyway, so scrubbing makes the
-    file agree with the render. The read side scrubs INDEPENDENTLY regardless
-    (see ``_utf8_safe_meta``), because a hand-edited file never passes here.
-
-    Raises whatever ``redact_known_secrets`` raises: the LIVE redactor
-    deliberately propagates a provider failure rather than degrading to
-    unmasked, and ``write_tool_meta`` turns that into its fail-closed refusal.
+    The string literal ``json.dumps(..., ensure_ascii=False)`` makes, which is how
+    every such file is encoded; an ``indent`` changes only the whitespace between
+    tokens, never a literal, so this one form serves the indented manifest and the
+    flat sidecars alike.
     """
-    return None if value is None else _utf8_safe(redact_known_secrets(value))
+    return json.dumps(text, ensure_ascii=False)[1:-1]
+
+
+def _holds_a_secret(text: str, secrets: list[str]) -> bool:
+    """Whether ``_mask_known_secrets`` would change ``text``: the mask's own matcher.
+
+    So the same three things count as a hit: a whole known value, a trailing
+    prefix of one at least ``_MIN_SECRET_LEN`` long, and more matches than the
+    mask collects.
+    """
+    return _mask_known_secrets(text, secrets) != text
+
+
+def _spells_a_secret(text: str, secrets: list[str]) -> bool:
+    """Whether ``text``, written as a JSON string literal, holds a known secret."""
+    return _holds_a_secret(_written_literal(text), secrets)
+
+
+def _redacted(value: str | None, secrets: list[str], cap: int | None = None) -> str | None:
+    """One free-text VALUE of a JSON file, as it is written; None stays None.
+
+    The field check of every JSON file this module and ``tool_drafts`` write with
+    text in them (``summary.json``, ``origin.json``, a draft's manifest): masked
+    with ``secrets``, cut to ``cap`` when there is one, surrogate-scrubbed, and
+    then checked with the mask's own matcher in both forms the value takes. A
+    reader decodes the file and has the text itself -- the tool summary API hands
+    it on as it is -- so the text is checked (``_holds_a_secret``); the file holds
+    it encoded, so that form is checked too (``_spells_a_secret``). The mask
+    worked on the text before the scrub and the encoding, and each form can hold
+    what the masked text did not:
+
+    * the text: the scrub leaves three U+FFFD for one lone surrogate, and with the
+      characters beside them they can complete a known value that holds them;
+    * the file: the encoder writes a line break as ``\\n``, a quote as ``\\"``, a
+      backslash as ``\\\\``, a control character as ``\\uXXXX``. A PEM registered
+      from a single-quoted ``.env`` line keeps its ``\\n`` as those two
+      characters, so a text holding that key with real line breaks is written as
+      exactly the secret's bytes.
+
+    Neither form answers for the other: a known value of three U+FFFD and a quote
+    can be whole in the text and absent from the file, which writes the quote as
+    ``\\"``, and an escape is only in the file. A value that holds a secret in
+    either form is written as the redaction marker, whole: masking it in place
+    would mean cutting into escapes.
+
+    What it does not cover: a difference of representation an exact match cannot
+    see -- a secret registered with a real line break that a text spells as the
+    two characters ``\\n``, a value encoded another way (base64, say), a ``.env``
+    value whose undecodable bytes were replaced when it was read.
+
+    Masking comes before the scrub: the mask must match the REGISTERED value
+    against untouched text. The scrub is what keeps the write path's own encode
+    from raising: an LLM reply or a hand-edited field can carry a lone surrogate,
+    which is a legal ``str`` that ``.encode("utf-8")`` refuses. Scrubbing rather
+    than REFUSING is the adjudicated choice -- one bad code point is a
+    display-level defect in a summary that is otherwise a genuine, useful
+    explanation, and refusing would lose the whole generation over it (and, on
+    the install hook's placeholder path, leave the operator with no sidecar and no
+    重新產生 button at all). U+FFFD is exactly what the reader would show anyway,
+    so scrubbing makes the file agree with the render. The read side scrubs
+    INDEPENDENTLY regardless (see ``_utf8_safe_meta``), because a hand-edited file
+    never passes here.
+    """
+    if value is None:
+        return None
+    masked = _mask_known_secrets(value, secrets)
+    text = _utf8_safe(masked if cap is None else masked[:cap])
+    if _holds_a_secret(text, secrets) or _spells_a_secret(text, secrets):
+        return _REDACTION_MARKER
+    return text
+
+
+def _masked_as_shown(text: str, secrets: list[str], cap: int | None = None) -> str:
+    """``text`` as a message or a screen shows it: masked, cut to ``cap`` when there
+    is one, made encodable, and checked after the last of these.
+
+    The mask works on the text as given, before the scrub: a known value can hold
+    a lone surrogate itself, and the scrub would hide the text's copy of it from
+    the mask. The scrub writes three U+FFFD for one lone surrogate, and those can
+    complete a known value the text did not hold, so what is shown is checked
+    once more after it, with the mask's own matcher (``_holds_a_secret``): one
+    that holds a known value is shown as the redaction marker, whole, as
+    ``_redacted`` writes a field. What a caller puts beside the answer afterwards
+    -- a template, a separator -- is outside this check.
+    """
+    masked = _mask_known_secrets(text, secrets)
+    shown = _utf8_safe(masked if cap is None else masked[:cap])
+    return _REDACTION_MARKER if _holds_a_secret(shown, secrets) else shown
+
+
+@dataclass(frozen=True, slots=True)
+class _Fixed:
+    """A value written as fixed content, whole, for ``_encode_spans``.
+
+    Everything inside is fixed: a string with its quotes, a number, a list or a
+    mapping with its keys. It marks what the backend decides, never text it was
+    handed.
+    """
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Record:
+    """A mapping keyed by the backend's own literals, for ``_encode_spans``: its keys
+    are fixed content, and each value is marked by what it is."""
+
+    fields: dict[str, Any]
+
+
+def _encode_spans(value: Any, indent: int | None) -> tuple[str, list[tuple[int, int]]]:
+    """``value`` as ``json.dumps(value, ensure_ascii=False, indent=indent)`` writes it,
+    and where in that text the free text is.
+
+    ``value`` is JSON data with parts marked (``_Fixed``, ``_Record``). The text is
+    the same, character for character, as ``json.dumps`` writes the data with the
+    marks taken off: the same separators (``", "`` and ``": "``, or ``","`` and a
+    new line indented by ``indent`` per level), ``[]`` and ``{}`` for an empty
+    container, and each string and number as ``json.dumps`` writes it alone.
+
+    Free text is what a check of the written text has to take as coming from
+    outside: what is between the quotes of a string, escapes as written, and the
+    digits of a number, unless it is inside a ``_Fixed``; and the keys of a
+    mapping that is not a ``_Record``. Everything else is fixed content:
+    punctuation and white space, the quotes of every string, ``null``, ``true``
+    and ``false`` (they hold no character of anything given), the keys of a
+    ``_Record``, and all of a ``_Fixed``. The free text comes back as
+    ``(start, end)`` ranges of the text, in order and apart.
+
+    A key that is not a string raises ``TypeError``, as a value of a type JSON has
+    no form for does.
+    """
+    pieces: list[str] = []
+    free: list[tuple[int, int]] = []
+    size = 0
+
+    def put(text: str, start: int = 0, end: int = 0) -> None:
+        # ``text[start:end]`` is free text.
+        nonlocal size
+        if start < end:
+            free.append((size + start, size + end))
+        pieces.append(text)
+        size += len(text)
+
+    def layout(level: int) -> tuple[str, str, str]:
+        # What opens, separates and closes the items of a container at ``level``.
+        if indent is None:
+            return "", ", ", ""
+        inner = "\n" + " " * (indent * (level + 1))
+        return inner, "," + inner, "\n" + " " * (indent * level)
+
+    def walk(item: Any, level: int, fixed: bool) -> None:
+        if isinstance(item, _Fixed):
+            walk(item.value, level, True)
+        elif isinstance(item, _Record):
+            mapping(item.fields, level, fixed, True)
+        elif isinstance(item, dict):
+            mapping(item, level, fixed, fixed)
+        elif isinstance(item, (list, tuple)):
+            if not item:
+                put("[]")
+                return
+            opening, separator, closing = layout(level)
+            put("[" + opening)
+            for index, element in enumerate(item):
+                if index:
+                    put(separator)
+                walk(element, level + 1, fixed)
+            put(closing + "]")
+        elif item is None or item is True or item is False:
+            put(json.dumps(item))
+        elif isinstance(item, str):
+            literal = json.dumps(item, ensure_ascii=False)
+            put(literal, 1, 0 if fixed else len(literal) - 1)
+        elif isinstance(item, (int, float)):
+            literal = json.dumps(item)
+            put(literal, 0, 0 if fixed else len(literal))
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    def mapping(fields: dict[Any, Any], level: int, fixed: bool, keys_fixed: bool) -> None:
+        if not fields:
+            put("{}")
+            return
+        opening, separator, closing = layout(level)
+        put("{" + opening)
+        for index, (key, item) in enumerate(fields.items()):
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            if index:
+                put(separator)
+            literal = json.dumps(key, ensure_ascii=False)
+            put(literal, 1, 0 if keys_fixed else len(literal) - 1)
+            put(": ")
+            walk(item, level + 1, fixed)
+        put(closing + "}")
+
+    walk(value, 0, False)
+    return "".join(pieces), free
+
+
+def _touches_free_text(text: str, free: list[tuple[int, int]], secrets: list[str]) -> bool:
+    """Whether a known value occurs in ``text`` where the occurrence takes in free text.
+
+    ``free`` is where the free text is, as ``_encode_spans`` gives it. Every
+    occurrence of every value counts, overlapping ones too; one that lies wholly
+    outside ``free`` -- in fixed content -- passes, since the backend's own
+    characters spell it. Only whole occurrences count: the text was not cut.
+
+    After an occurrence that passes, the search goes on from the first place an
+    occurrence could reach the next free range: those it skips lie in fixed
+    content, and every occurrence that takes in free text is still seen. Nothing
+    found is kept, and the first occurrence that takes in free text ends the
+    search; per value, the work is one pass over the text and one search for each
+    free range at most.
+    """
+    ends = [end for _, end in free]
+    for value in secrets:
+        if not value:
+            # Found everywhere and never a secret: no match form is empty.
+            continue
+        size = len(value)
+        at = text.find(value)
+        while at != -1:
+            index = bisect.bisect_right(ends, at)
+            if index == len(ends):
+                break
+            start = free[index][0]
+            if start < at + size:
+                return True
+            at = text.find(value, start - size + 1)
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _Writing:
+    """How a builder hands over the values of one JSON file: as they are, or marked.
+
+    A builder of such a file (``write_tool_meta``'s, ``write_origin_meta``'s,
+    ``tool_drafts._document``) hands a value over through one of these methods by
+    what it is, so the check of the written text (``_encode_checked``) learns what
+    the file is made of from the same code that makes it:
+
+    * ``fixed`` -- a value whose shape a check fixed (a vid, a timestamp, an id, a
+      number, a word of a closed vocabulary): as it is. Nothing such a check
+      passes can carry text, and a mask could only corrupt it;
+    * ``record`` -- a mapping keyed by the builder's own literals, its keys fixed;
+    * ``text`` -- free text: through ``_redacted``, or the redaction marker when
+      ``degraded``.
+
+    ``marked`` hands the values to ``_encode_spans``: what ``fixed`` and ``record``
+    give is marked (``_Fixed``, ``_Record``), and so is the marker ``text`` gives
+    when ``degraded``, which is fixed content. A text otherwise is free text, and
+    so is a value a builder writes without one of these methods -- as
+    ``write_tool_meta`` writes ``llm_log_process`` --, which no marker ever
+    replaces: nothing vouched for it, and the marker cannot either. Unmarked,
+    every value is plain data, which is how ``tool_drafts.read_manifest`` reads a
+    manifest back.
+    """
+
+    secrets: list[str]
+    degraded: bool = False
+    marked: bool = False
+
+    def fixed(self, value: Any) -> Any:
+        return _Fixed(value) if self.marked else value
+
+    def record(self, fields: dict[str, Any]) -> Any:
+        return _Record(fields) if self.marked else fields
+
+    def text(self, value: str | None, cap: int | None = None) -> str | _Fixed | None:
+        if value is None:
+            return None
+        if self.degraded:
+            return _Fixed(_REDACTION_MARKER) if self.marked else _REDACTION_MARKER
+        return _redacted(value, self.secrets, cap)
+
+
+def _encode_checked(
+    build: Callable[[_Writing], Any],
+    secrets: list[str],
+    *,
+    indent: int | None = None,
+    end: str = "",
+) -> str | None:
+    """The file ``build`` makes, as written; None when a known value in it takes in free text.
+
+    The text is ``json.dumps(..., ensure_ascii=False, indent=indent)`` of what
+    ``build`` hands over, followed by ``end``. ``_encode_spans`` makes it from the
+    values ``build`` marks (``_Writing``), so the check looks at exactly the text
+    that is written and knows which of it is fixed content: keys, punctuation and
+    white space, ``end``, what a shape check fixed, ``null``, ``true`` and
+    ``false``. Every occurrence of every known value counts, overlapping ones too
+    (``_touches_free_text``). One wholly in fixed content passes -- an identifier
+    is written as it is. One that takes in any free text sends every text to the
+    redaction marker, which is fixed content, and the file is made and checked
+    again; one that still takes in free text takes in a value no check vouched
+    for, and nothing is written.
+
+    The field check (``_redacted``) runs first, inside ``build``. This is the
+    floor behind it, and sees what reached the file some other way, across a key,
+    a quote or the boundary between two fields as well as inside one value.
+    """
+    for degraded in (False, True):
+        writing = _Writing(secrets, degraded=degraded, marked=True)
+        text, free = _encode_spans(build(writing), indent)
+        text += end
+        if not _touches_free_text(text, free, secrets):
+            return text
+    return None
 
 
 def _still_the_expected_package(
@@ -1564,10 +2279,12 @@ def _write_package_file_atomic(
 
     The publisher refuses non-regular existing targets, writes and fsyncs a temp
     file in the destination directory, checks an optional version identity at the
-    last instant, replaces the target, and fsyncs the directory. Its bool contract
-    is shared by state, current, origin, and summary callers and reports whether
-    publication happened; the optional one-item out parameter exists solely so
-    ``publish_current`` can expose confirmed directory durability to discard.
+    last instant, replaces the target, and fsyncs the directory. Its bool reports
+    whether publication happened, for every caller. The optional one-item out
+    parameter also reports whether that directory fsync succeeded -- whether the
+    replaced name is confirmed durable -- for a caller that acts on it, such as
+    ``publish_current`` (for discard) and ``tool_drafts._write_manifest`` (for a
+    draft save, which keeps what it would otherwise remove when it is not).
     """
     path = directory / filename
     # The mode to publish under. There is ALWAYS one now (R11): a fresh file
@@ -1683,10 +2400,11 @@ def write_tool_meta(
       either"). Any OTHER type refuses the write: ``summary`` is a string by
       contract, the read path renders anything else as "no summary", and writing
       one would make the file lie about whether a summary exists;
-    * ``updated_at`` -- a ``str``, else the write is REFUSED. Every caller stamps
-      its own (``_now_iso`` / ``datetime.now``), so a missing or out-of-shape one
-      is a caller bug, and inventing a timestamp on their behalf would put a
-      fact in the file that nothing actually observed;
+    * ``updated_at`` -- a timestamp in the shape ``datetime.now(UTC).isoformat()``
+      gives (``_UTC_TIMESTAMP_RE``), else the write is REFUSED. Every caller stamps
+      its own, so a missing or out-of-shape one is a caller bug, and inventing a
+      timestamp on their behalf would put a fact in the file that nothing actually
+      observed;
     * ``llm_log_id`` -- an ``int`` (``bool`` excluded, since it is an ``int``
       subclass and a stray ``true`` would render as a link to log record 1), else
       None;
@@ -1724,22 +2442,22 @@ def write_tool_meta(
     docstring named a second line of defence -- a revise copies the installed
     package into a staging build, and ``validate_package``'s embedded-secret gate
     scans EVERY file there -- and that has not been true since the revise flow
-    took its final shape: ``tool_builder._revise_copy_ignore`` withholds the
-    sidecar's reserved namespace at EVERY depth, and ``_strip_builder_sidecars``
-    deletes any sidecar found in staging BEFORE validation runs, so no sidecar
-    ever reaches that gate. The correction matters rather than being pedantic: a
+    took its final shape: ``_strip_builder_sidecars`` deletes any sidecar found in
+    staging BEFORE validation runs, so no sidecar ever reaches that gate. The
+    correction matters rather than being pedantic: a
     maintainer who believed a downstream gate would catch an unmasked value could
     reasonably relax the refusal below into "write it unmasked", and nothing
     downstream would catch anything.
 
-    So a redaction failure (``known_secret_values`` raising -- the LIVE path
-    deliberately propagates rather than degrading to unmasked, see
-    ``redact_known_secrets``) writes NOTHING and returns False. It is applied to
-    the three fields that can carry operator/LLM text and to nothing else,
-    because nothing else CAN: ``llm_log_id`` is an int,
-    ``llm_log_process`` is an opaque token this backend
-    generated for itself, and ``updated_at`` is a machine timestamp its caller
-    just produced (no on-disk one ever round-trips -- both callers overwrite it).
+    So a failure to read the known secrets (``known_secret_values`` raising -- the
+    LIVE path deliberately propagates rather than degrading to unmasked, see
+    ``redact_known_secrets``) writes NOTHING and returns False. The field check
+    (``_redacted``) is applied to ``summary``, the one field that carries
+    operator/LLM text; the check of the written text (``_encode_checked``) to the
+    whole file, in which the keys, ``updated_at`` and ``llm_log_id`` -- shapes
+    checked above -- are fixed content. ``llm_log_process`` is written as the
+    caller gives it, so it is free text that no marker replaces: a known value
+    that takes in any of it writes nothing.
 
     The serialized payload is bounded by ``_AI_META_MAX_BYTES``, the SAME cap
     ``read_tool_meta`` refuses past, so this can never produce a file that reads
@@ -1749,15 +2467,14 @@ def write_tool_meta(
     metadata is best-effort by design.
 
     The serialize + encode + size check live INSIDE the fail-closed ``try``, and
-    that placement is load-bearing rather than tidy. They used to sit outside it,
-    so a lone surrogate reaching any string field raised ``UnicodeEncodeError``
-    straight out of this function -- turning a PATCH that should have answered
-    False (-> 404) into a 500. ``_redacted`` now scrubs the three text fields
-    before ``dumps`` sees them, so the surrogate case is HANDLED rather than
-    merely caught; the guard still covers ``updated_at``, the one caller-supplied
-    string this function passes through verbatim (every real caller stamps a
-    machine timestamp, so scrubbing it would only paper over a caller bug -- a
-    refusal is the honest answer there).
+    that placement is load-bearing rather than tidy: a lone surrogate reaching a
+    string field would otherwise raise ``UnicodeEncodeError`` straight out of this
+    function -- turning a PATCH that should have answered False (-> 404) into a
+    500. ``_redacted`` scrubs the summary before ``dumps`` sees it and
+    ``updated_at`` is refused unless it is a timestamp, so for those two the
+    surrogate case is HANDLED rather than merely caught; the guard still covers
+    ``llm_log_process``, the one caller-supplied string this function passes
+    through verbatim.
 
     The write itself is ATOMIC (``_write_package_file_atomic``): the previous sidecar
     survives every failure and the file is never observable half-written. See
@@ -1804,7 +2521,7 @@ def write_tool_meta(
     if not isinstance(summary, str):
         return False
     updated_at = meta.get("updated_at")
-    if not isinstance(updated_at, str):
+    if not isinstance(updated_at, str) or not _UTC_TIMESTAMP_RE.fullmatch(updated_at):
         return False
     log_id = meta.get("llm_log_id")
     if not isinstance(log_id, int) or isinstance(log_id, bool):
@@ -1812,21 +2529,30 @@ def write_tool_meta(
     log_process = meta.get("llm_log_process")
     if not isinstance(log_process, str):
         log_process = None
+
+    def build(writing: _Writing) -> Any:
+        return writing.record(
+            {
+                "summary": writing.text(summary),
+                "updated_at": writing.fixed(updated_at),
+                "llm_log_id": writing.fixed(log_id),
+                # Written as the caller gives it: free text no marker replaces.
+                "llm_log_process": log_process,
+            }
+        )
+
     try:
-        payload: dict[str, Any] = {
-            "summary": _redacted(summary),
-            "updated_at": updated_at,
-            "llm_log_id": log_id,
-            "llm_log_process": log_process,
-        }
         # ensure_ascii=False keeps CJK readable in the file (and is what the byte
         # cap below is measured against). Every value is a str/int/None we just
-        # built, so dumps cannot fail on an unserializable type -- but the ENCODE
-        # can still raise on a surrogate-bearing ``updated_at``, which is why both
-        # steps sit inside this guard (see the docstring). The cap is checked on
-        # the ENCODED length, because that is the unit the writer's half of the
-        # read/write symmetry is stated in (see _AI_META_MAX_BYTES).
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # built, so the JSON text cannot fail on an unserializable type -- but the
+        # ENCODE can still raise on a surrogate-bearing ``llm_log_process``, which
+        # is why both steps sit inside this guard (see the docstring). The cap is
+        # checked on the ENCODED length, because that is the unit the writer's half
+        # of the read/write symmetry is stated in (see _AI_META_MAX_BYTES).
+        text = _encode_checked(build, _redaction_secrets())
+        if text is None:
+            return False
+        data = text.encode("utf-8")
     except Exception:
         return False
     if len(data) > _AI_META_MAX_BYTES:
@@ -1844,7 +2570,14 @@ def write_tool_meta(
 
 
 def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
-    """Publish immutable, sanitized ``origin.json`` before a version is installed."""
+    """Publish immutable, sanitized ``origin.json`` before a version is installed.
+
+    Its four text fields go through the field check (``_redacted``) and the
+    written file through the check of its text (``_encode_checked``), in which the
+    keys and the vid of the version before it -- the one field whose shape a
+    check fixes -- are fixed content. Every False writes nothing, among them a
+    failure to read the known secrets.
+    """
 
     source = origin.get("source")
     previous = origin.get("previous")
@@ -1852,15 +2585,23 @@ def write_origin_meta(build_root: BuildRoot, origin: dict[str, Any]) -> bool:
         return False
     if previous is not None and (not isinstance(previous, str) or not _VID_RE.fullmatch(previous)):
         return False
+
+    def build(writing: _Writing) -> Any:
+        return writing.record(
+            {
+                "source": writing.text(source),
+                "openapi_url": writing.text(_meta_str(origin.get("openapi_url"))),
+                "instructions": writing.text(_meta_str(origin.get("instructions"))),
+                "feedback": writing.text(_meta_str(origin.get("feedback"))),
+                "previous": writing.fixed(previous),
+            }
+        )
+
     try:
-        payload = {
-            "source": _redacted(source),
-            "openapi_url": _redacted(_meta_str(origin.get("openapi_url"))),
-            "instructions": _redacted(_meta_str(origin.get("instructions"))),
-            "feedback": _redacted(_meta_str(origin.get("feedback"))),
-            "previous": previous,
-        }
-        data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+        text = _encode_checked(build, _redaction_secrets(), end="\n")
+        if text is None:
+            return False
+        data = text.encode("utf-8")
     except Exception:
         return False
     if len(data) > _AI_META_MAX_BYTES:
@@ -1991,15 +2732,31 @@ def resolution_lineage(
     )
 
 
-def list_tools() -> list[dict[str, Any]]:
+def list_tools(
+    *, draft_view: Callable[[PackageRoot, Resolution], dict[str, Any] | None] | None = None
+) -> list[dict[str, Any]]:
     """List every installed package as a UI-facing summary.
 
     A broken package is included with ``valid=False`` and a safe error reason,
     but is never executable; a missing or unset tools directory yields [].
+
+    With ``draft_view`` each row also carries ``draft``: what it answers for the
+    package and the resolution this same scan made. The caller hands it in
+    (``tool_drafts.draft_view``, bound to the job table), because reading a draft
+    needs to know which jobs are running, and that is not this module's to know.
+    ``tool_drafts.draft_view`` reads a manifest only where there is one.
     """
-    return [
-        {
-            "name": scan.name,
+    rows = []
+    for scan in _scan_all():
+        row: dict[str, Any] = {
+            # The directory's own name, made encodable: read on Linux, a name holds a
+            # lone surrogate for each byte that does not decode as UTF-8, and one of
+            # them fails the encode of the whole listing. Such a name is never a tool name
+            # (``_NAME_RE``), so its row never scans valid -- the manifest's name must
+            # equal it -- and a route addressed by it is refused before it runs (the
+            # routes take ``_NAME_RE`` names only); the replacement characters cannot
+            # make it one.
+            "name": _utf8_safe(scan.name),
             "description": scan.description,
             "enabled": scan.enabled,
             "valid": scan.valid,
@@ -2011,8 +2768,10 @@ def list_tools() -> list[dict[str, Any]]:
                 else "broken"
             ),
         }
-        for scan in _scan_all()
-    ]
+        if draft_view is not None:
+            row["draft"] = draft_view(scan.package_root, scan.resolution)
+        rows.append(row)
+    return rows
 
 
 def package_identity(version_root: VersionRoot) -> tuple[int, int, int] | None:
@@ -2097,7 +2856,7 @@ def enabled_llm_tools() -> list[LlmTool]:
 # llm_log redacts every KNOWN secret VALUE out of the prompt/response bodies it
 # stores, at its storage choke point. But llm_log is a leaf observability module
 # and must not import THIS one -- so it takes a provider CALLABLE and main wires
-# in ``known_secret_values`` below (the same leaf/provider inversion llm_log's
+# in ``known_secrets_for_log`` below (the same leaf/provider inversion llm_log's
 # own logger config uses). The inversion is about THAT direction only: this
 # module imports llm_log directly (for ``process_token``, see
 # ``store_summary_meta``), which is the direction that keeps llm_log a leaf.
@@ -2105,17 +2864,33 @@ def enabled_llm_tools() -> list[LlmTool]:
 # static value, because it genuinely CHANGES at runtime: an install writes a new
 # tool ``.env``, and an in-flight install registers its form secret before that
 # ``.env`` even exists.
+#
+# Every collection says whether it is whole (``_collect_known_secrets``): a
+# ``.env`` that could not be read contributes no values, and a list missing them
+# must not be taken for the whole list. The masks refuse to work from one
+# (``known_secret_values`` raises ``KnownSecretsIncomplete``); llm_log stores, in
+# place of a body checked against one, a marker saying the body was not recorded
+# (``llm_log._UNCHECKED_MARKER``).
 
 # In-flight secrets: values that must stay redactable for the DURATION of one
 # operation, independently of what the ``.env`` scan below can see AT THE MOMENT
 # a body is recorded. Three kinds of holder register here:
 #
-# * a web-installer form secret (``secret_value``), for the whole install
-#   (tool_builder registers/discards around ``run_install``) -- the window BEFORE
-#   promote writes it into the package ``.env``, after which the per-package
-#   ``.env`` scan below is what covers it;
-# * a revise session's ``.env`` values, for the whole builder session, plus
-#   whatever the promote re-vets on its way out;
+# * a web-installer form secret (``secret_value``), for the whole install:
+#   ``tool_builder.run_install`` registers it before the build and releases it
+#   when the install returns or ends in an ``Exception``. It covers the window
+#   BEFORE promote writes the value into the package ``.env``, which the
+#   per-package ``.env`` scan below covers from then on. An install cancelled --
+#   the event loop shutting down -- or ended by an interrupt or an exit keeps it
+#   until the process ends: a promote's worker it started goes on without it, and
+#   still scans the build and writes ``origin.json`` with the known secrets before
+#   the value is in an installed package's ``.env`` -- and a promote that fails
+#   never installs one;
+# * a revise round's ``.env`` values, held by ``tool_builder.run_revise`` from
+#   before its builder session to its end, released and kept the same way: a
+#   worker the round handed a save, a record or a publish to may still take the
+#   known secrets after it, and the package's ``.env`` may no longer hold a value
+#   the round was given;
 # * the ``.env`` values ONE TOOL CALL was handed. ``_build_tool_env`` copies the
 #   package's ``.env`` into the child's environment, and the child can echo any
 #   of it back -- but the redaction of that output happens when the child
@@ -2143,8 +2918,11 @@ _INFLIGHT_SECRETS: dict[str, int] = {}
 _INFLIGHT_LOCK = threading.Lock()
 
 # Cache of one package's parsed ``.env`` VALUES, keyed by the ``.env`` path and
-# tagged with a FILE IDENTITY taken from its ``stat``, so ``known_secret_values``
-# re-parses a package only when its ``.env`` actually changed. This matters
+# tagged with a FILE IDENTITY, so ``_collect_known_secrets`` re-parses a package
+# only when its ``.env`` actually changed. Only a read that gave an answer is
+# stored, tagged with the ``fstat`` of the file it read; a look or a read that
+# failed is never stored, and it drops the entry, so an entry can never stand in
+# for a file that could not be looked at. This matters
 # because the provider runs once PER STORED LOG BODY (every request message +
 # every response of every attempt), and a busy installer session records the
 # whole GROWING conversation on each of dozens of rounds -- without the cache,
@@ -2192,7 +2970,12 @@ def register_inflight_secret(value: str) -> None:
     Every call must be matched by exactly one ``discard_inflight_secret`` from a
     ``finally``: the count is what lets overlapping holders of the same value
     (two calls to the same tool, a revise session and a tool call reading the
-    same ``.env``) each release only their OWN hold.
+    same ``.env``) each release only their OWN hold. One exception: a builder job
+    (``tool_builder.run_install``, ``tool_builder.run_revise``) that a
+    ``BaseException`` other than an ``Exception`` ends -- the event loop's
+    shutdown cancelling it, an interrupt, an exit -- keeps its holds until the
+    process ends, since a worker it handed on goes on without it and may still
+    take the known secrets.
     """
     if not value:
         return
@@ -2241,47 +3024,181 @@ def _inflight_secrets(values: frozenset[str]) -> Iterator[None]:
             discard_inflight_secret(value)
 
 
-def _cached_env_values(package_root: PackageRoot) -> frozenset[str]:
-    """The redactable VALUES of one package's ``.env``, cached per (path, identity).
+@dataclass(frozen=True, slots=True)
+class SecretSourceGap:
+    """One place the known secrets could not be read from.
 
-    Reuses the ONE bounded ``.env`` loader (``_load_tool_dotenv``) rather than
-    hand-rolling a second parser, so the FIFO/symlink/oversize hardening and the
-    drop-bare-keys behavior are inherited unchanged. Empty values are dropped so
-    a ``KEY=`` line contributes nothing (``_redact`` also guards empties, but not
-    seeding them keeps the set tidy).
+    ``tool`` is the package directory's name, None for the tools directory
+    itself; ``path`` is the ``.env`` that could not be read -- for a package
+    whose directory could not be looked at, the ``.env`` it would hold -- or the
+    tools directory; ``error`` is the failure's type name, never its text.
+    """
+
+    tool: str | None
+    path: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class KnownSecrets:
+    """One collection of the known secret values, and whether it is whole.
+
+    ``gaps`` names every source that could not be read; ``values`` then lacks
+    whatever those hold. ``complete`` only when there are none: an empty set
+    that is complete means there are no secrets, one that is not means nothing.
+    """
+
+    values: frozenset[str]
+    gaps: tuple[SecretSourceGap, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return not self.gaps
+
+
+def _incomplete_message(gaps: tuple[SecretSourceGap, ...]) -> str:
+    """What the operator is told when the known secrets cannot all be read.
+
+    Names the first place, says how many more there are and what to check. It
+    holds no value and no failure text, only the failure's type name, and it never
+    says a secret was found: none was looked for.
+    """
+    first = gaps[0]
+    where = _utf8_safe(first.path)
+    if first.tool is None:
+        text = (
+            f"已知秘密的清單不完整：讀不到工具目錄 {where}（{first.error}），"  # noqa: RUF001
+            "無法得知各工具 .env 裡的值。"
+        )
+        subject = "這個目錄"
+    else:
+        text = (
+            f"已知秘密的清單不完整：讀不到工具「{_utf8_safe(first.tool)}」的 "  # noqa: RUF001
+            f"{where}（{first.error}）。"  # noqa: RUF001
+        )
+        subject = "這個檔案"
+    if len(gaps) > 1:
+        text += f"另有 {len(gaps) - 1} 處也讀不到。"
+    return text + f"請檢查{subject}與它上層目錄的權限、磁碟狀態後重試。"
+
+
+class KnownSecretsIncomplete(OperatorFacingError):
+    """The known secrets could not all be read, so no mask can be whole.
+
+    Raised by ``known_secret_values`` -- and so by ``_redaction_secrets`` and
+    ``redact_known_secrets`` -- instead of answering with the values it did read.
+    ``gaps`` is every source that could not be read (``SecretSourceGap``); the
+    message is ``_incomplete_message``'s.
+    """
+
+    code = "known_secrets_incomplete"
+
+    def __init__(self, gaps: tuple[SecretSourceGap, ...]) -> None:
+        self.gaps = gaps
+        super().__init__(_incomplete_message(gaps))
+
+
+def _forget_env_values(key: str) -> None:
+    with _ENV_VALUE_CACHE_LOCK:
+        _ENV_VALUE_CACHE.pop(key, None)
+
+
+def _cached_env_values(package_root: PackageRoot) -> frozenset[str] | SecretSourceGap:
+    """The redactable VALUES of one package's ``.env``, or where it could not be read.
+
+    Read the way the runtime reads it (``_read_package_dotenv``, the loader
+    ``_load_tool_dotenv`` uses): a link is not followed and a FIFO, a directory or
+    any other file that is not regular is not read, so neither holds a value
+    anyone is given. Each answer, by what is seen:
+
+    * not there -- ``ENOENT`` or ``ENOTDIR`` from the ``lstat`` or the open: none;
+    * a ``lstat``, or the ``fstat`` of what opened, that sees something not a
+      regular file, a link above all: none. An ``ELOOP`` from the open counts as a
+      link only when a ``lstat`` sees the ``.env`` itself is one; a loop above it
+      is a failure;
+    * text over the loader's cap, judged on the text as read: none;
+    * text within it: exactly the non-empty values the parser gives, which may be
+      some of the lines, or none of them;
+    * any other failure to look at, open or read it: the ``SecretSourceGap``.
 
     The path is the cache KEY and the file's identity is the TAG (see
     ``_ENV_VALUE_CACHE`` for what is in it and for the measurements that chose
     the fields): a path answers "whose ``.env`` is this", and only the identity
-    can answer "is it still the same file with the same contents". Both come out
-    of the one ``stat`` this function already made.
+    can answer "is it still the same file with the same contents". The entry is
+    looked up by the ``lstat`` of the path, stored with the ``fstat`` of the file
+    read, and only for a read that gave an answer; every other answer drops it.
+    Empty values are dropped so a ``KEY=`` line contributes nothing.
     """
     env_file = package_root.path / ".env"
     key = str(env_file)
     try:
-        info = env_file.stat()
-    except OSError:
-        # No ``.env`` (the common case) or an unstattable path: nothing to
-        # contribute. Forget any stale cache entry so a LATER-created ``.env`` is
-        # picked up fresh next time.
-        with _ENV_VALUE_CACHE_LOCK:
-            _ENV_VALUE_CACHE.pop(key, None)
+        info = os.lstat(env_file)
+    except FileNotFoundError, NotADirectoryError:
+        _forget_env_values(key)
+        return frozenset()
+    except OSError as exc:
+        _forget_env_values(key)
+        return SecretSourceGap(package_root.path.name, key, type(exc).__name__)
+    if not stat.S_ISREG(info.st_mode):
+        _forget_env_values(key)
         return frozenset()
     identity = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
     with _ENV_VALUE_CACHE_LOCK:
         cached = _ENV_VALUE_CACHE.get(key)
         if cached is not None and cached[0] == identity:
             return cached[1]
-    # Parse OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
+    # Read OUTSIDE the lock (it does file I/O); the (path, identity) key makes a
     # concurrent double-parse harmless -- both produce the identical set.
-    values = frozenset(value for value in _load_tool_dotenv(package_root).values() if value)
+    read = _read_package_dotenv(env_file)
+    if read.unread is not None:
+        _forget_env_values(key)
+        return SecretSourceGap(package_root.path.name, key, read.unread)
+    values = frozenset(value for value in read.values.values() if value)
+    if read.identity is None:
+        # Gone, or no regular file, since the ``lstat``: nothing to keep.
+        _forget_env_values(key)
+        return values
     with _ENV_VALUE_CACHE_LOCK:
-        _ENV_VALUE_CACHE[key] = (identity, values)
+        _ENV_VALUE_CACHE[key] = (read.identity, values)
     return values
 
 
-def known_secret_values() -> frozenset[str]:
-    """Every value llm_log should redact out of stored prompt/response bodies (D36).
+def _collect_package_values(base: Path, values: set[str], gaps: list[SecretSourceGap]) -> None:
+    """Add every package's ``.env`` values under ``base`` to ``values``; record the gaps.
+
+    The packages are what they have always been here: each entry not hidden that
+    is a directory once links are followed. A listing or a look at an entry that
+    fails other than with "not there" is a gap, never a package without values.
+    """
+    try:
+        names = sorted(os.listdir(base))
+    except FileNotFoundError, NotADirectoryError:
+        return
+    except OSError as exc:
+        gaps.append(SecretSourceGap(None, os.fspath(base), type(exc).__name__))
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        child = base / name
+        try:
+            info = os.stat(child)
+        except FileNotFoundError, NotADirectoryError:
+            continue
+        except OSError as exc:
+            gaps.append(SecretSourceGap(name, os.fspath(child / ".env"), type(exc).__name__))
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        found = _cached_env_values(PackageRoot(child))
+        if isinstance(found, SecretSourceGap):
+            gaps.append(found)
+        else:
+            values |= found
+
+
+def _collect_known_secrets() -> KnownSecrets:
+    """Every known secret value, and whether that is all of them (``KnownSecrets``).
 
     The union of three sources:
 
@@ -2290,29 +3207,68 @@ def known_secret_values() -> frozenset[str]:
       it into a body), but redacting it too means even a tool that somehow echoed
       it back cannot surface it in the log;
     * every VALUE in every installed tool package's ``.env`` (a KB API key etc.),
-      cached per (path, file identity) so a call per record stays cheap;
+      cached per (path, file identity) so a call per record stays cheap
+      (``_cached_env_values`` says what each ``.env`` answers);
     * every value currently HELD in-flight (see ``_INFLIGHT_SECRETS``) -- an
       install's form secret before promote writes it, a revise session's values,
       and the values a running tool call handed its child. Each covers a window
       the directory scan above cannot answer for, because the file it reads is
       whatever is on disk NOW rather than what the holder was given.
 
-    Wired as llm_log's secret provider by main. llm_log calls this INSIDE its own
-    ``except Exception`` guard (the no-observer-failure invariant), so a hiccup
-    here only ever degrades to "record unredacted", never breaks a recording.
+    A tools directory that is not configured, not there, or under a component
+    that is a file holds no packages. One whose path cannot be resolved
+    (``ToolsDirUnresolvedError``), or whose listing fails, is a gap, and so is
+    every package or ``.env`` that cannot be looked at, opened or read: those
+    failures are answered here, never raised. Private on purpose: a caller must
+    not take ``values`` without ``complete`` -- ``known_secret_values`` and
+    ``known_secrets_for_log`` are the ways in.
     """
-    secrets: set[str] = set()
+    values: set[str] = set()
+    gaps: list[SecretSourceGap] = []
     api_key = get_settings().openai_api_key.strip()
     if api_key:
-        secrets.add(api_key)
-    base = tools_dir()
-    if base is not None and base.is_dir():
-        for child in sorted(base.iterdir()):
-            if child.is_dir() and not child.name.startswith("."):
-                secrets |= _cached_env_values(PackageRoot(child))
+        values.add(api_key)
+    try:
+        base = tools_dir()
+    except ToolsDirUnresolvedError as exc:
+        base = None
+        gaps.append(SecretSourceGap(None, exc.path, exc.error))
+    if base is not None:
+        _collect_package_values(base, values, gaps)
     with _INFLIGHT_LOCK:
-        secrets |= set(_INFLIGHT_SECRETS)
-    return frozenset(secrets)
+        values |= set(_INFLIGHT_SECRETS)
+    return KnownSecrets(frozenset(values), tuple(gaps))
+
+
+def known_secret_values() -> frozenset[str]:
+    """Every known secret value, only when that is all of them.
+
+    Raises ``KnownSecretsIncomplete`` when some source could not be read
+    (``_collect_known_secrets``): a mask built from the rest would leave what that
+    source holds in plain sight while looking whole.
+    """
+    collected = _collect_known_secrets()
+    if not collected.complete:
+        raise KnownSecretsIncomplete(collected.gaps)
+    return collected.values
+
+
+def known_secrets_for_log() -> tuple[frozenset[str], bool]:
+    """llm_log's secret provider: ``(values, complete)``. Never raises.
+
+    Wired by main. llm_log is an observer and must not fail the call it records,
+    so a collection that is not whole, or that failed, is answered as
+    ``(frozenset(), False)`` rather than raised; llm_log then stores, in place of
+    each body, the marker saying it was not recorded
+    (``llm_log._checked_as_stored_and_written``). Goes through
+    ``known_secret_values``, so the same answer serves both. It hands over the
+    values themselves: llm_log puts them in their match forms with its own copy of
+    ``_match_forms``.
+    """
+    try:
+        return known_secret_values(), True
+    except Exception:
+        return frozenset(), False
 
 
 # The exact-match marker every redacted secret VALUE is replaced with, in BOTH the
@@ -2335,7 +3291,9 @@ _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 # uses: masking a 1-5 char value would shred ordinary prose (imagine redacting every
 # "1234"), and a real API key/token is never that short. F3 makes the install-form
 # secret schema reject a <6-char value up front precisely so a legitimately-supplied
-# secret is always long enough to be redactable here.
+# secret is always long enough to be redactable here. The floor is a value's own: the
+# newline-normalized form of a value at it is matched whatever its length
+# (``_match_forms``).
 _MIN_SECRET_LEN = 6
 
 # Hard ceiling on how many mask ranges a single call collects before giving up on
@@ -2362,10 +3320,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     copy of this. It is DUPLICATED in each module, not hoisted into a shared home, for
     the same leaf/layering reason the marker is (see ``_REDACTION_MARKER``); the two
     copies MUST stay byte-for-byte in LOCKSTEP so a value masked in a live tool result
-    and one masked in the log are indistinguishable. ``secrets`` are the known values
-    already filtered to ``>= _MIN_SECRET_LEN`` -- each caller produces that list under
-    its OWN failure direction (tools lets a provider error propagate/fail-closed; llm_log
-    swallows one and records unredacted), then hands the masking here.
+    and one masked in the log are indistinguishable. ``secrets`` are the known values in
+    their match forms (``_match_forms``: each value at ``_MIN_SECRET_LEN`` or above, and
+    its newline-normalized form, which may be shorter) -- each caller produces that list
+    under its OWN failure direction (tools lets a provider error propagate/fail-closed;
+    llm_log swallows one and stores, in place of the body, the marker saying it was not
+    recorded), then hands the masking here.
 
     Every mask range is computed against the PRISTINE ``text`` and only THEN applied,
     which is load-bearing (H1). The older order -- full-value ``str.replace`` FIRST, then
@@ -2382,9 +3342,10 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     secret cut by an EARLIER truncation boundary leaves a prefix the full-value match can
     never catch; a false positive only masks a tail of already-truncated text, and
     INTERIOR fragments are prevented at their sources -- the summary/openapi slices in
-    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
-    merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
-    one marker per merged range.
+    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut) -- a
+    form shorter than the floor only ever matches whole; (2) merge overlapping/adjacent
+    ranges; (3) build the output in ONE pass, emitting exactly one marker per merged
+    range.
 
     Collecting every occurrence in step (1) is BOUNDED two ways (D36 round-5), because a
     legitimate secret can itself be adversarial input to this search. First, the find
@@ -2394,11 +3355,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     happens to look like that -- step past each other instead of registering one range
     per shifted start. This can still leave a residual of up to ``len(value) - 1``
     characters at a repeated run's tail (a strict remainder of the run length modulo
-    ``len(value)``); at the ``_MIN_SECRET_LEN`` floor -- the shortest value ever reaches
-    here, and exactly the reported case -- that residual is itself under the floor,
-    exactly as unredactable as any other short substring by the SAME rationale that
-    floor already encodes, and a residual landing at the very END of ``text`` is still
-    separately caught by the trailing-fragment guard above regardless of length. Second,
+    ``len(value)``); for a value at the ``_MIN_SECRET_LEN`` floor -- exactly the reported
+    case -- that residual is itself under the floor, and for a normalized form shorter
+    than the floor it is shorter still, exactly as unredactable as any other short
+    substring by the SAME rationale that floor already encodes, and a residual landing at
+    the very END of ``text`` is still separately caught by the trailing-fragment guard
+    above regardless of length. Second,
     stepping is not sufficient by itself: a sufficiently large low-entropy document can
     still cross ``_MAX_MASK_RANGES`` one ``len(value)``-sized step at a time, so
     collection STOPS the instant it would and this returns the marker ALONE for the
@@ -2407,6 +3369,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     before it is ever sorted, the merge in step (2) is O(n log n) on that bounded n
     rather than on the size of ``text``, and step (3)'s output build remains the single
     pass it always was.
+
+    What it checks is the text it is given. Text a caller puts beside the answer
+    afterwards -- a heading, a prefix, a separator, a truncation marker -- is outside
+    it, and with the text next to it can spell a known value that holds that text; so
+    can a marker this puts in, with the text beside it. A caller that needs its text
+    checked as it is finally used checks it there.
     """
     if not secrets:
         return text
@@ -2463,13 +3431,38 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
+def _match_forms(values: Iterable[str]) -> list[str]:
+    """The forms known values are matched and masked in, sorted: each value at the
+    ``_MIN_SECRET_LEN`` floor or above, and that value with its line breaks
+    normalized -- each CRLF, then each lone CR, made an LF.
+
+    Text read in universal-newline mode -- a file read as text, the output of a
+    subprocess -- has its line breaks normalized that way before anything matches
+    or masks it, so a value holding a CR is found there only in its normalized
+    form. The floor is the value's own: a value under it adds no form at all, and
+    the normalized form of a value at it is kept whatever its length -- a derived
+    form may be shorter than the floor. Text that differs from a value only in its
+    line breaks counts as holding it.
+
+    Passing the answer through again gives the same answer: a normalized form under
+    the floor is there beside the value it came from, and a normalized form
+    normalizes to itself. A list that went through this once can go through it again
+    without losing a form.
+    """
+    held = {value for value in values if len(value) >= _MIN_SECRET_LEN}
+    return sorted(held | {value.replace("\r\n", "\n").replace("\r", "\n") for value in held})
+
+
 def _redaction_secrets() -> list[str]:
-    """``known_secret_values`` at the redactor's floor: the list every mask takes.
+    """``known_secret_values`` in their match forms (``_match_forms``): the list
+    every mask, scan and check as written takes.
 
     Unguarded, like the scan it wraps: a caller that must not fail on it says so
     itself (``_record_bodies``); every other caller wants the failure to propagate.
+    That failure includes ``KnownSecretsIncomplete``, a list some ``.env`` could
+    not be read into: never answered with the rest.
     """
-    return [value for value in known_secret_values() if len(value) >= _MIN_SECRET_LEN]
+    return _match_forms(known_secret_values())
 
 
 def redact_known_secrets(text: str) -> str:
@@ -2481,27 +3474,53 @@ def redact_known_secrets(text: str) -> str:
     the next round's ``role:"tool"`` message -- where the model can read it and copy it
     onward (into an install ``summary``, another tool call, ...). Masking every known
     value at each boundary where raw tool output enters the conversation/state closes
-    that class: the model only ever sees the marker, never the value.
+    that class for the text it masks: a known value in it reaches the model as the
+    marker, never as itself. What a caller attaches beside the answer afterwards -- a
+    heading, a prefix, a separator, a truncation marker -- is outside this check, and
+    with the masked text it can spell a known value that holds that text.
 
     Values come from ``known_secret_values`` (our key + every installed tool's .env
-    values + the in-flight install secret); those at least ``_MIN_SECRET_LEN`` long are
-    handed to the shared ``_mask_known_secrets`` (byte-identical to ``llm_log``'s copy),
-    which computes every mask range on the PRISTINE text and merges them -- see that
-    helper for why the range-based order is load-bearing (H1) and how the trailing
-    fragment guard fits in.
+    values + the in-flight install secret); in their match forms (``_match_forms``:
+    those at least ``_MIN_SECRET_LEN`` long, and each one's newline-normalized form)
+    they are handed to the shared ``_mask_known_secrets`` (byte-identical to
+    ``llm_log``'s copy), which computes every mask range on the PRISTINE text and
+    merges them -- see that helper for why the range-based order is load-bearing (H1)
+    and how the trailing fragment guard fits in.
 
     Unlike ``llm_log._redact``, this is on the LIVE path, so it does NOT swallow a
     provider failure into "return the text unmasked" -- that would leak the very value
     it exists to hide. ``known_secret_values`` is called WITHOUT a guard here, so any
     surprise it raised PROPAGATES to the caller's fail-closed handling (the llm loop's
     and meta-tools' own ``except`` degrade it into a safe failed-tool-result string),
-    never a silent leak.
+    never a silent leak. A list some ``.env`` could not be read into is such a
+    failure (``KnownSecretsIncomplete``), not a shorter list.
     """
     secrets = _redaction_secrets()
     # Bare call, deliberately unguarded (see the docstring above): a failure here must
     # PROPAGATE fail-closed, the opposite of llm_log._redact's guarded degrade-to-
     # unredacted direction (D36 round-5).
     return _mask_known_secrets(text, secrets)
+
+
+def redact_known_secrets_as_shown(text: str) -> str:
+    """``text`` as the model or a screen is shown it, with every known secret VALUE
+    masked: ``_masked_as_shown`` with the secrets known now.
+
+    For live-path text that can hold a lone surrogate: a file name or path read
+    from disk -- on Linux, the bytes of a name that do not decode as UTF-8 come
+    back as one each -- and a message built from one. ``redact_known_secrets`` leaves such a
+    character where it is, and one of them fails the UTF-8 encode of the whole
+    request or response the text rides in. Here each becomes three U+FFFD, and
+    because those can complete a known value the text did not hold, the answer is
+    checked once more with the mask's own matcher: one that holds a known value is
+    the redaction marker, whole.
+
+    The secrets and the failure direction are ``redact_known_secrets``'s: the list
+    is ``_redaction_secrets``, collected without a guard, so a failure to collect
+    it -- ``KnownSecretsIncomplete`` among them -- propagates to the caller. What a
+    caller puts beside the answer afterwards is outside the check, as there.
+    """
+    return _masked_as_shown(text, _redaction_secrets())
 
 
 # --- execution -------------------------------------------------------------
@@ -2607,10 +3626,12 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
 
     Blocking. ``.env`` contributes KEY NAMES only; its values are read solely to
     flag conflicts and never leave this function. ``config.env`` contributes its
-    pairs, but a value that CONTAINS a known secret -- an exact substring of some
-    registered value at the redactor's floor -- is flagged ``contains_secret`` and
-    served as the marker alone: the file holds settings by the operator's choice,
-    and a secret pasted into it by mistake is exactly what must not be served back.
+    pairs, but a value that CONTAINS a known secret -- one of the known values'
+    match forms (``_match_forms``: a registered value at the redactor's floor, or
+    its newline-normalized form, since the file is read with universal newlines) as
+    an exact substring -- is flagged ``contains_secret`` and served as the marker
+    alone: the file holds settings by the operator's choice, and a secret pasted
+    into it by mistake is exactly what must not be served back.
 
     Exact containment, deliberately NOT ``redact_known_secrets``' own answer (P1
     review C1): that redactor also masks a text that merely ENDS with the first six
@@ -2647,25 +3668,54 @@ def package_settings(package_root: PackageRoot) -> dict[str, Any]:
     }
 
 
-def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+@dataclass(frozen=True, slots=True)
+class _DotenvRead:
+    """One package env file as ``_read_package_dotenv`` read it.
+
+    ``values`` is what the parse gave, {} unless the file was read and within the
+    cap. ``unread`` is the type name of a failure that left the file unread (a
+    look, an open or a read that failed other than with "not there"); None when
+    the answer is definite, values or none. ``identity`` is the ``fstat`` identity
+    of the file the text came from (``_CappedText``), when there was text.
+    """
+
+    values: dict[str, str]
+    unread: str | None = None
+    identity: tuple[int, int, int, int, int] | None = None
+
+
+def _read_package_dotenv(env_file: Path) -> _DotenvRead:
     """The bounded read + interpolate=False parse both package env files share."""
-    # Read through the ONE bounded-regular-file helper (F3a): its O_NONBLOCK+S_ISREG
+    # Read through the ONE bounded-regular-file read (F3a): its O_NONBLOCK+S_ISREG
     # gate refuses a FIFO an operator (or a post-install mutation) could `mkfifo` in
     # place of .env -- which dotenv_values(path) would reopen and BLOCK on forever --
     # its O_NOFOLLOW refuses a symlinked .env, and its cap+1 read bounds the per-CALL
     # memory the parse would otherwise slurp whole into the child's exec env block.
-    # None (missing / FIFO / symlink / read error) and an over-cap length BOTH
-    # degrade to {} -- the SAME degrade-to-no-extra-env contract the malformed-.env
+    # No text (missing / FIFO / symlink / read error) and an over-cap length BOTH
+    # give {} -- the SAME degrade-to-no-extra-env contract the malformed-.env
     # fallback below gives -- so a runaway or mutated .env can never bloat per call.
-    text = _read_regular_file_capped(env_file, _ENV_FILE_MAX_BYTES)
-    if text is None or len(text) > _ENV_FILE_MAX_BYTES:
-        return {}
+    # The over-cap test is on the text as read, the loader's own unit, never the
+    # file's size.
+    read = _read_regular_text_capped(env_file, _ENV_FILE_MAX_BYTES)
+    if read.text is None:
+        return _DotenvRead({}, unread=read.error if read.refusal == "failed" else None)
+    if len(read.text) > _ENV_FILE_MAX_BYTES:
+        return _DotenvRead({}, identity=read.identity)
     # Parse the ALREADY-READ text (never dotenv_values(path)): handing python-dotenv the
     # path would make it REOPEN the file -- a second, UNBOUNDED read that also re-follows a
     # symlink -- defeating the bounded, O_NOFOLLOW'd read above. ``_parse_dotenv_text`` is
     # the shared interpolate=False parser (see there); both reads must be the same bytes
     # and the same regular-file decision.
-    return _parse_dotenv_text(text)
+    return _DotenvRead(_parse_dotenv_text(read.text), identity=read.identity)
+
+
+def _load_package_dotenv(env_file: Path) -> dict[str, str]:
+    """The env file's values, {} whenever there are none to give (``_read_package_dotenv``).
+
+    The runtime's degrade: a file that cannot be read gives no extra env, the same
+    as one that is not there.
+    """
+    return _read_package_dotenv(env_file).values
 
 
 def _build_tool_env(package_root: PackageRoot) -> tuple[dict[str, str], frozenset[str]]:
@@ -2728,18 +3778,20 @@ def _cap_output(text: str, cap: int) -> str:
 def _kill_process_group(proc: subprocess.Popen[str]) -> None:
     """SIGKILL the child's whole process group (it is a group leader).
 
-    ``start_new_session=True`` made the child a session/group leader, so
-    ``os.getpgid(pid) == pid`` and one ``killpg`` takes down the child AND any
-    grandchildren it spawned -- a tool that forked a runaway helper cannot
-    survive the timeout. Falls back to killing just the child if the group
-    signal cannot be delivered (already reaped, or a platform edge), and never
-    raises.
+    Every child drained by ``_communicate_bounded`` is started with
+    ``start_new_session=True``, which made it a session/group leader: its group
+    id is its pid, and one ``killpg`` takes down the child AND any grandchildren
+    it spawned -- a tool that forked a runaway helper cannot survive the timeout.
+    ESRCH and EPERM, the answers of a group with nothing left this process may
+    signal, are ignored.
+
+    Sent to ``proc.pid`` as it is: no ``getpgid``, which macOS answers ESRCH for
+    an exited leader, and no ``proc.kill()``, whose ``poll()`` would reap that
+    leader -- the teardown alone reaps it, and the group id stays pinned until
+    then.
     """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except ProcessLookupError, PermissionError, OSError:
-        with contextlib.suppress(Exception):
-            proc.kill()
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
 
 
 @dataclass(slots=True)
@@ -2750,7 +3802,9 @@ class _BoundedOutput:
     flags say a stream ran PAST the cap (and so the process was killed for it),
     which the callers use to decide between "here is the truncated output" and
     "the tool failed". ``timed_out`` is the wall-clock expiry, kept distinct so
-    a caller can render the timeout message instead of an output.
+    a caller can render the timeout message instead of an output. ``aborted``
+    says the caller's stop signal ended the wait first (only a caller that
+    passed one can see it set).
     """
 
     stdout: str
@@ -2758,6 +3812,7 @@ class _BoundedOutput:
     stdout_overflow: bool
     stderr_overflow: bool
     timed_out: bool
+    aborted: bool = False
 
 
 class _CappedReader:
@@ -2811,8 +3866,76 @@ class _CappedReader:
         self.text = joined[: self._cap + 1] if self.overflow else joined
 
 
+def _process_group_is_gone(pgid: int) -> bool:
+    """Whether no process group ``pgid`` exists any more.
+
+    Asked with signal 0, which delivers nothing, so asking after the leader was
+    reaped cannot reach another process. A group id taken up again since then
+    reads as still there: the answer can be a needless "no", never a wrong "yes".
+    """
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _resend_group_kill(pgid: int, deadline: float) -> None:
+    """Send SIGKILL to group ``pgid`` again until nothing in it is left to kill.
+
+    For a platform whose group kill can miss a fork (``_GROUP_KILL_CAN_MISS_A_FORK``):
+    ``_communicate_bounded``'s teardown calls it after its first SIGKILL and before
+    it reaps the leader, with the leader unreaped (``proc.returncode`` is None) --
+    the unreaped leader pins the group id, so every send here reaches this group
+    and no other. Each round asks with signal 0 first and stops once that raises
+    -- EPERM, macOS's answer when no live member is left to signal (exited ones
+    waiting for their reaper count as none), or ESRCH -- or once ``deadline`` has
+    passed. Whether the leader itself has exited is no reason to stop: a command
+    that ended on its own can leave members running, forking as they go.
+
+    Its end is not evidence of anything. EPERM is also the answer when every live
+    member left is one this process may not signal, and stopping early then is
+    right: such a member keeps the group in existence, which the check after the
+    reap sees, and no further send could reach it.
+    """
+    while True:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return
+        if time.monotonic() >= deadline:
+            return
+        time.sleep(_GROUP_KILL_RESEND_SECONDS)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def _group_seen_gone_by(pgid: int, deadline: float) -> bool:
+    """Whether group ``pgid`` is seen gone (``_process_group_is_gone``) by ``deadline``.
+
+    Asked at once, then every ``_WAIT_POLL_SECONDS``: a member sent SIGKILL leaves
+    the group only once its reaper (init, launchd) has collected it, so the first
+    answer may come too early. Only signal 0 is ever sent, so asking after the
+    leader's reap reaches no other process.
+    """
+    while not _process_group_is_gone(pgid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_WAIT_POLL_SECONDS, remaining))
+    return True
+
+
 def _communicate_bounded(
-    proc: subprocess.Popen[str], *, input_text: str | None, cap: int, timeout: float
+    proc: subprocess.Popen[str],
+    *,
+    input_text: str | None,
+    cap: int,
+    timeout: float,
+    abort: threading.Event | None = None,
+    on_reaped: Callable[[], None] | None = None,
 ) -> _BoundedOutput:
     """``communicate`` with a hard per-stream memory cap and a wall-clock timeout.
 
@@ -2828,6 +3951,42 @@ def _communicate_bounded(
     (see ``_CappedReader``). Threads are the mechanism, not asyncio: this runs in
     a ``run_in_threadpool`` worker, and ``file.read`` releases the GIL while it
     blocks, so the reads and the ``wait`` genuinely proceed in parallel.
+
+    ``abort`` is an optional stop signal set from another thread. Once it is set
+    while the leader still runs, the wait ends at the next poll, and the group is
+    sent SIGKILL and its leader reaped by the same teardown the deadline uses,
+    under the same lock -- so a stop never needs a kill from outside, which could
+    reach a pid already reaped and reused. The result then has ``aborted`` set.
+    Without ``abort``, the wait is the deadline-only one it always was.
+
+    Every way out passes through that teardown -- a return, and an exception
+    too (a reader thread that cannot start, say) -- so no exit skips the kill and
+    the reap. ``on_reaped``, when given, is called from the teardown itself, at
+    the one point where it is known to have worked: ``proc.wait()`` has left a
+    return code, and after that the group is seen gone -- signal 0 to it raises
+    ESRCH. The group is asked at once after the reap, then again until the
+    teardown's time limit (``_REAP_TIMEOUT_SECONDS``, counted from the teardown's
+    start, so a slow reap leaves less of it). What a send answers is never that
+    point: a SIGKILL delivered is not a member exited, macOS's group kill can miss
+    a member forked while it is sent, and EPERM may mean only that the live
+    members left are ones this process may not signal.
+    Where the kill can miss a fork, it is sent again before the reap
+    (``_resend_group_kill``); never after it, when the group id is no longer
+    pinned. ``on_reaped`` is called the same way whether the function then
+    returns or raises, and not at all when the reap failed or the group was still
+    there at the limit; a caller that must know the process is gone relies on it,
+    never on the return. It must not raise. Without it, the teardown sends one
+    SIGKILL, watches nothing, and gives each thread's join the whole limit.
+
+    There is no ``on_reaped`` to be had -- the process stays possibly running for
+    the caller -- when, among others:
+
+    * a member SIGKILL cannot end within the limit: one stuck in an
+      uninterruptible wait in the kernel, or one this process may not signal (a
+      setuid program) -- either keeps the group in existence;
+    * the service runs as PID 1 on Linux with no init: an orphaned member is
+      reaped by nobody, and its zombie keeps the group in existence, so a process
+      that leaves any member besides its leader is never confirmed.
     """
     threads: list[threading.Thread] = []
     # `teardown_lock` + `reaped` make the overflow-kill callback below and the
@@ -2839,119 +3998,161 @@ def _communicate_bounded(
     def kill() -> None:
         # Called by a _CappedReader the instant its stream passes the cap. Guarded
         # so it can NEVER run once the teardown below has begun reaping: after
-        # proc.wait() frees the leader's pid, os.getpgid(proc.pid) here could read a
-        # REUSED pid's group and _kill_process_group would signal the wrong group. The
-        # lock makes "kill" and "reap" mutually exclusive; the `reaped` flag makes a
-        # kill attempt after teardown a no-op. While NOT reaped (teardown not begun),
-        # the leader is un-reaped so proc.pid still names THIS group and the early
-        # overflow kill is valid.
+        # proc.wait() frees the leader's pid, _kill_process_group's killpg(proc.pid)
+        # here could reach a group that has REUSED that id. The lock makes "kill"
+        # and "reap" mutually exclusive; the `reaped` flag makes a kill attempt
+        # after teardown a no-op. While NOT reaped (teardown not begun), the leader
+        # is un-reaped -- the teardown is the only thing that reaps it -- so
+        # proc.pid still names THIS group and the early overflow kill is valid.
         with teardown_lock:
             if reaped:
                 return
             _kill_process_group(proc)
 
-    if input_text is not None and proc.stdin is not None:
-        stdin = proc.stdin
-
-        def _write_stdin() -> None:
-            # Best-effort: a child that exits or closes stdin early makes this
-            # raise BrokenPipeError -- not our failure. A SIGKILL later unblocks a
-            # write stalled on a full pipe, so this thread always ends.
-            with contextlib.suppress(Exception):
-                stdin.write(input_text)
-            with contextlib.suppress(Exception):
-                stdin.close()
-
-        # daemon=True on every reader/writer thread is a BACKSTOP, not the
-        # mechanism: the unconditional group kill before the reap below is what
-        # normally reaps a thread whose pipe is held open by a surviving
-        # descendant. But should even that fail (a descendant that escaped the
-        # process group entirely -- see the teardown comment), a NON-daemon
-        # thread stuck in a blocking read/write would keep the interpreter alive at
-        # shutdown; daemon makes that impossible -- at worst one FD leaks until
-        # process exit, never a hung interpreter.
-        writer = threading.Thread(target=_write_stdin, daemon=True)
-        writer.start()
-        threads.append(writer)
-
-    stdout_reader = _CappedReader(proc.stdout, cap, kill) if proc.stdout is not None else None
-    stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
-    for reader in (stdout_reader, stderr_reader):
-        if reader is not None:
-            # daemon=True for the same backstop reason as the writer above.
-            thread = threading.Thread(target=reader.run, daemon=True)
-            thread.start()
-            threads.append(thread)
-
-    # Watch the leader for exit WITHOUT reaping it, under the wall-clock deadline.
-    # We must NOT ``proc.wait`` here: reaping frees the leader's pid, and the
-    # UNCONDITIONAL group kill below (``os.killpg(proc.pid)``) would then race a
-    # kernel that had already REUSED that pid as another process's group id --
-    # signalling the wrong group. ``os.waitid(..., WEXITED | WNOWAIT | WNOHANG)``
-    # instead DETECTS the exit and leaves the leader a zombie; a zombie's pid (and
-    # therefore its process-GROUP id) is pinned un-reusable until we ``wait`` it,
-    # which is the load-bearing invariant that makes the kill race-free. WNOHANG
-    # makes each probe non-blocking so we poll under our own deadline.
     timed_out = False
-    deadline = time.monotonic() + timeout
-    while True:
-        try:
-            info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-        except ChildProcessError:
-            # Already reaped somehow (we are the only waiter, so this is defensive):
-            # stop polling and fall through to the kill, which no-ops on a gone group.
-            break
-        if info is not None:
-            break  # leader exited; the zombie is retained, pinning the PGID
-        if time.monotonic() >= deadline:
-            timed_out = True
-            break
-        time.sleep(_WAIT_POLL_SECONDS)
+    aborted = False
+    stdout_reader: _CappedReader | None = None
+    stderr_reader: _CappedReader | None = None
+    # The process exists from here on, so every way out of this function -- the
+    # normal one, or an exception such as a reader thread that cannot start --
+    # passes through the teardown in the ``finally``: none of them leaves the
+    # group running or its leader unreaped.
+    try:
+        if input_text is not None and proc.stdin is not None:
+            stdin = proc.stdin
 
-    # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
-    # callback above (teardown_lock): setting `reaped` before releasing the lock
-    # guarantees no _CappedReader can call getpgid/killpg on the pid we are about
-    # to free below. Within the lock, the kill+reap still run UNCONDITIONALLY --
-    # whether the leader exited on its own or we timed out. This is the fix for
-    # two holes the old "escalate only if a reader thread is still alive"
-    # teardown carried:
-    #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
-    #      left the readers at EOF and their threads dead, so no escalation ever
-    #      fired and the detached daemon LEAKED. An unconditional kill reaps it;
-    #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
-    #      had already freed -- a REUSED-pgid hazard. Here the leader is still
-    #      un-reaped (a zombie on natural exit, or alive on timeout), so ``proc.pid``
-    #      provably still names THIS group (``start_new_session=True`` made the
-    #      leader its own group leader, so the group id EQUALS its pid).
-    # A leader that exited NATURALLY is already a dead zombie, so this SIGKILL is a
-    # no-op for it and cannot disturb its recorded exit status -- ``proc.wait`` below
-    # still returns the tool's REAL exit code. A descendant that double-fork/setsid'd
-    # OUT of the group escapes even this and is beyond v1's non-container stance
-    # (D21); the daemon flag on every reader/writer thread is the honest backstop.
-    with teardown_lock:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(proc.pid, signal.SIGKILL)
+            def _write_stdin() -> None:
+                # Best-effort: a child that exits or closes stdin early makes this
+                # raise BrokenPipeError -- not our failure. A SIGKILL later unblocks a
+                # write stalled on a full pipe, so this thread always ends.
+                with contextlib.suppress(Exception):
+                    stdin.write(input_text)
+                with contextlib.suppress(Exception):
+                    stdin.close()
 
-        # Reap the leader now that its group is SIGKILLed: this frees the zombie
-        # (releasing the pinned pid) and, on a natural exit, returns the tool's REAL
-        # returncode -- preserving exit-code semantics for ordinary tools. No timeout
-        # is needed: the group is dead, so a natural-exit zombie is collected at once
-        # and a timed-out leader was just killed (SIGKILL is uncatchable, so it dies
-        # promptly).
-        with contextlib.suppress(Exception):
-            proc.wait()
-        reaped = True
+            # daemon=True on every reader/writer thread is a BACKSTOP, not the
+            # mechanism: the unconditional group kill before the reap below is what
+            # normally reaps a thread whose pipe is held open by a surviving
+            # descendant. But should even that fail (a descendant that escaped the
+            # process group entirely -- see the teardown comment), a NON-daemon
+            # thread stuck in a blocking read/write would keep the interpreter alive at
+            # shutdown; daemon makes that impossible -- at worst one FD leaks until
+            # process exit, never a hung interpreter.
+            writer = threading.Thread(target=_write_stdin, daemon=True)
+            writer.start()
+            threads.append(writer)
 
-    # The group is dead, so every inherited pipe write end is now closed and the
-    # (daemon) reader/writer threads hit EOF and finish. Join them under the short
-    # reap bound purely so a pathologically wedged pipe can never turn cleanup
-    # itself into a hang; with the group gone this join is guaranteed to complete.
-    # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
-    # blocked waiting on the lock, must be free to acquire it and no-op before this
-    # join can observe that thread finished -- joining while still holding the lock
-    # could deadlock against it.
-    for thread in threads:
-        thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+        stdout_reader = _CappedReader(proc.stdout, cap, kill) if proc.stdout is not None else None
+        stderr_reader = _CappedReader(proc.stderr, cap, kill) if proc.stderr is not None else None
+        for reader in (stdout_reader, stderr_reader):
+            if reader is not None:
+                # daemon=True for the same backstop reason as the writer above.
+                thread = threading.Thread(target=reader.run, daemon=True)
+                thread.start()
+                threads.append(thread)
+
+        # Watch the leader for exit WITHOUT reaping it, under the wall-clock deadline.
+        # We must NOT ``proc.wait`` here: reaping frees the leader's pid, and the
+        # UNCONDITIONAL group kill below (``os.killpg(proc.pid)``) would then race a
+        # kernel that had already REUSED that pid as another process's group id --
+        # signalling the wrong group. ``os.waitid(..., WEXITED | WNOWAIT | WNOHANG)``
+        # instead DETECTS the exit and leaves the leader a zombie; a zombie's pid (and
+        # therefore its process-GROUP id) is pinned un-reusable until we ``wait`` it,
+        # which is the load-bearing invariant that makes the kill race-free. WNOHANG
+        # makes each probe non-blocking so we poll under our own deadline.
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                info = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+            except ChildProcessError:
+                # Already reaped. Nothing here reaps the leader before the teardown
+                # does, so this is defensive: stop polling and fall through to it.
+                break
+            if info is not None:
+                break  # leader exited; the zombie is retained, pinning the PGID
+            if abort is not None and abort.is_set():
+                aborted = True
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(_WAIT_POLL_SECONDS)
+    finally:
+        # Tear the WHOLE group down and reap, atomically w.r.t. the overflow-kill
+        # callback above (teardown_lock): setting `reaped` before releasing the lock
+        # guarantees no _CappedReader can send a kill to the pid we are about to free
+        # below. Within the lock, the kill+reap still run UNCONDITIONALLY --
+        # whether the leader exited on its own, we timed out, or the caller's stop
+        # signal ended the wait. This is the fix for two holes the old "escalate only
+        # if a reader thread is still alive" teardown carried:
+        #  (a) a descendant that CLOSED its inherited stdout/stderr but kept running
+        #      left the readers at EOF and their threads dead, so no escalation ever
+        #      fired and the detached daemon LEAKED. An unconditional kill reaches it;
+        #  (b) killing AFTER ``proc.wait`` reaped the leader targeted a pid the kernel
+        #      had already freed -- a REUSED-pgid hazard. Here the kill comes before
+        #      the reap: the leader is a zombie on natural exit, or alive on timeout
+        #      or stop, so ``proc.pid`` still names THIS group (``start_new_session=True``
+        #      made the leader its own group leader, so the group id EQUALS its pid).
+        # A leader that exited NATURALLY is already a zombie, so this SIGKILL cannot
+        # disturb its recorded exit status -- ``proc.wait`` below still returns the
+        # tool's REAL exit code. Whether the send succeeds says nothing about whether
+        # the group is gone (see the docstring); with ``on_reaped`` that is asked of
+        # the group itself, after the reap. A descendant that double-fork/setsid'd
+        # OUT of the group escapes even this and is beyond v1's non-container stance
+        # (D21); the daemon flag on every reader/writer thread is the honest backstop.
+        #
+        # One limit, counted from here (``_REAP_TIMEOUT_SECONDS``), bounds the
+        # re-sent kill, the watch after the reap, and the join. The reap itself
+        # has no bound.
+        deadline = time.monotonic() + _REAP_TIMEOUT_SECONDS
+        with teardown_lock:
+            if not reaped:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                # A defence, not a path anything here takes: a leader reaped by
+                # anything before the teardown no longer pins the group id, so
+                # nothing is sent to that id again.
+                if (
+                    on_reaped is not None
+                    and _GROUP_KILL_CAN_MISS_A_FORK
+                    and proc.returncode is None
+                ):
+                    _resend_group_kill(proc.pid, deadline)
+
+                # Reap the leader: this frees the zombie (releasing the pinned pid)
+                # and, on a natural exit, returns the tool's REAL returncode --
+                # preserving exit-code semantics for ordinary tools. No timeout: a
+                # natural-exit zombie is collected at once, and a leader just sent
+                # SIGKILL dies promptly (SIGKILL is uncatchable).
+                with contextlib.suppress(Exception):
+                    proc.wait()
+                reaped = True
+
+        # The evidence ``on_reaped`` stands for, asked of the group itself now that its
+        # leader is reaped: gone at once, or within what is left of the limit. Only
+        # signal 0 is sent from here on, so it is asked OUTSIDE teardown_lock.
+        if (
+            on_reaped is not None
+            and proc.returncode is not None
+            and _group_seen_gone_by(proc.pid, deadline)
+        ):
+            on_reaped()
+
+        # Once the group is gone no member holds a write end of the pipes, so the
+        # (daemon) reader/writer threads hit EOF and the join completes at once. With
+        # ``on_reaped`` the join gets what is left of the one limit: a group still
+        # there at the limit has left the caller without evidence anyway. Without it
+        # each thread gets the whole limit, purely so a pathologically wedged pipe can
+        # never turn cleanup itself into a hang.
+        # OUTSIDE teardown_lock (released above): a reader thread still inside `kill`,
+        # blocked waiting on the lock, must be free to acquire it and no-op before this
+        # join can observe that thread finished -- joining while still holding the lock
+        # could deadlock against it.
+        for thread in threads:
+            if on_reaped is None:
+                thread.join(timeout=_REAP_TIMEOUT_SECONDS)
+            else:
+                thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     return _BoundedOutput(
         stdout=stdout_reader.text if stdout_reader is not None else "",
@@ -2959,6 +4160,7 @@ def _communicate_bounded(
         stdout_overflow=stdout_reader.overflow if stdout_reader is not None else False,
         stderr_overflow=stderr_reader.overflow if stderr_reader is not None else False,
         timed_out=timed_out,
+        aborted=aborted,
     )
 
 
@@ -2985,7 +4187,9 @@ _TOOL_DISABLED_RESULT = "tool not run: this tool was disabled after it was offer
 # How one call ended, as its run record states it. ``refused`` is the tool never
 # running (disabled, replaced, identity changed); ``error`` is the BACKEND failing
 # the call -- the secret scan behind the redaction, the tools lock -- whether or
-# not the tool had run, which the model reads as ``tool execution failed: <type>``.
+# not the tool had run. One that raised the model reads as ``tool execution
+# failed: <type>``; a tool that ran and whose output could not be masked, as
+# ``output_withheld_text``, which says it ran.
 # Every other non-ok value is a way a tool that DID start can fail.
 # ``output_overflow`` is the one the model's string cannot tell apart: stderr past
 # the cap kills the process group, so the model sees ``tool failed (exit -9)`` --
@@ -3004,13 +4208,28 @@ RUN_ERROR = "error"
 RUN_FAILURE_OUTCOMES = frozenset({RUN_FAILED, RUN_OUTPUT_OVERFLOW, RUN_TIMEOUT, RUN_START_FAILED})
 
 
+def output_withheld_text(what: str, exit_code: int | None) -> str:
+    """The result of a command that ran but whose output could not be checked.
+
+    ``what`` is "tool" (an installed tool) or "command" (the builder's
+    ``run_shell``). Says that it ran and how it ended, so that it is not taken
+    for a call that never happened, and that its output is withheld because it
+    could not be checked for known secrets -- none of it, nor why in more detail,
+    is in the text.
+    """
+    return (
+        f"{what} ran (exit {exit_code}), but its output is withheld: "
+        "it could not be checked for known secrets"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ToolRunResult:
     """One call's outcome: the string the model gets, plus what its record keeps.
 
-    ``text`` is the agent-visible result, byte-identical to what this module
-    returned before run records existed (invariant F) -- the record is an
-    observer and must not change the conversation. ``args``/``stdout``/``stderr``
+    ``text`` is the agent-visible result, the same whether or not a recorder is
+    wired (invariant F) -- the record is an observer and must not change the
+    conversation. ``args``/``stdout``/``stderr``
     are set only for a run that started and failed, already REDACTED and not yet
     CUT: the recorder applies its own caps afterwards, the redact->cap order.
     """
@@ -3249,29 +4468,38 @@ def _run_tool_subprocess(
     # regardless of the (kill-induced, negative) exit code the overflow kill left
     # behind: the tool produced its answer, we just stopped reading it. _cap_output
     # trims the retained cap+1 chars down to the cap behind the marker.
-    if output.stdout_overflow:
-        return ToolRunResult(
-            _cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK, truncated=True
-        )
-    if proc.returncode != 0:
-        # One snapshot of the known secrets serves the model's string AND the
-        # record, so this branch still scans once. Fail-closed exactly as
-        # ``redact_known_secrets`` is: these are the same two calls it makes.
-        secrets = _redaction_secrets()
-        stderr = _mask_known_secrets(output.stderr, secrets)
-        # ``output_overflow`` only when the overflow KILL ended it: a tool that
-        # wrote past the cap and exited with its own code first is a plain failure
-        # (its code is what the model was told). Exit 0 never reaches here.
-        killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
-        return ToolRunResult(
-            f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
-            RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
-            exit_code=proc.returncode,
-            args=_mask_known_secrets(args_json, secrets),
-            stdout=_mask_known_secrets(output.stdout, secrets),
-            stderr=stderr,
-        )
-    return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
+    try:
+        if output.stdout_overflow:
+            return ToolRunResult(
+                _cap_output(redact_known_secrets(output.stdout), output_cap),
+                RUN_OK,
+                truncated=True,
+            )
+        if proc.returncode != 0:
+            # One snapshot of the known secrets serves the model's string AND the
+            # record, so this branch still scans once. Fail-closed exactly as
+            # ``redact_known_secrets`` is: these are the same two calls it makes.
+            secrets = _redaction_secrets()
+            stderr = _mask_known_secrets(output.stderr, secrets)
+            # ``output_overflow`` only when the overflow KILL ended it: a tool that
+            # wrote past the cap and exited with its own code first is a plain failure
+            # (its code is what the model was told). Exit 0 never reaches here.
+            killed_for_output = output.stderr_overflow and proc.returncode == -signal.SIGKILL
+            return ToolRunResult(
+                f"tool failed (exit {proc.returncode}): {_cap_output(stderr.strip(), output_cap)}",
+                RUN_OUTPUT_OVERFLOW if killed_for_output else RUN_FAILED,
+                exit_code=proc.returncode,
+                args=_mask_known_secrets(args_json, secrets),
+                stdout=_mask_known_secrets(output.stdout, secrets),
+                stderr=stderr,
+            )
+        return ToolRunResult(_cap_output(redact_known_secrets(output.stdout), output_cap), RUN_OK)
+    except Exception:
+        # The tool RAN; only what it wrote could not be checked against the known
+        # secrets (a ``.env`` that cannot be read, say), so none of it is handed
+        # over, to the model or to the record. Said as it is: told the call failed,
+        # a model may run it again, and the tool may act on something real.
+        return ToolRunResult(output_withheld_text("tool", proc.returncode), RUN_ERROR)
 
 
 @dataclass(slots=True, weakref_slot=True)
@@ -3545,7 +4773,7 @@ def _make_handler(
             try:
                 tools_lock_fd = owned_lock_fd
                 if identity is not None and tools_lock_fd is None:
-                    owned_lock_fd = await run_in_threadpool(acquire_shared_tools_lock)
+                    owned_lock_fd = await acquire_shared_tools_lock_async()
                     tools_lock_fd = owned_lock_fd
                 # Timed from here: a direct caller may have waited for a destroyer
                 # to let go of the lock, and that wait is not the tool's duration.
@@ -3578,8 +4806,7 @@ def _make_handler(
             )
             return result
         finally:
-            if owned_lock_fd is not None:
-                await run_in_threadpool(release_tools_lock, owned_lock_fd)
+            release_tools_lock(owned_lock_fd)
 
     async def _handler(arguments: dict[str, Any]) -> str:
         try:
@@ -3637,9 +4864,13 @@ def load_examples(version_root: VersionRoot) -> ExamplesFile:
     file goes through. The shape is ``{"examples": [{"name": str, "args": {...}},
     ...]}`` with at most ``EXAMPLES_MAX`` entries; each ``args`` is a JSON object,
     because that is what a tool is called with.
+
+    No examples only when ``examples.json`` is seen not to exist (``_seen_gone``).
+    A look at it that fails reads on, so the read reports a file it could not
+    read instead of passing for no examples.
     """
     path = version_root.path / _EXAMPLES_FILENAME
-    if not os.path.lexists(path):
+    if _seen_gone(path):
         return ExamplesFile()
     text = _read_regular_file_capped(path, _EXAMPLES_MAX_BYTES)
     if text is None:
@@ -3786,7 +5017,7 @@ async def run_examples(
     all of them down), and once ``budget_seconds`` is spent the rest are not run
     (invariant S). ``on_progress`` sees the result after every example.
     """
-    fd = await run_in_threadpool(acquire_shared_tools_lock)
+    fd = await acquire_shared_tools_lock_async()
     if fd is None:
         return CheckResult(status="not_found")
     try:
@@ -3817,7 +5048,7 @@ async def run_examples(
             await _write_check(name, check_id, workflow, result)
             return result
     finally:
-        await run_in_threadpool(release_tools_lock, fd)
+        release_tools_lock(fd)
 
 
 async def _write_check(name: str, check_id: str, workflow: str, result: CheckResult) -> None:
@@ -3894,67 +5125,58 @@ async def _run_loaded_examples(
 # --- mutation (name-validated + containment-checked) -----------------------
 
 
-def _resolve_package_dir(name: str) -> Path | None:
-    """Resolve ``<tools_dir>/<name>`` for a mutation, or None if it is unsafe.
-
-    The path-traversal hard-block, in two independent layers:
-
-    1. ``name`` must match ``_NAME_RE`` -- which admits no ".", "/", or
-       whitespace, so ``".."`` / ``"../evil"`` / ``"/etc/passwd"`` never even
-       reach the filesystem;
-    2. the RESOLVED candidate must still be contained under the RESOLVED
-       ``tools_dir``. Redundant with (1) for a plain name, but it is what
-       actually stops a package that is a SYMLINK pointing outside the tools dir
-       (or any future loosening of the regex) from letting ``delete_tool``
-       ``rmtree`` an arbitrary path. Attack blocked: a request to
-       ``set_enabled("../../etc")`` or a symlinked ``evil`` package escaping the
-       directory returns None here and the caller no-ops.
-
-    None also covers the feature being off (``tools_dir`` unset).
-    """
-    base = tools_dir()
-    if base is None or not _NAME_RE.match(name):
-        return None
-    candidate = (base / name).resolve()
-    if not _is_within(base.resolve(), candidate):
-        return None
-    return candidate
-
-
 def _resolve_package_dir_no_alias(name: str) -> PackageRoot | None:
-    """``_resolve_package_dir`` PLUS the INTERNAL-alias refusal, in one helper.
+    """The package directory ``<tools_dir>/<name>`` itself, never one reached through a link.
 
-    ``_resolve_package_dir`` resolves ``tools/<name>`` and then checks
-    containment -- which an INTERNAL symlink ``tools/alias -> tools/real``
-    PASSES, because it resolves to a path genuinely inside the tools root. The
-    alias/real distinction is erased by that ``resolve()``, so a caller handed
-    the result cannot tell it was addressed through an alias, and every
-    by-name operation on it silently acts on the REAL package instead
-    (a regenerate spending an LLM session rewriting the summary of REAL's live
-    version, a discard by that name retiring it). ``set_enabled`` calls
-    that out at length and hard-blocks it before its own resolve, for exactly
-    this reason (see its H3 comment); ``delete_tool`` carries its own variant
-    because it has a SAFE alias action (unlink just the link).
+    Every route and service that addresses a package BY NAME goes through here,
+    so that none acts on another package through an alias: an internal link
+    ``tools/alias -> tools/real`` resolves inside the tools root and would hand
+    ``real`` to whatever the caller does next -- a discard by the alias's name
+    removing ``real``'s draft or retiring its current version, a regenerate
+    rewriting its summary. ``_delete_tool_locked`` alone looks at the name
+    itself first, with a strict ``lstat``, and then asks here.
 
-    Every route/service that addresses a package BY NAME with no such special
-    case goes through here instead of composing the three steps itself, so the
-    hard-block cannot be forgotten by the next one added: name regex + tools_dir
-    gate, then ``is_symlink`` (which does NOT follow the final component, so it
-    sees the alias itself) BEFORE the resolve, then the containment resolve, and
-    finally the "is anything actually installed there" ``is_dir``. None is the
-    single did-not-happen answer for all four.
+    In order: the name pattern and the feature being on; ``is_symlink`` on
+    ``<tools_dir>/<name>``, which sees an alias without following it; the resolve
+    of that path; the check on what the resolve gave, which must be exactly
+    ``<tools_dir>/<name>`` with the base as ``tools_dir`` spelled it, not resolved
+    again; and ``is_dir``, something installed there. The check on the result is
+    what refuses an alias: ``is_symlink`` answers "not a link" when its look
+    fails, while a resolve that follows the link gives another path -- the
+    target, wherever it is, a directory of the same name under another parent in
+    the root included. The check makes no query of its own, so it has no failure
+    to misread, and a path equal to ``<tools_dir>/<name>`` is inside the root by
+    construction. It also refuses a base from ``tools_dir``'s ``ENOTDIR`` branch,
+    a configured path that runs through a file with its ``..`` kept: the resolve
+    folds every ``..`` and lands in a directory the configured path cannot
+    reach. The base is taken once, so the resolve and the check work from one
+    root even if ``tools_dir`` would answer with another a moment later.
 
-    ``_resolve_package_dir`` is deliberately left alone: ``delete_tool`` must
-    keep reaching an alias to unlink it, so the refusal belongs in this
-    composition, not in the shared resolve.
+    A failed ``is_symlink`` look does not refuse a real package -- it stays a
+    pre-check rather than a strict ``lstat``, and a resolve that cannot look at a
+    component keeps it as written -- but a failed ``is_dir`` look gives None.
+    The record purges do not read its None: they look at the name themselves
+    (``tool_runs._package_seen_gone``).
+
+    What it does not cover: an alias whose looks all fail, ``is_symlink``'s and
+    the resolve's, is handed out as the alias path itself, never its target. What
+    acts on a package looks at its directory without following a link and
+    refuses it (``resolve_current``, ``tool_drafts._own_meta``), or looks before
+    it asks here (``_delete_tool_locked``'s ``lstat``, which goes no further when
+    that look fails or sees a link); the settings and the run records' version
+    state are read through it. Nor does it cover a link put in place meanwhile:
+    after this answer, or during it in the root's own path, which gives None.
     """
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return None
-    if (base / name).is_symlink():
+    package = base / name
+    if package.is_symlink():
         return None
-    directory = _resolve_package_dir(name)
-    return PackageRoot(directory) if directory is not None and directory.is_dir() else None
+    directory = package.resolve()
+    if directory != package or not directory.is_dir():
+        return None
+    return PackageRoot(directory)
 
 
 def set_enabled(name: str, enabled: bool) -> bool:
@@ -3967,22 +5189,18 @@ def set_enabled(name: str, enabled: bool) -> bool:
     base = tools_dir()
     if base is None or not _NAME_RE.match(name):
         return False
-    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
-    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
-    # resolve-then-contain check below would PASS and this toggle would write the
-    # state file INTO the REAL package THROUGH the alias -- switching off a tool
-    # the operator addressed by another name. ``is_symlink`` does not follow the
-    # final component, so it detects the alias itself; refuse outright -- set_enabled
-    # has no safe action on an alias, unlike delete_tool which can at least drop
-    # just the dangling link. Checked before resolve precisely because
-    # ``resolve()`` erases the alias/real distinction. External-symlink escapes are
-    # separately caught by ``_resolve_package_dir``'s containment check.
-    if (base / name).is_symlink():
+    # The lookup refuses a link at the name, wherever it points: its own look
+    # sees the link, and where that look fails, what a resolve that follows the
+    # link gives is not exactly ``<tools_dir>/<name>``. An alias whose looks all
+    # fail, ``is_symlink``'s and the resolve's, is handed back as the alias path
+    # itself, never its target, and ``resolve_current`` below refuses it: its
+    # ``lstat`` of the package directory takes neither a failed look nor a link
+    # for a package directory. So the toggle needs no strict ``lstat`` of its
+    # own the way deletion does: deletion must be able to remove a package that
+    # ``resolve_current`` refuses, and this toggle refuses one.
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
         return False
-    directory = _resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
-        return False
-    package_root = PackageRoot(directory)
     # The one write is atomic: a torn
     # state file is an UNREADABLE one, and an unreadable one takes the package out
     # of the registry (see ``_read_enabled_state``), so publishing this by
@@ -4008,6 +5226,21 @@ def set_enabled(name: str, enabled: bool) -> bool:
     if _read_enabled_state(package_root).notice is not None:
         return False
     return write_package_state(package_root, enabled)
+
+
+def _seen_gone(path: Path) -> bool:
+    """Whether ``path`` is seen not to exist: its ``lstat`` says so, and nothing else.
+
+    An ``lstat`` that fails any other way -- a directory above it denies search,
+    say -- says nothing about it, so it is not gone as far as anyone can tell.
+    """
+    try:
+        os.lstat(path)
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    return False
 
 
 type ToolRemovalOutcome = Literal["removed", "retained"]
@@ -4113,7 +5346,7 @@ def _discard_version_locked(package_root: PackageRoot, expected_vid: str) -> Dis
 
     with contextlib.suppress(Exception):
         shutil.rmtree(parked)
-    if os.path.lexists(parked):
+    if not _seen_gone(parked):
         return ToolRemovalResult("retained", parked, "cleanup_failed")
     return ToolRemovalResult("removed", None, None)
 
@@ -4125,11 +5358,16 @@ type DeleteToolResult = ToolRemovalResult | Literal["ai_job_in_progress"]
 def delete_tool(name: str) -> DeleteToolResult | None:
     """Delete a package (``rmtree``), or unlink an alias; return its outcome.
 
-    Name-validated and containment-checked exactly like ``set_enabled`` (the
-    traversal hard-block is what makes an ``rmtree`` here safe), so it can only
-    ever remove a directory that genuinely sits inside ``tools_dir``. None when
-    the name is unsafe, the package is absent, or it could not be taken out of
-    the registry at all.
+    Name-validated, then one strict ``lstat`` of its own, then
+    ``_resolve_package_dir_no_alias`` (the traversal hard-block is what makes an
+    ``rmtree`` here safe), so it can only ever remove a directory that sits
+    exactly at ``<tools_dir>/<name>``. None when the name is unsafe, the tools
+    directory is not seen as a directory (not there, or a look at it that fails),
+    the package is absent, the look at this name fails, what the name resolves
+    to is not the package directory itself, or it could not be taken out of the
+    registry at all. The tools directory is looked at before any lock is tried:
+    ``exclusive_tools_lock`` answers False for a root that is not a directory,
+    which would read as an AI job in progress.
 
     Destruction occurs only under the non-blocking exclusive tools lock. An
     ordinary request holds the shared side from advertisement through response,
@@ -4143,7 +5381,7 @@ def delete_tool(name: str) -> DeleteToolResult | None:
     sweep; no local generation/provenance judgement participates.
     """
     base = tools_dir()
-    if base is None or not _NAME_RE.match(name):
+    if base is None or not _NAME_RE.match(name) or not base.is_dir():
         return None
     with exclusive_tools_lock(base) as acquired:
         if not acquired:
@@ -4154,34 +5392,51 @@ def delete_tool(name: str) -> DeleteToolResult | None:
 def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
     """Delete one validated name while the exclusive tools lock is held."""
 
-    # INTERNAL-alias hard-block (H3), BEFORE resolve: an internal symlink
-    # ``tools/<name> -> tools/real`` RESOLVES inside the tools root, so the
-    # resolve-then-contain check below would PASS and ``rmtree`` would recurse
-    # through the alias and DELETE THE REAL PACKAGE -- user-triggerable data loss,
-    # since the scan lists the alias as an invalid row and the UI offers 刪除 on
-    # invalid rows. ``is_symlink`` does not follow the final component, so it
-    # detects the alias itself; ``unlink`` removes ONLY the link (its target,
-    # internal OR external, is never touched), so the phantom row disappears and
-    # the real package survives. This is a genuine deletion of what the user saw
-    # (the alias row), so it reports removed. It runs before resolve precisely
-    # because ``resolve()`` would erase the alias/real distinction; the
-    # resolve-then-contain check below still guards a non-symlink external escape.
+    # Two guards stand between the name and the ``rmtree`` below.
+    #
+    # First, one ``lstat`` that raises decides what the name is: a link, a
+    # directory, or anything else, which is refused. A look that fails cannot
+    # tell a link from a directory, so it touches nothing, and the answer is
+    # None, as for a missing package. Taken for "not a link" -- what
+    # ``is_symlink`` answers when its look fails -- an alias
+    # ``tools/<name> -> tools/real`` would go on as a package directory, and
+    # what becomes of it would be left to later looks that can fail the same
+    # way: the lookup below refuses ``real``, where a resolve that follows the
+    # alias lands, but when its looks fail too, ``is_symlink``'s and the
+    # resolve's, it hands back the link itself, to be renamed in place of a
+    # package and reported retained.
     candidate = base / name
-    if candidate.is_symlink():
+    try:
+        info = os.lstat(candidate)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode):
+        # ``unlink`` removes only the link: what it points at, inside the root
+        # or out, is never touched. A link to a directory is listed as an
+        # invalid row and the UI offers 刪除 on it, so this removes what the
+        # operator saw and reports removed.
         try:
             candidate.unlink()
         except OSError:
             return None
         return ToolRemovalResult("removed", None, None)
-    directory = _resolve_package_dir(name)
-    if directory is None or not directory.is_dir():
+    if not stat.S_ISDIR(info.st_mode):
         return None
-    # ``directory.parent`` rather than ``base``: the containment check above
-    # already proved the resolved package sits directly under the resolved tools
-    # root, so this is that root -- and taking it FROM the path being renamed is
-    # what makes "the new name lands in the same directory" true by construction
-    # rather than by re-deriving it. A rename inside one directory is also the
-    # only shape that cannot cross a filesystem, and the only one that is atomic.
+    # Second, the package lookup hands back only ``<tools_dir>/<name>`` itself,
+    # never a path reached through a link: what its resolve gave must be exactly
+    # that path. The look above sees only its own moment, so this is what keeps
+    # a directory replaced by a link after it from handing this deletion the
+    # package the link points at.
+    package_root = _resolve_package_dir_no_alias(name)
+    if package_root is None:
+        return None
+    directory = package_root.path
+    # ``directory.parent`` rather than ``base``: the lookup's check proved the
+    # package is exactly ``<tools_dir>/<name>``, so its parent is the tools root
+    # -- and taking it FROM the path being renamed is what makes "the new name
+    # lands in the same directory" true by construction rather than by
+    # re-deriving it. A rename inside one directory is also the only shape that
+    # cannot cross a filesystem, and the only one that is atomic.
     stale = _stale_backup_path(directory.parent, name, uuid4().hex)
     try:
         os.rename(directory, stale)
@@ -4190,9 +5445,10 @@ def _delete_tool_locked(base: Path, name: str) -> ToolRemovalResult | None:
         # not happen" -- the same answer a failed removal gave before.
         return None
     # Best-effort from here: the tool is already gone as far as every registry
-    # reader is concerned, so partial removal is reported as retained and retried
-    # by the exclusive stale sweep.
+    # reader is concerned. Removed only once the stale path is seen gone; what is
+    # not -- partial removal, or remains a look cannot see -- is reported as
+    # retained with its path and retried by the exclusive stale sweep.
     shutil.rmtree(stale, ignore_errors=True)
-    if os.path.lexists(stale):
+    if not _seen_gone(stale):
         return ToolRemovalResult("retained", stale, "cleanup_failed")
     return ToolRemovalResult("removed", None, None)

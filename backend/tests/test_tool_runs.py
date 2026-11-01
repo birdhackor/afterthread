@@ -8,11 +8,14 @@ database costs the record at most, never the call; W -- route declaration order.
 """
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import sqlite3
 import sys
 import time
+import typing
 from collections.abc import Callable, Generator
 from datetime import UTC, datetime
 from functools import partial
@@ -21,16 +24,19 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from pydantic import BaseModel
 from sqlalchemy import Engine
 from sqlmodel import Session, SQLModel, col, select
 
+from afterthread import schemas
 from afterthread.config import Settings
 from afterthread.db import get_session
 from afterthread.main import app
-from afterthread.models import SQLITE_MAX_INT, ToolRun
-from afterthread.services import llm, llm_log, tool_runs, tools
+from afterthread.models import SQLITE_MAX_INT, ToolCheck, ToolRun
+from afterthread.routers import tools as tools_router
+from afterthread.services import llm, llm_log, tool_builder, tool_runs, tools
 from afterthread.services.llm import LLMUpstreamError
 from afterthread.services.tools import enabled_llm_tools, set_enabled
 
@@ -326,31 +332,59 @@ def test_no_recorder_means_no_record_and_the_same_result(
 def test_a_call_the_backend_fails_is_recorded_as_error_and_still_raises(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
 ) -> None:
-    """Every call is recorded -- also one that dies in the backend after the tool ran.
+    """Every call is recorded -- also one the backend fails with an exception.
 
-    The fail-closed redaction is the realistic case: the tool exited non-zero and
-    the secret scan masking its stderr raised. The exception still reaches the
-    llm loop, which tells the model what it always did; the record stores the
-    same words and keeps no bodies.
+    The exception still reaches the llm loop, which tells the model its category;
+    the record stores the same words and keeps no bodies.
     """
     root = tmp_path / "tools"
-    _make_tool(root, "boom", "import sys\nsys.stderr.write('bad')\nsys.exit(1)\n")
+    _make_tool(root, "boom", "print('never run')\n")
     _install_tools(monkeypatch, root)
     [tool] = enabled_llm_tools()
 
-    def _broken_scan() -> frozenset[str]:
-        raise OSError("tools directory unreadable")
+    def _broken_run(*args: Any) -> tools.ToolRunResult:
+        raise RuntimeError("the backend failed the call")
 
-    monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
+    monkeypatch.setattr(tools, "_run_tool_subprocess", _broken_run)
 
-    with pytest.raises(OSError):
+    with pytest.raises(RuntimeError):
         asyncio.run(tool.handler({"q": "x"}))
     model_text = asyncio.run(llm._invoke_tool_handler(tool, '{"q": "x"}'))
 
-    assert model_text == "tool execution failed: OSError"
+    assert model_text == "tool execution failed: RuntimeError"
     assert [run.outcome for run in records] == [tools.RUN_ERROR, tools.RUN_ERROR]
     assert records[0].message == model_text
     assert (records[0].args, records[0].stdout, records[0].stderr) == (None, None, None)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_tool_that_ran_but_whose_output_cannot_be_masked_says_it_ran_and_hands_none_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, records: list[tools.ToolRunRecord]
+) -> None:
+    """The tool ran and wrote another tool's secret to stderr, and that other
+    tool's directory cannot be looked at, so its ``.env`` -- and the secret -- is
+    not in the known list. Nothing of the output is handed over, to the model or
+    to the record, and the model is told the tool ran and how it ended, not that
+    it failed to run. Red before the fix: the list was taken as whole without that
+    ``.env``, and the secret reached the model unmasked."""
+    root = tmp_path / "tools"
+    secret = "other-tool-secret-abcdef"
+    _make_tool(root, "boom", f"import sys\nsys.stderr.write('leak {secret}')\nsys.exit(1)\n")
+    other = _make_tool(root, "other", "print('x')\n", dotenv=f"OTHER_KEY={secret}\n")
+    _install_tools(monkeypatch, root)
+    [tool, _other_tool] = enabled_llm_tools()
+    assert tool.spec["function"]["name"] == "boom"
+    other.chmod(0)
+    try:
+        model_text = asyncio.run(llm._invoke_tool_handler(tool, '{"q": "x"}'))
+    finally:
+        other.chmod(0o700)
+
+    assert secret not in model_text
+    assert model_text == tools.output_withheld_text("tool", 1)
+    [run] = records
+    assert (run.outcome, run.message) == (tools.RUN_ERROR, model_text)
+    assert (run.args, run.stdout, run.stderr) == (None, None, None)
 
 
 def test_a_call_cut_off_by_the_interaction_deadline_still_ends_and_is_recorded(
@@ -771,6 +805,78 @@ def test_fixable_is_a_failure_of_the_current_version(
     }
 
 
+def test_a_directory_whose_name_is_not_utf8_lists_as_an_invalid_row_nothing_looks_up_or_reaches(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tools directory holds an entry whose name is not UTF-8, which Linux reads
+    back with a lone surrogate for the byte (APFS refuses such a name, so the scan of
+    it is added to the listing). The list still loads: the other tool is listed with
+    its newest run, and that entry is a row of its own -- invalid, its name made
+    encodable, no run looked up for it. No per-tool route takes the name the row
+    shows, and whatever such a directory holds, it does not scan valid: the
+    manifest's name must equal the directory's."""
+    root = tmp_path / "tools"
+    package = _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    [run_id] = _seed_rows(session, _record())
+    not_utf8 = b"pkg-\xff".decode("utf-8", "surrogateescape")
+    real_scan_all = tools._scan_all
+    monkeypatch.setattr(
+        tools,
+        "_scan_all",
+        lambda: [*real_scan_all(), tools.scan_installed(tools.PackageRoot(root / not_utf8))],
+    )
+    real_lookup = tool_runs.last_runs_by_name
+    looked_up: list[list[str]] = []
+
+    def lookup(session: Session, names: list[str]) -> dict[str, ToolRun]:
+        looked_up.append(list(names))
+        return real_lookup(session, names)
+
+    monkeypatch.setattr(tool_runs, "last_runs_by_name", lookup)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["tools"]}
+    shown = "pkg-" + "�" * 3
+    assert set(rows) == {"kb", shown}
+    assert (rows["kb"]["valid"], rows["kb"]["last_run"]["id"]) == (True, run_id)
+    assert (rows[shown]["valid"], rows[shown]["last_run"]) == (False, None)
+    assert rows[shown]["error"]
+    assert looked_up == [["kb"]]
+    per_tool = [
+        route
+        for route in tools_router.router.routes
+        if isinstance(route, APIRoute) and route.path.startswith("/tools/{name}")
+    ]
+    # The filter finds at least these.
+    assert {
+        ("PATCH", "/tools/{name}"),
+        ("DELETE", "/tools/{name}"),
+        ("DELETE", "/tools/{name}/versions/{vid}"),
+        ("DELETE", "/tools/{name}/draft"),
+        ("GET", "/tools/{name}/summary"),
+        ("POST", "/tools/{name}/summary/regenerate"),
+        ("POST", "/tools/{name}/revise"),
+        ("POST", "/tools/{name}/draft/publish"),
+        ("POST", "/tools/{name}/check"),
+        ("GET", "/tools/{name}/settings"),
+        ("GET", "/tools/{name}/runs"),
+    } <= {(method, route.path) for route in per_tool for method in route.methods or set()}
+    for route in per_tool:
+        path = "/api" + route.path.replace("{name}", shown).replace("{vid}", _TEST_VID)
+        assert route.methods, route.path
+        for method in route.methods:
+            refused = client.request(method, path, json={})
+            assert refused.status_code == 422, (method, route.path)
+            assert ["path", "name"] in [error["loc"] for error in refused.json()["detail"]]
+    version = tools.VersionRoot(package / tools._VERSIONS_DIRNAME / _TEST_VID)
+    assert tools._scan_tool_content(version, not_utf8).error == (
+        "name does not match the package name"
+    )
+
+
 def test_an_older_version_that_still_exists_is_older_not_gone(
     client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1027,6 +1133,195 @@ def test_a_missing_tools_directory_makes_no_record_an_orphan(
 
     assert _purge(client, orphans_only=True)["matched"] == 0
     assert client.get("/api/tool-runs/stats").json()["orphans"] == 0
+
+
+def _looks_failing_at(
+    patch: pytest.MonkeyPatch,
+    target: Path,
+    code: int,
+    looks: tuple[str, ...] = ("lstat", "stat"),
+) -> list[str]:
+    """The ``os`` looks named in ``looks`` fail with ``code`` on exactly ``target``;
+    any other path is looked at as before. Both by default, as both fail under a
+    directory that denies search. Returns the names of the looks it failed."""
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def failing(name: str) -> Callable[..., Any]:
+        real = getattr(os, name)
+
+        def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+            spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+            if spelled == spelled_target:
+                failed.append(name)
+                raise OSError(code, "a-failure-text-never-shown", spelled_target)
+            return real(path, *args, **kwargs)
+
+        return fake
+
+    for name in looks:
+        patch.setattr(os, name, failing(name))
+    return failed
+
+
+def _seed_verdicts(session: Session, *names: str) -> None:
+    for name in names:
+        session.add(
+            ToolCheck(
+                check_id=f"{name}-check",
+                tool_name=name,
+                vid=_TEST_VID,
+                workflow="health_check",
+                total=1,
+                passed=1,
+                failed=0,
+            )
+        )
+    session.commit()
+
+
+def _verdict_names(session: Session) -> list[str]:
+    session.expire_all()
+    return sorted(row.tool_name for row in session.exec(select(ToolCheck)))
+
+
+def test_a_failed_look_at_a_tool_makes_no_orphan_of_its_records_or_verdicts(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a look that sees no package there makes an orphan; a failed one saw nothing."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n")
+    _install_tools(monkeypatch, root)
+    kb, gone = _seed_rows(session, _record(tool_name="kb"), _record(tool_name="gone"))
+    _seed_verdicts(session, "kb", "gone")
+    failed_looks = _looks_failing_at(monkeypatch, root.resolve() / "kb", errno.EACCES)
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    # The bound covers kb's record as well: only the scope keeps it.
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert failed_looks
+    assert _ids(session) == [kb]
+    assert _verdict_names(session) == ["kb"]
+
+
+def _listed(client: TestClient) -> list[str]:
+    return [row["name"] for row in client.get("/api/tools").json()["tools"]]
+
+
+def test_a_link_at_a_tool_s_name_that_leads_to_a_directory_makes_no_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The tools list shows such a link as a row, and its 刪除 removes the link alone,
+    the records and verdicts of its name with it."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "print('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    alias, gone = _seed_rows(session, _record(tool_name="alias"), _record(tool_name="gone"))
+    _seed_verdicts(session, "alias", "gone")
+
+    assert "alias" in _listed(client)
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert _ids(session) == [alias]
+    assert _verdict_names(session) == ["alias"]
+
+    assert client.delete("/api/tools/alias").json()["runs_deleted"] is True
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+    assert (root / "real").is_dir()
+
+
+@pytest.mark.parametrize(
+    "target",
+    ["nowhere", "a-file/inside", "a-file", "alias"],
+    ids=["dangling", "through-a-file", "to-a-file", "into-itself"],
+)
+def test_a_link_at_a_tool_s_name_that_leads_to_no_directory_makes_orphans(
+    client: TestClient,
+    session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    target: str,
+) -> None:
+    """The tools list has no row for such a link, so the orphan purge is where the
+    records and verdicts of its name go."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    (root / "a-file").write_text("not a package\n", encoding="utf-8")
+    (root / "alias").symlink_to(root / target)
+    _install_tools(monkeypatch, root)
+    [alias] = _seed_rows(session, _record(tool_name="alias"))
+    _seed_verdicts(session, "alias")
+
+    assert "alias" not in _listed(client)
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": alias}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=alias)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+
+
+def test_a_link_whose_target_cannot_be_looked_at_makes_no_orphan(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The link itself is seen, but following it fails, as it does into a directory that
+    denies search: that look saw nothing, so the link's records and verdicts stay."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "print('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    alias, gone = _seed_rows(session, _record(tool_name="alias"), _record(tool_name="gone"))
+    _seed_verdicts(session, "alias", "gone")
+    failed_looks = _looks_failing_at(
+        monkeypatch, root.resolve() / "alias", errno.EACCES, looks=("stat",)
+    )
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": gone}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=gone)["deleted"] == 1
+    assert failed_looks
+    assert _ids(session) == [alias]
+    assert _verdict_names(session) == ["alias"]
+
+
+def test_a_record_name_no_package_can_have_is_an_orphan_even_where_a_directory_sits(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The installer's staging directory is never a package, whatever is in it."""
+    root = tmp_path / "tools"
+    (root / tool_builder._STAGING_DIRNAME).mkdir(parents=True)
+    _install_tools(monkeypatch, root)
+    [staged] = _seed_rows(session, _record(tool_name=tool_builder._STAGING_DIRNAME))
+    _seed_verdicts(session, tool_builder._STAGING_DIRNAME)
+
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": staged}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=staged)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
+
+
+def test_a_file_at_a_tool_s_name_makes_orphans_of_its_records_and_verdicts(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No package can be where a file is, and deleting the tool by that name refuses it:
+    the orphan purge is where its records and verdicts go."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    (root / "kb").write_text("not a package\n", encoding="utf-8")
+    _install_tools(monkeypatch, root)
+    [kb] = _seed_rows(session, _record(tool_name="kb"))
+    _seed_verdicts(session, "kb")
+
+    assert client.delete("/api/tools/kb").status_code == 404
+    assert client.get("/api/tool-runs/stats").json()["orphans"] == 1
+    assert _purge(client, orphans_only=True) == {"matched": 1, "deleted": 0, "max_id": kb}
+    assert _purge(client, orphans_only=True, dry_run=False, max_id=kb)["deleted"] == 1
+    assert _ids(session) == []
+    assert _verdict_names(session) == []
 
 
 def test_a_purge_with_an_unknown_condition_is_refused_not_widened(client: TestClient) -> None:
@@ -1324,9 +1619,90 @@ def test_successes_refusals_and_backend_errors_are_not_reported_as_tool_failures
             await tool.handler({})
             set_enabled("fine", True)
             monkeypatch.setattr(tools, "known_secret_values", _broken_scan)
-            with pytest.raises(OSError):
-                await tool.handler({})
+            # It ran; only its output is withheld: a backend error, not the tool's.
+            await tool.handler({})
             return list(failures)
 
     assert asyncio.run(_request()) == []
     assert [run.outcome for run in records] == [tools.RUN_OK, tools.RUN_REFUSED, tools.RUN_ERROR]
+
+
+# --- the run summaries a draft keeps, read back -----------------------------------
+
+_KEPT_SUMMARY: dict[str, Any] = {
+    "id": 7,
+    "started_at": "2026-10-29T01:02:03+00:00",
+    "workflow": "verify",
+    "vid": _TEST_VID,
+    "outcome": tools.RUN_FAILED,
+    "exit_code": 1,
+}
+
+
+def test_a_kept_run_summary_of_the_backend_s_shapes_stands_for_its_record() -> None:
+    """A purged record's summary whose every field is of the shape the backend
+    writes it in is read back as that record, marked purged: each outcome a run
+    is recorded with, and the workflows the AI requests and checks name."""
+    run = tool_runs._summary_only(_KEPT_SUMMARY)
+
+    assert run is not None
+    assert (run.id, run.workflow, run.vid, run.outcome, run.exit_code, run.purged) == (
+        7,
+        "verify",
+        _TEST_VID,
+        tools.RUN_FAILED,
+        1,
+        True,
+    )
+    assert run.started_at == datetime(2026, 10, 29, 1, 2, 3, tzinfo=UTC)
+    assert tool_runs._RUN_OUTCOMES
+    for outcome in tool_runs._RUN_OUTCOMES:
+        assert tool_runs._summary_only({**_KEPT_SUMMARY, "outcome": outcome}) is not None
+    for workflow in ("capture", "enrich", "assist_update", "health_check", "unknown"):
+        assert tool_runs._summary_only({**_KEPT_SUMMARY, "workflow": workflow}) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vid", "20261029T010203Z-ABCDEF"),
+        ("vid", f"{_TEST_VID}\n"),
+        ("vid", _SECRET),
+        ("outcome", "crashed"),
+        ("outcome", "FAILED"),
+        ("workflow", "Verify"),
+        ("workflow", "verify now"),
+        ("workflow", _SECRET),
+        ("vid", _MARKER),
+        ("outcome", _MARKER),
+        ("workflow", _MARKER),
+        ("started_at", _MARKER),
+    ],
+    ids=[
+        "vid-uppercase-hex",
+        "vid-trailing-newline",
+        "vid-free-text",
+        "outcome-unknown",
+        "outcome-uppercase",
+        "workflow-uppercase",
+        "workflow-with-a-space",
+        "workflow-free-text",
+        "vid-masked",
+        "outcome-masked",
+        "workflow-masked",
+        "started-at-masked",
+    ],
+)
+def test_a_kept_run_summary_with_a_field_out_of_the_backend_s_shape_is_left_out(
+    field: str, value: str
+) -> None:
+    """The manifest writes these fields as free text, so a hand edit or the mask of
+    a secret known when it was written can leave one of them out of the shape the
+    backend writes it in: then the summary cannot stand for a record."""
+    assert tool_runs._summary_only({**_KEPT_SUMMARY, field: value}) is None
+
+
+def test_the_outcomes_a_kept_run_summary_may_carry_are_those_a_run_is_served_with() -> None:
+    """The writer's own constants, collected for the read back, and the API's
+    literal of a run's outcome name the same values."""
+    assert set(typing.get_args(schemas.ToolRunOutcome)) == tool_runs._RUN_OUTCOMES

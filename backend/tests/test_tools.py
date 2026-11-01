@@ -23,25 +23,33 @@ ring is process-wide, so an autouse fixture resets it around every test.
 """
 
 import asyncio
+import contextlib
+import errno
 import fcntl
 import inspect
 import json
 import os
+import random
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Literal
 
+import anyio
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 
 from afterthread.config import Settings
+from afterthread.routers.ai import _advertised_tools_lock
 from afterthread.services import llm_log, tools
 from afterthread.services.llm import (
     _MAX_TOOL_CALLS_ACCEPTED,
@@ -1018,6 +1026,39 @@ def test_invariant_e_discard_succeeds_when_old_version_removal_fails(
     assert not tools._ADVERTISEMENT_GENERATIONS
 
 
+def test_discard_reports_removed_only_once_the_parked_version_is_seen_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at ``<vid>.discarded`` fails, so nothing can tell whether the
+    parked version's removal finished. The discard reports it retained, with
+    that path, rather than removed, and the parked version is still there once
+    the looks work again. A check that reads a failed look as "not there", as
+    ``os.path.lexists`` does, would report it removed."""
+    root = tmp_path / "tools"
+    first = _make_tool(root, "echo", "import sys\n")
+    package = _package_path(first)
+    second_vid = "20260728T020304Z-fedcba"
+    second = _add_committed_version(package, second_vid, description="second", output="SECOND")
+    assert tools.publish_current(tools.PackageRoot(package), second_vid)
+    resolution = tools.resolve_current(tools.PackageRoot(package))
+    assert isinstance(resolution, tools.Resolved)
+    parked = second.with_name(f"{second_vid}.discarded")
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", parked, errno.EIO)
+        discarded = tools.discard_version(resolution.package_root, resolution.vid)
+
+    assert isinstance(discarded, tools.ToolRemovalResult)
+    assert (discarded.outcome, discarded.retained_path, discarded.retention_reason) == (
+        "retained",
+        parked,
+        "cleanup_failed",
+    )
+    assert len(failed) >= 1
+    assert _resolved_version(package) == first  # the discard itself stands
+    assert parked.is_dir()
+
+
 def test_discard_parks_then_removes_under_the_exclusive_lock(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1527,6 +1568,49 @@ def test_runtime_timeout_kills_process_group(
     assert elapsed < 5  # killed on expiry, not waited out for 30s
 
 
+def test_a_tool_run_whose_reader_thread_fails_to_start_leaves_no_live_group(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runtime tool is spawned, then its output reader's thread fails to start,
+    as in a process out of threads. The drain's teardown still kills the tool's
+    process group and reaps its leader before the error leaves the run."""
+    root = tmp_path / "tools"
+    _make_tool(root, "slow", "import time\ntime.sleep(30)\n")
+    _install_tools(monkeypatch, root)
+    real_popen = subprocess.Popen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    real_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        target = getattr(self, "_target", None)
+        if isinstance(getattr(target, "__self__", None), tools._CappedReader):
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    handler = enabled_llm_tools()[0].handler
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    monkeypatch.setattr(threading.Thread, "start", start)
+    try:
+        with contextlib.suppress(RuntimeError):
+            asyncio.run(handler({}))
+        # Read before the cleanup below, which would reap whatever the run left.
+        ends = [proc.returncode for proc in spawned]
+    finally:
+        for proc in spawned:
+            if proc.returncode is None:  # unreaped, so its pid still names its group
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=10)
+
+    assert ends == [-signal.SIGKILL]  # killed by the drain's teardown, and reaped
+
+
 def test_runtime_output_is_capped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     _make_tool(root, "big", "import sys\nsys.stdout.write('a' * 5000)\n")
@@ -1581,8 +1665,8 @@ def test_runtime_overflow_output_with_exiting_leader_stays_clean(
     test does not assert (or need) which one wins -- only that the result is
     invariant either way: `_communicate_bounded`'s teardown_lock makes the
     overflow callback a no-op once the main thread has started reaping,
-    instead of letting it call getpgid/killpg on a pid the reap may have just
-    freed (and the kernel could have reused)."""
+    instead of letting it send its kill to a pid the reap may have just freed
+    (and the kernel could have reused)."""
     root = tmp_path / "tools"
     _make_tool(root, "big", "import sys\nsys.stdout.write('a' * 5000)\n")
     _install_tools(monkeypatch, root, llm_tool_output_max_chars=1000)
@@ -1595,6 +1679,253 @@ def test_runtime_overflow_output_with_exiting_leader_stays_clean(
         assert len(result) == 1000
         assert result.endswith(marker)
     assert time.monotonic() - started < 10  # 20 clean teardowns, never a hang
+
+
+@pytest.mark.parametrize("abort", ["omitted", "never-set"])
+@pytest.mark.parametrize("scenario", ["exits", "times-out", "overflows"])
+def test_communicate_bounded_without_a_stop_signal_ends_as_before(
+    scenario: str, abort: str
+) -> None:
+    """With no stop signal -- none passed, or one that is never set -- a bounded
+    read ends exactly as it did before the signal existed: a natural exit keeps
+    its output and exit code, a timeout kills the group, an overflow kills it at
+    the cap, and none of them reads as stopped."""
+    command, timeout = {
+        "exits": ("printf out; exit 3", 30.0),
+        "times-out": ("printf out; sleep 30", 0.3),
+        "overflows": ("yes", 30.0),
+    }[scenario]
+    proc = subprocess.Popen(
+        ["bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    signal_kwargs: dict[str, Any] = {} if abort == "omitted" else {"abort": threading.Event()}
+    cap = 1000
+
+    started = time.monotonic()
+    output = tools._communicate_bounded(
+        proc, input_text=None, cap=cap, timeout=timeout, **signal_kwargs
+    )
+    elapsed = time.monotonic() - started
+
+    expected = {
+        "exits": (tools._BoundedOutput("out", "", False, False, False), 3),
+        "times-out": (tools._BoundedOutput("out", "", False, False, True), -signal.SIGKILL),
+        # The reader keeps one character past the cap, to tell "over" from "at".
+        "overflows": (
+            tools._BoundedOutput(("y\n" * cap)[: cap + 1], "", True, False, False),
+            -signal.SIGKILL,
+        ),
+    }[scenario]
+    assert (output, proc.returncode) == expected
+    assert output.aborted is False
+    assert elapsed < 5
+
+
+def _bash_in_its_own_group(command: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ["bash", "-c", command],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+
+
+def test_communicate_bounded_asks_after_the_reap_until_the_group_is_seen_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``on_reaped``, the teardown asks about the group after the leader's
+    reap, and asks again while the limit lasts: the first answer can come before
+    the members' reaper has collected them. The evidence is given once, at the
+    first answer that the group is gone, and nothing is asked after it."""
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    answers = [False, False, True]
+    asked: list[int] = []
+
+    def gone_at_the_third_ask(pgid: int) -> bool:
+        asked.append(pgid)
+        return answers[len(asked) - 1]
+
+    monkeypatch.setattr(tools, "_process_group_is_gone", gone_at_the_third_ask)
+    proc = _bash_in_its_own_group("exit 0")
+    confirmations: list[int | None] = []
+
+    tools._communicate_bounded(
+        proc,
+        input_text=None,
+        cap=1000,
+        timeout=30,
+        on_reaped=lambda: confirmations.append(proc.returncode),
+    )
+
+    assert asked == [proc.pid] * 3
+    assert confirmations == [0]  # once, and only after the reap
+
+
+def test_communicate_bounded_bounds_its_whole_teardown_by_one_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The group is never seen gone, and a member the kill missed still holds the
+    output pipes, so the readers stay blocked. ``on_reaped`` is never called, and
+    the teardown ends at its one limit: the watch for the group and the join of
+    the readers share it rather than each taking a limit of its own."""
+    limit = 0.6
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", limit)
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    monkeypatch.setattr(tools, "_process_group_is_gone", lambda pgid: False)
+    real_killpg = os.killpg
+
+    def leader_only(pgid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            os.kill(pgid, signal.SIGKILL)  # the member is missed
+            return
+        real_killpg(pgid, sig)
+
+    member_file = tmp_path / "member.pid"
+    proc = _bash_in_its_own_group(f'sleep 30 & echo $! > "{member_file}"; exec sleep 30')
+    member: int | None = None
+    try:
+        for _ in range(500):
+            text = member_file.read_text(encoding="utf-8").strip() if member_file.exists() else ""
+            if text:
+                member = int(text)
+                break
+            time.sleep(0.01)
+        assert member is not None
+        monkeypatch.setattr(tools.os, "killpg", leader_only)
+        stop = threading.Event()
+        stop.set()
+        confirmations: list[None] = []
+
+        started = time.monotonic()
+        output = tools._communicate_bounded(
+            proc,
+            input_text=None,
+            cap=1000,
+            timeout=30,
+            abort=stop,
+            on_reaped=lambda: confirmations.append(None),
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        if member is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(member, signal.SIGKILL)  # releases the pipes the readers wait on
+
+    assert output.aborted is True
+    assert proc.returncode == -signal.SIGKILL  # the leader was reaped
+    assert confirmations == []
+    assert limit <= elapsed < 1.5 * limit
+
+
+def test_communicate_bounded_resends_the_kill_only_while_the_leader_pins_the_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Where the group kill can miss a fork, it is sent again before the reap --
+    but only while the unreaped leader holds the group id. Nothing in the drain
+    reaps the leader before its teardown, so the test reaps it first: the
+    teardown then sends its one SIGKILL, re-sends nothing, and only asks whether
+    the group is gone. (The SIGKILL is recorded, not sent: this leader no longer
+    pins its id.)"""
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    proc = _bash_in_its_own_group("exit 0")
+    proc.wait()
+    real_killpg = os.killpg
+    sent: list[int] = []
+
+    def recording(pgid: int, sig: int) -> None:
+        sent.append(sig)
+        if sig == signal.SIGKILL:
+            raise ProcessLookupError(errno.ESRCH, "No such process")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(tools.os, "killpg", recording)
+    confirmations: list[None] = []
+
+    tools._communicate_bounded(
+        proc, input_text=None, cap=1000, timeout=30, on_reaped=lambda: confirmations.append(None)
+    )
+
+    assert sent == [signal.SIGKILL, 0]  # the kill, then the one question after the reap
+    assert confirmations == [None]
+
+
+def test_the_overflow_kill_leaves_an_exited_leader_unreaped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The overflow kill sends SIGKILL to the leader's group id as it is. Here the
+    leader has already exited and is a zombie, and ``getpgid`` is made to answer
+    ESRCH for it -- macOS's answer for a zombie -- so the test means the same on
+    either platform. The kill raises nothing and reaps nothing: the leader is
+    still there to wait for, so its group id stays pinned until the teardown
+    reaps it."""
+
+    def no_group_for_a_zombie(pid: int) -> int:
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    monkeypatch.setattr(tools.os, "getpgid", no_group_for_a_zombie)
+    proc = subprocess.Popen(
+        ["bash", "-c", "exit 3"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
+    exited = os.WEXITED | os.WNOWAIT | os.WNOHANG
+    try:
+        for _ in range(500):
+            if os.waitid(os.P_PID, proc.pid, exited) is not None:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the leader never exited")
+
+        tools._kill_process_group(proc)
+
+        assert proc.returncode is None  # not reaped by the kill
+        assert os.waitid(os.P_PID, proc.pid, exited) is not None  # still waitable
+    finally:
+        proc.wait()
+    assert proc.returncode == 3  # reaped only here, with its own exit code
+
+
+def test_runtime_tool_teardown_sends_one_kill_and_watches_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A runtime tool's drain is given no ``on_reaped``: its teardown sends one
+    SIGKILL to the group and asks nothing afterwards -- no kill sent again, even
+    where the platform's group kill can miss a fork, and no watch for the group to
+    be gone."""
+    root = tmp_path / "tools"
+    _make_tool(root, "quick", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    real_killpg = os.killpg
+    sent: list[int] = []
+    asked: list[int] = []
+
+    def recording_killpg(pgid: int, sig: int) -> None:
+        sent.append(sig)
+        real_killpg(pgid, sig)
+
+    def recording_gone(pgid: int) -> bool:
+        asked.append(pgid)
+        return True
+
+    monkeypatch.setattr(tools.os, "killpg", recording_killpg)
+    monkeypatch.setattr(tools, "_process_group_is_gone", recording_gone)
+
+    assert asyncio.run(handler({})) == "ok"
+    assert sent == [signal.SIGKILL]
+    assert asked == []
 
 
 def test_runtime_refuses_a_package_replaced_after_it_was_advertised(
@@ -3242,6 +3573,618 @@ def test_validate_package_rejection_never_echoes_secret_in_filename(
     assert tools._REDACTION_MARKER in error  # the offending path is named, masked
 
 
+# --- the embedded-secret scan ------------------------------------------------
+
+_SCAN_SECRET = "planted-secret-value-abcdef"
+# A value holding a "/", as a base64 key can.
+_SLASHED_SECRET = "planted/secret-value-ghijkl"
+
+
+def _scan(root: Path) -> tools.SecretScanDone:
+    """Scan ``root`` for the two planted values; the scan must have finished."""
+    scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET, _SLASHED_SECRET])
+    assert isinstance(scan, tools.SecretScanDone), scan
+    return scan
+
+
+def _hits(scan: tools.SecretScanDone) -> list[tuple[str, str]]:
+    return [(hit.path, hit.kind) for hit in scan.hits]
+
+
+def _plant_past_the_first_64_kib(root: Path) -> list[tuple[str, str]]:
+    (root / "data.txt").write_text("x" * (70 * 1024) + _SCAN_SECRET + "\n", encoding="utf-8")
+    return [("data.txt", "content")]
+
+
+def _plant_across_a_read_boundary(root: Path) -> list[tuple[str, str]]:
+    # Half of the value before the end of the scan's first read, half after it.
+    before = tools._SECRET_SCAN_CHUNK_CHARS - len(_SCAN_SECRET) // 2
+    (root / "data.txt").write_text("x" * before + _SCAN_SECRET + "x" * 10, encoding="utf-8")
+    return [("data.txt", "content")]
+
+
+def _plant_in_a_file_name(root: Path) -> list[tuple[str, str]]:
+    (root / f"key-{_SCAN_SECRET}.txt").write_text("clean\n", encoding="utf-8")
+    return [(f"key-{_SCAN_SECRET}.txt", "name")]
+
+
+def _plant_in_a_directory_name(root: Path) -> list[tuple[str, str]]:
+    # Two levels down, with clean names below it: every path under the directory
+    # carries the value too.
+    nested = root / "a" / f"d-{_SCAN_SECRET}" / "b"
+    nested.mkdir(parents=True)
+    (nested / "inner.txt").write_text("clean\n", encoding="utf-8")
+    named = f"a/d-{_SCAN_SECRET}"
+    return [(named, "name"), (f"{named}/b", "name"), (f"{named}/b/inner.txt", "name")]
+
+
+def _plant_across_path_components(root: Path) -> list[tuple[str, str]]:
+    # Written as a path, a value with a "/" becomes a directory and a file; no
+    # single name holds it, the relative path does.
+    head, tail = _SLASHED_SECRET.split("/")
+    (root / head).mkdir()
+    (root / head / tail).write_text("clean\n", encoding="utf-8")
+    return [(_SLASHED_SECRET, "name")]
+
+
+def _plant_in_a_hidden_file(root: Path) -> list[tuple[str, str]]:
+    # A dot-directory is walked like any other.
+    (root / ".cache").mkdir()
+    (root / ".cache" / "notes").write_text("token " + _SCAN_SECRET, encoding="utf-8")
+    return [(".cache/notes", "content")]
+
+
+def _plant_in_a_link_target(root: Path) -> list[tuple[str, str]]:
+    # A dangling link: only its target STRING carries the value, and it is never
+    # followed.
+    (root / "link").symlink_to(f"../{_SCAN_SECRET}/nowhere")
+    return [("link", "link_target")]
+
+
+def _plant_in_a_binary_file(root: Path) -> list[tuple[str, str]]:
+    noise = b"\xff\xfe\x00\x80" * 4096
+    (root / "blob.bin").write_bytes(noise + _SCAN_SECRET.encode() + b"\xc3")
+    return [("blob.bin", "content")]
+
+
+def _plant_in_several_files(root: Path) -> list[tuple[str, str]]:
+    (root / "b.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    (root / "sub").mkdir()
+    (root / "sub" / "a.txt").write_text("prefix " + _SCAN_SECRET, encoding="utf-8")
+    (root / "clean.txt").write_text("nothing here\n", encoding="utf-8")
+    return [("b.txt", "content"), ("sub/a.txt", "content")]
+
+
+# Every place the scan must find a value, each building its own tree and returning
+# the hits it expects, in the scan's order.
+_PLANTED: dict[str, Callable[[Path], list[tuple[str, str]]]] = {
+    "past-the-first-64-KiB": _plant_past_the_first_64_kib,
+    "across-a-read-boundary": _plant_across_a_read_boundary,
+    "file-name": _plant_in_a_file_name,
+    "directory-name": _plant_in_a_directory_name,
+    "across-path-components": _plant_across_path_components,
+    "hidden-file": _plant_in_a_hidden_file,
+    "link-target": _plant_in_a_link_target,
+    "binary-file": _plant_in_a_binary_file,
+    "several-files": _plant_in_several_files,
+}
+
+# The places the publish gate could not see before it read files whole and
+# checked paths and link targets.
+_NEWLY_REFUSED = (
+    "past-the-first-64-KiB",
+    "across-a-read-boundary",
+    "file-name",
+    "directory-name",
+    "across-path-components",
+    "link-target",
+)
+
+
+@pytest.mark.parametrize("case", list(_PLANTED))
+def test_scan_embedded_secrets_finds_every_planted_value(tmp_path: Path, case: str) -> None:
+    """Each place a builder can bake a known value into a tree is found, and every
+    hit is returned -- not only the first -- sorted by path."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    expected = _PLANTED[case](root)
+
+    scan = _scan(root)
+
+    assert _hits(scan) == expected
+    assert scan.skipped == ()
+
+
+@pytest.mark.parametrize("before", range(1, len(_SCAN_SECRET)))
+def test_scan_embedded_secrets_finds_a_value_cut_at_any_point_by_a_read_boundary(
+    tmp_path: Path, before: int
+) -> None:
+    """A read boundary can fall anywhere inside a value: ``before`` of its
+    characters end the first read and the rest open the next one. The value is
+    found at every cut, down to the worst -- all but its last character before the
+    boundary -- which needs the whole "longest value minus one" carried over."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    start = tools._SECRET_SCAN_CHUNK_CHARS - before
+    (root / "data.txt").write_text("x" * start + _SCAN_SECRET + "x" * 10, encoding="utf-8")
+
+    # The cut value is the only, and so the longest, value looked for.
+    scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("data.txt", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_passes_long_and_binary_files_without_the_value(
+    tmp_path: Path,
+) -> None:
+    """A file several reads long and one that is not text at all, neither holding
+    the value: no hit, nothing skipped."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    long_text = "x" * (3 * tools._SECRET_SCAN_CHUNK_CHARS + 17)
+    (root / "long.txt").write_text(long_text, encoding="utf-8")
+    (root / "blob.bin").write_bytes(bytes(range(256)) * 1024)
+
+    assert _scan(root) == tools.SecretScanDone(hits=(), skipped=())
+
+
+def test_scan_embedded_secrets_never_follows_a_link(tmp_path: Path) -> None:
+    """Links to a file and to a directory outside the tree, both holding the
+    value: the scan reads neither target, and their target strings are clean."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "holder.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    (root / "to-file").symlink_to(outside / "holder.txt")
+    (root / "to-dir").symlink_to(outside, target_is_directory=True)
+
+    assert _scan(root) == tools.SecretScanDone(hits=(), skipped=())
+
+
+def test_scan_embedded_secrets_skips_a_fifo_and_says_so(tmp_path: Path) -> None:
+    """A FIFO is never opened -- a read of one could block -- and the caller is
+    told its content went unsearched; the rest of the tree is still scanned."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    os.mkfifo(root / "pipe")
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+
+    scan = _scan(root)
+
+    assert _hits(scan) == [("a.txt", "content")]
+    assert scan.skipped == (tools.SecretScanSkip("pipe", "not_regular"),)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file")
+def test_scan_embedded_secrets_lists_an_unreadable_file_as_skipped(tmp_path: Path) -> None:
+    """An OSError reading one file does not fail the scan: the file is listed as
+    unreadable, so the caller knows its content went unsearched."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    locked = root / "locked.txt"
+    locked.write_text(_SCAN_SECRET, encoding="utf-8")
+    locked.chmod(0)
+    try:
+        scan = _scan(root)
+    finally:
+        locked.chmod(0o600)
+
+    assert scan == tools.SecretScanDone(
+        hits=(), skipped=(tools.SecretScanSkip("locked.txt", "unreadable"),)
+    )
+
+
+def test_scan_embedded_secrets_lists_a_file_whose_read_fails_as_skipped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OSError after the open succeeded -- here the descriptor's stat -- counts
+    the same as one on the open: the file is listed as unreadable and the scan
+    still finishes."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+
+    def failing_fstat(_fd: int) -> os.stat_result:
+        raise OSError(errno.EIO, "input/output error")
+
+    with monkeypatch.context() as patch:
+        # Only the scan runs while this is in place.
+        patch.setattr(tools.os, "fstat", failing_fstat)
+        scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+
+    assert scan == tools.SecretScanDone(
+        hits=(), skipped=(tools.SecretScanSkip("a.txt", "unreadable"),)
+    )
+
+
+def test_scan_embedded_secrets_fails_when_the_known_secrets_cannot_be_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no list given, the scan looks the known values up itself; if that
+    raises, the result is a failure -- one with no hits to misread as clean."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text("text\n", encoding="utf-8")
+
+    def unavailable() -> frozenset[str]:
+        raise RuntimeError("the secret store is unavailable")
+
+    monkeypatch.setattr(tools, "known_secret_values", unavailable)
+
+    scan = tools.scan_embedded_secrets(root)
+
+    assert scan == tools.SecretScanFailed("RuntimeError")
+    assert not hasattr(scan, "hits")
+
+
+def test_scan_embedded_secrets_finds_a_known_value_holding_a_crlf_by_its_normalized_form(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installed tool's ``.env`` gives a value holding a CRLF, and a file holds
+    that value's very bytes. The scan reads text with universal newlines, so the
+    file holds the value with an LF in place of the CRLF: it is found by that
+    form, though the form is shorter than the floor."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", dotenv='KB_KEY="ab\\r\\ncd"\n')
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    assert "ab\r\ncd" in tools.known_secret_values()
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "notes.txt").write_bytes(b"prefix ab\r\ncd suffix")
+
+    scan = tools.scan_embedded_secrets(tree)
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("notes.txt", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_finds_a_value_holding_a_lone_cr_in_a_file_of_its_bytes(
+    tmp_path: Path,
+) -> None:
+    """A value holding a lone CR, and a file holding exactly its bytes. Read with
+    universal newlines, the file holds the value with an LF in the CR's place,
+    and that form is found."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "data.bin").write_bytes(b"alpha\rbeta")
+
+    scan = tools.scan_embedded_secrets(tree, ["alpha\rbeta"])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("data.bin", "content"),), skipped=())
+
+
+def test_scan_embedded_secrets_finds_a_value_holding_an_lf_in_a_file_with_crlf_line_breaks(
+    tmp_path: Path,
+) -> None:
+    """A value holding an LF, and a file that differs from it only in its line
+    breaks -- written with CRLF. That counts as holding it: the file is found."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "key.pem").write_bytes(b"-----BEGIN-----\r\nline-one\r\nline-two\r\n-----END-----\r\n")
+
+    scan = tools.scan_embedded_secrets(tree, ["line-one\nline-two"])
+
+    assert scan == tools.SecretScanDone(hits=(tools.SecretHit("key.pem", "content"),), skipped=())
+
+
+def test_a_value_under_the_floor_adds_no_form_though_it_holds_a_crlf(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``ab\\r\\nc`` is five characters, under the floor, so it adds no form -- not
+    itself, and not its normalized form: text holding either is masked nowhere,
+    and no scan finds a file holding either."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"ab\r\nc"}))
+    text = "x ab\r\nc y ab\nc z"
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "notes.txt").write_bytes(text.encode("utf-8"))
+
+    assert tools._match_forms(["ab\r\nc"]) == []
+    assert tools.redact_known_secrets(text) == text
+    assert tools.scan_embedded_secrets(tree) == tools.SecretScanDone(hits=(), skipped=())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
+def test_scan_embedded_secrets_fails_when_a_directory_cannot_be_listed(tmp_path: Path) -> None:
+    """A directory the scan cannot list may hold anything, so the scan fails
+    rather than report the rest of the tree as all there is."""
+    root = tmp_path / "tree"
+    sealed = root / "sealed"
+    sealed.mkdir(parents=True)
+    (sealed / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    sealed.chmod(0)
+    try:
+        scan = tools.scan_embedded_secrets(root, [_SCAN_SECRET])
+    finally:
+        sealed.chmod(0o700)
+
+    assert scan == tools.SecretScanFailed("PermissionError")
+
+
+def test_scan_embedded_secrets_fails_on_a_read_error_other_than_oserror(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only an OSError makes a file "unreadable". Anything else a read raises --
+    here the TypeError a text read raises for a read size that is not an int --
+    fails the scan instead of passing the file as clean or merely skipped."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    (root / "a.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    monkeypatch.setattr(tools, "_SECRET_SCAN_CHUNK_CHARS", 1.5)
+
+    assert tools.scan_embedded_secrets(root, [_SCAN_SECRET]) == tools.SecretScanFailed("TypeError")
+
+
+def _package_with_other_tools_secret(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A clean staged package, while another installed tool's ``.env`` makes the
+    two planted values known."""
+    root = tmp_path / "tools"
+    dotenv = f"OTHER_KEY={_SCAN_SECRET}\nSECOND_KEY={_SLASHED_SECRET}\n"
+    _make_tool(root, "other", "import sys\n", dotenv=dotenv)
+    _install_tools(monkeypatch, root)
+    return _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+
+
+@pytest.mark.parametrize("case", _NEWLY_REFUSED)
+def test_validate_refuses_a_value_planted_where_the_old_gate_could_not_see(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """Past the first 64 KiB of a file, across a read boundary, in a file or
+    directory name, in a link target: publication is refused now, and the message
+    reads as it always has -- the first hit's path, with the value masked out."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    first_path = _PLANTED[case](pkg)[0][0]
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    marker = tools._REDACTION_MARKER
+    masked = first_path.replace(_SCAN_SECRET, marker).replace(_SLASHED_SECRET, marker)
+    assert error == f"{masked} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+    assert _SCAN_SECRET not in (error or "")
+    assert _SLASHED_SECRET not in (error or "")
+
+
+def _known_secrets_by_lookup(first: list[str], later: list[str]) -> Callable[[], list[str]]:
+    """A stand-in for ``tools._redaction_secrets`` whose answer changes after the
+    first lookup -- a value registered, or released, while the gate runs."""
+    lookups = 0
+
+    def lookup() -> list[str]:
+        nonlocal lookups
+        lookups += 1
+        return list(first if lookups == 1 else later)
+
+    return lookup
+
+
+def _package_with_a_file_named_after_the_value(tmp_path: Path) -> Path:
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    (pkg / f"key-{_SCAN_SECRET}.txt").write_text("clean\n", encoding="utf-8")
+    return pkg
+
+
+def test_validate_scans_and_masks_with_one_secrets_snapshot_a_value_known_only_later(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The gate scans and masks with the SAME snapshot of the known values. Here a
+    value becomes known only after the first lookup, and a file is named after
+    it. Whatever the gate answers, the value is not in it: a scan that looked the
+    values up again would hit that name, and the path would reach the message
+    masked by a list that does not hold the value."""
+    pkg = _package_with_a_file_named_after_the_value(tmp_path)
+    monkeypatch.setattr(tools, "_redaction_secrets", _known_secrets_by_lookup([], [_SCAN_SECRET]))
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert _SCAN_SECRET not in (error or "")
+
+
+def test_validate_scans_and_masks_with_one_secrets_snapshot_a_value_known_only_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The other order: a value known at the first lookup and gone after it. The
+    package is refused for the file named after the value, and the path in the
+    message is masked -- a scan that looked again would find nothing to refuse,
+    and a mask that looked again would leave the value bare."""
+    pkg = _package_with_a_file_named_after_the_value(tmp_path)
+    monkeypatch.setattr(tools, "_redaction_secrets", _known_secrets_by_lookup([_SCAN_SECRET], []))
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    masked = f"key-{tools._REDACTION_MARKER}.txt"
+    assert error == f"{masked} 不得包含秘密值（請改由環境變數讀取）"  # noqa: RUF001
+
+
+def test_validate_refuses_when_the_known_secrets_cannot_be_read_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The known values cannot be looked up: the package is refused as UNCHECKED,
+    and the message says the scan failed -- never that it holds a secret."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+
+    def unavailable() -> frozenset[str]:
+        raise RuntimeError("the secret store is unavailable")
+
+    monkeypatch.setattr(tools, "known_secret_values", unavailable)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    assert "秘密掃描失敗" in error
+    assert "RuntimeError" in error  # the failure's category, never its text
+    assert "不得包含秘密值" not in error
+    assert "含秘密" not in error
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_validate_refuses_while_another_tools_env_cannot_be_read_and_names_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The staged package holds another tool's value, and that tool's directory
+    cannot be looked at, so the value is not in the known list. The package is
+    refused as unchecked, and the message names the ``.env`` and what to check --
+    never that a secret was found. Red before the fix: the list was taken as
+    whole without that ``.env``, and the package passed."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    (pkg / "notes.txt").write_text(f"key: {_SCAN_SECRET}\n", encoding="utf-8")
+    base = tools.tools_dir()
+    assert base is not None
+    other = base / "other"
+    other.chmod(0)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        other.chmod(0o700)
+
+    assert error is not None
+    assert "「other」" in error
+    assert os.fspath(other / ".env") in error
+    assert "權限" in error and "重試" in error
+    assert "不得包含秘密值" not in error
+    assert _SCAN_SECRET not in error
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can list a mode-000 directory")
+def test_validate_refuses_a_package_whose_directory_the_scan_cannot_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A directory the builder made unlistable hides whatever is inside it, here
+    a known value: the package is refused as unchecked rather than published."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    sealed = pkg / "sealed"
+    sealed.mkdir()
+    (sealed / "key.txt").write_text(_SCAN_SECRET, encoding="utf-8")
+    sealed.chmod(0)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        sealed.chmod(0o700)
+
+    assert error is not None
+    assert "秘密掃描失敗" in error
+    assert "PermissionError" in error
+    assert "不得包含秘密值" not in error
+
+
+def _fail_reads_of(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
+    """Let each of ``paths`` open, then fail the stat on that descriptor with
+    EIO: a read error on those files alone, whoever runs the test."""
+    targets = {os.fspath(path) for path in paths}
+    opened: set[int] = set()
+    real_open = os.open
+    real_fstat = os.fstat
+
+    def tracking_open(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, flags, *args, **kwargs)
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) in targets:
+            opened.add(fd)
+        return fd
+
+    def failing_fstat(fd: int) -> os.stat_result:
+        if fd in opened:
+            opened.discard(fd)
+            raise OSError(errno.EIO, "input/output error")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(tools.os, "open", tracking_open)
+    monkeypatch.setattr(tools.os, "fstat", failing_fstat)
+
+
+@pytest.mark.parametrize(
+    "unreadable_by",
+    [
+        pytest.param(
+            "mode 000",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root can read a mode-000 file"),
+        ),
+        "a read error",
+    ],
+)
+def test_validate_refuses_files_the_scan_could_not_read_and_names_the_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unreadable_by: str
+) -> None:
+    """Two files the scan cannot read, both holding a known value. Nothing after
+    the gate reads them again, so publishing would ship them unseen: the package
+    is refused, the message names the first of them and says it could not be
+    read -- never that a secret was found."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    (pkg / "data").mkdir()
+    blind = [pkg / "data" / "a.txt", pkg / "data" / "b.txt"]
+    for path in blind:
+        path.write_text(f"KEY={_SCAN_SECRET}\n", encoding="utf-8")
+    if unreadable_by == "mode 000":
+        for path in blind:
+            path.chmod(0)
+    else:
+        _fail_reads_of(monkeypatch, *blind)
+    try:
+        error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+    finally:
+        for path in blind:
+            path.chmod(0o600)
+
+    assert error is not None
+    assert error.startswith("data/a.txt ")
+    assert "data/b.txt" not in error
+    assert "無法讀取" in error
+    assert "不得包含秘密值" not in error
+    assert "含秘密" not in error
+    assert _SCAN_SECRET not in error
+
+
+def test_validate_does_not_refuse_a_package_for_a_fifo_in_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A FIFO is skipped by the scan too, but it has no stored content to hold a
+    value, and its name is checked like every entry's: unlike a file the scan
+    could not read, it does not get the package refused."""
+    pkg = _package_with_other_tools_secret(monkeypatch, tmp_path)
+    os.mkfifo(pkg / "pipe")
+
+    scan = tools.scan_embedded_secrets(tools.BuildRoot(pkg))
+    assert isinstance(scan, tools.SecretScanDone)
+    assert scan.skipped == (tools.SecretScanSkip("pipe", "not_regular"),)
+    assert tools.validate_tool_content(tools.BuildRoot(pkg), "staged") is None
+
+
+# A known value holding a lone surrogate, as one read from an environment that is
+# not UTF-8 does.
+_SURROGATE_SECRET = "planted-\udcff-secret-abcdef"
+
+
+@pytest.mark.parametrize("named_as", ["a hit", "unreadable"])
+def test_validate_names_a_path_with_lone_surrogates_masked_and_encodable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, named_as: str
+) -> None:
+    """A path read back from a name that is not UTF-8 carries lone surrogates --
+    here one beside the known value and one inside it. The scan's answer is
+    injected, since not every filesystem can hold such a name. Either way the gate
+    names the path, the message encodes as UTF-8, and the value is still masked
+    out of it: the mask comes first, and only then are the surrogates replaced."""
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    path = f"dir-\udc80/key-{_SURROGATE_SECRET}.txt"
+    if named_as == "a hit":
+        scan = tools.SecretScanDone(hits=(tools.SecretHit(path, "name"),), skipped=())
+    else:
+        scan = tools.SecretScanDone(hits=(), skipped=(tools.SecretScanSkip(path, "unreadable"),))
+    monkeypatch.setattr(tools, "_redaction_secrets", lambda: [_SURROGATE_SECRET])
+    monkeypatch.setattr(tools, "scan_embedded_secrets", lambda root, secrets=None: scan)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    error.encode("utf-8")  # a lone surrogate left in it would raise here
+    assert error.startswith(tools._utf8_safe("dir-\udc80") + f"/key-{tools._REDACTION_MARKER}.txt ")
+    assert "planted-" not in error
+
+
 # --- known-secret redaction (F1 / F4, D36) ---------------------------------
 
 
@@ -3295,18 +4238,606 @@ def test_known_secret_values_still_caches_an_unchanged_env(
     tools._ENV_VALUE_CACHE.clear()
 
     parses: list[Path] = []
-    real_loader = tools._load_tool_dotenv
+    real_read = tools._read_package_dotenv
 
-    def counting_loader(directory: tools.PackageRoot) -> dict[str, str]:
-        parses.append(directory.path)
-        return real_loader(directory)
+    def counting_read(env_file: Path) -> Any:
+        parses.append(env_file)
+        return real_read(env_file)
 
-    monkeypatch.setattr(tools, "_load_tool_dotenv", counting_loader)
+    monkeypatch.setattr(tools, "_read_package_dotenv", counting_read)
 
     assert "cached-secret-abcdef" in tools.known_secret_values()
     assert len(parses) == 1  # the miss
     assert "cached-secret-abcdef" in tools.known_secret_values()
     assert len(parses) == 1  # ... and the hit, with no second read
+
+
+# --- the known secrets: what each source answers, and whether that is all ----
+
+
+def _failing_at(
+    patch: pytest.MonkeyPatch, name: str, target: Path, code: int, *, times: int | None = None
+) -> list[str]:
+    """``os.<name>`` of exactly ``target`` fails with ``code`` -- the first ``times``
+    calls, or every one -- and works as before for any other path. Returns the
+    paths it failed."""
+    real = getattr(os, name)
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def fake(path: Any, *args: Any, **kwargs: Any) -> Any:
+        spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+        if spelled == spelled_target and (times is None or len(failed) < times):
+            failed.append(spelled_target)
+            raise OSError(code, "a-failure-text-never-shown", spelled_target)
+        return real(path, *args, **kwargs)
+
+    patch.setattr(os, name, fake)
+    return failed
+
+
+class _ReadFails:
+    """A file handle whose read fails, as a disk error would make it."""
+
+    def __init__(self, handle: Any) -> None:
+        self._handle = handle
+
+    def __enter__(self) -> _ReadFails:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._handle.close()
+
+    def read(self, *args: Any) -> str:
+        raise OSError(errno.EIO, "a-failure-text-never-shown")
+
+
+def _reads_failing_at(patch: pytest.MonkeyPatch, target: Path) -> list[str]:
+    """Reading ``target`` through ``os.fdopen`` fails with EIO; it still opens."""
+    real_fdopen = os.fdopen
+    failed: list[str] = []
+
+    def fdopen(fd: int, *args: Any, **kwargs: Any) -> Any:
+        handle = real_fdopen(fd, *args, **kwargs)
+        if os.path.samestat(os.fstat(fd), os.stat(target, follow_symlinks=False)):
+            failed.append(os.fspath(target))
+            return _ReadFails(handle)
+        return handle
+
+    patch.setattr(os, "fdopen", fdopen)
+    return failed
+
+
+def _two_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """Tools ``kb`` and ``other`` under one tools directory, each with a secret in
+    its ``.env``; returns both package directories, spelled as the scan spells them."""
+    root = tmp_path / "tools"
+    kb = _package_path(_make_tool(root, "kb", "print('x')\n", dotenv="KB_KEY=kb-secret-abcdef\n"))
+    other = _package_path(
+        _make_tool(root, "other", "print('x')\n", dotenv="OTHER_KEY=other-secret-abcdef\n")
+    )
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    return kb.resolve(), other.resolve()
+
+
+@pytest.mark.parametrize("code", [errno.ENOENT, errno.ENOTDIR], ids=["ENOENT", "ENOTDIR"])
+def test_a_source_seen_not_to_be_there_holds_no_value_and_the_list_stays_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, code: int
+) -> None:
+    """Not there is an answer: the ``.env`` a look finds missing -- ``ENOENT``, or
+    ``ENOTDIR`` -- holds no value, and the list is whole without it. So is an
+    entry of the tools directory that is no package: a link to nothing, a file, a
+    hidden directory. Not red at HEAD, which answered every source this way; it
+    keeps "not there" apart from a look that failed (the next test)."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    root = kb.parent
+    os.symlink(root / "nowhere", root / "dangling")
+    (root / "notes.txt").write_text("not a package\n", encoding="utf-8")
+    hidden = root / ".staging"
+    hidden.mkdir()
+    (hidden / ".env").write_text("HIDDEN=hidden-secret-abcdef\n", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", other / ".env", code)
+        _failing_at(patch, "stat", other / ".env", code)
+        values = tools.known_secret_values()
+        collected = tools._collect_known_secrets()
+        for_log = tools.known_secrets_for_log()
+
+    assert values == frozenset({"kb-secret-abcdef"})
+    assert collected == tools.KnownSecrets(frozenset({"kb-secret-abcdef"}))
+    assert collected.complete
+    assert for_log == (frozenset({"kb-secret-abcdef"}), True)
+
+
+_FAILED_LOOKS = ["list-tools-directory", "check-package", "look-at-env", "open-env", "read-env"]
+
+
+@pytest.mark.parametrize("look", _FAILED_LOOKS)
+def test_a_look_that_fails_leaves_the_list_not_whole_and_says_where(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, look: str
+) -> None:
+    """Listing the tools directory, checking what an entry is, looking at the
+    ``.env``, opening it or reading it fails with something other than "not
+    there": what that source holds is unknown. The masks refuse the list
+    (``known_secret_values`` raises), the gap names the tool and the ``.env`` (the
+    tools directory itself for the first), and llm_log is told it is not whole,
+    while the sources that could be read still are. Red before the fix: the
+    other sources came back as the whole list -- for the listing, a bare
+    ``PermissionError`` that named nothing."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    root = kb.parent
+    with monkeypatch.context() as patch:
+        if look == "list-tools-directory":
+            failed = _failing_at(patch, "listdir", root, errno.EACCES)
+            failed += _failing_at(patch, "scandir", root, errno.EACCES)
+            where = (None, os.fspath(root), "PermissionError")
+        elif look == "check-package":
+            failed = _failing_at(patch, "stat", other, errno.EIO)
+            where = ("other", os.fspath(env), "OSError")
+        elif look == "look-at-env":
+            failed = _failing_at(patch, "lstat", env, errno.EACCES)
+            _failing_at(patch, "stat", env, errno.EACCES)
+            where = ("other", os.fspath(env), "PermissionError")
+        elif look == "open-env":
+            failed = _failing_at(patch, "open", env, errno.EACCES)
+            where = ("other", os.fspath(env), "PermissionError")
+        else:
+            failed = _reads_failing_at(patch, env)
+            where = ("other", os.fspath(env), "OSError")
+        with pytest.raises(Exception) as raised:
+            tools.known_secret_values()
+        assert type(raised.value).__name__ == "KnownSecretsIncomplete"
+        collected = tools._collect_known_secrets()
+        for_log = tools.known_secrets_for_log()
+
+    assert failed
+    gap = tools.SecretSourceGap(*where)
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert raised.value.gaps == (gap,)
+    assert not collected.complete
+    assert collected.gaps == (gap,)
+    assert for_log == (frozenset(), False)
+    if look != "list-tools-directory":
+        assert "kb-secret-abcdef" in collected.values
+
+
+@pytest.mark.parametrize("kind", ["link", "fifo", "directory", "link-loop"])
+def test_an_env_that_is_no_regular_file_holds_no_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The runtime neither follows a link nor reads a special file
+    (``_load_tool_dotenv``), so a ``.env`` seen to be one holds no value anyone is
+    given -- a link to a file full of secrets, a loop of links, a FIFO, a
+    directory -- and the list is whole without it. Not red at HEAD, which answered
+    them the same way; it keeps them apart from a look that failed."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    env.unlink()
+    if kind == "link":
+        target = tmp_path / "elsewhere.env"
+        target.write_text("LINKED=linked-secret-abcdef\n", encoding="utf-8")
+        os.symlink(target, env)
+    elif kind == "fifo":
+        os.mkfifo(env)
+    elif kind == "directory":
+        env.mkdir()
+    else:
+        os.symlink(env, env)
+
+    assert tools.known_secret_values() == frozenset({"kb-secret-abcdef"})
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset({"kb-secret-abcdef"}))
+
+
+def test_the_shared_read_tells_a_link_it_refused_from_a_loop_above_the_file(
+    tmp_path: Path,
+) -> None:
+    """``ELOOP`` from the open is a link the open would not follow only when a look
+    at the final component sees that link; a loop among the directories above it
+    leaves the file unknown. The read that says why (``_read_regular_text_capped``)
+    tells them apart; the old answer, text or None, stays the same for both."""
+    loop = tmp_path / "loop"
+    os.symlink(loop, loop)
+    target = tmp_path / "real.env"
+    target.write_text("K=v\n", encoding="utf-8")
+    link = tmp_path / "link.env"
+    os.symlink(target, link)
+
+    above = tools._read_regular_text_capped(loop / ".env", 100)
+    at = tools._read_regular_text_capped(link, 100)
+
+    assert (above.text, above.refusal, above.error) == (None, "failed", "OSError")
+    assert (at.text, at.refusal) == (None, "not_regular")
+    assert tools._read_regular_file_capped(loop / ".env", 100) is None
+    assert tools._read_regular_file_capped(link, 100) is None
+    assert tools._read_regular_file_capped(target, 100) == "K=v\n"
+
+
+def test_a_package_entry_whose_links_loop_leaves_the_list_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A package is an entry that is a directory once links are followed. An entry
+    whose links loop cannot be told either way, so the list is not whole. Red
+    before the fix: the entry was skipped as no directory."""
+    kb, _other = _two_tools(monkeypatch, tmp_path)
+    loop = kb.parent / "looping"
+    os.symlink(loop, loop)
+
+    with pytest.raises(Exception) as raised:
+        tools.known_secret_values()
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert raised.value.gaps == (
+        tools.SecretSourceGap("looping", os.fspath(loop / ".env"), "OSError"),
+    )
+
+
+def test_an_env_over_the_cap_holds_no_value_judged_by_its_text_not_its_size(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The loader refuses a ``.env`` whose TEXT is over the cap, so such a file
+    holds no value given to anyone, and the list is whole without it. One whose
+    bytes are over the cap but whose text is not is read like any other, and its
+    value is in the list: the runtime hands it to the tool. Not red at HEAD; red
+    for a judgement made on the file's size."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    cap = tools._ENV_FILE_MAX_BYTES
+    (other / ".env").write_text(
+        "OTHER_KEY=other-secret-abcdef\n#" + "x" * cap + "\n", encoding="utf-8"
+    )
+    wide = "# " + "密" * (cap // 3) + "\nKB_KEY=kb-wide-secret-abcdef\n"
+    assert len(wide.encode("utf-8")) > cap >= len(wide)
+    (kb / ".env").write_text(wide, encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset({"kb-wide-secret-abcdef"})
+    assert tools._collect_known_secrets().complete
+
+
+def test_an_env_the_parser_reads_in_part_gives_exactly_what_it_gives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Text that was read is a definite answer whatever the parser makes of it:
+    the non-empty values it gives -- some lines, or none -- and the list is whole.
+    Not red at HEAD; it keeps a parse that gives little apart from a read that
+    failed."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    (kb / ".env").write_text("not a line at all\nEMPTY=\nKB_KEY=kb-part-abcdef\n", encoding="utf-8")
+    (other / ".env").write_text("=== nothing here ===\n", encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset({"kb-part-abcdef"})
+    assert tools._collect_known_secrets().complete
+
+
+def test_a_read_that_failed_is_not_cached_nor_does_a_cached_answer_stand_in_for_a_failed_look(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only a read that gave an answer is cached. A read that failed leaves the list
+    not whole and nothing behind it, so the next collection reads the file again
+    and finds its value. A cached answer is not used when the look at the file
+    fails: the list is then not whole, and the entry is dropped. Red before the
+    fix: the failed read was cached as no values, so the value stayed missing,
+    and a failed look was answered as no values."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "open", env, errno.EIO, times=1)
+        with pytest.raises(Exception) as first:
+            tools.known_secret_values()
+        second = tools.known_secret_values()
+
+    assert isinstance(first.value, tools.KnownSecretsIncomplete)
+    assert "other-secret-abcdef" in second
+    assert os.fspath(env) in tools._ENV_VALUE_CACHE
+
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", env, errno.EACCES)
+        _failing_at(patch, "stat", env, errno.EACCES)
+        with pytest.raises(Exception) as third:
+            tools.known_secret_values()
+
+    assert isinstance(third.value, tools.KnownSecretsIncomplete)
+    assert os.fspath(env) not in tools._ENV_VALUE_CACHE
+
+
+def test_a_whole_list_with_no_secrets_is_empty_and_whole_before_and_after_its_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``.env`` files with no values: the list is empty and whole, the masks get
+    it without raising, and a second collection served from the cache says the
+    same -- an empty whole list is never mistaken for one that is not whole. Not
+    red at HEAD, which had no other answer; it keeps the whole empty list apart
+    from the lists that are not whole above."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    (kb / ".env").write_text("EMPTY=\n", encoding="utf-8")
+    (other / ".env").write_text("# nothing\n", encoding="utf-8")
+
+    assert tools.known_secret_values() == frozenset()
+    assert tools._redaction_secrets() == []
+    first = tools._collect_known_secrets()
+    second = tools._collect_known_secrets()
+
+    assert first == second == tools.KnownSecrets(frozenset())
+    assert first.complete and second.complete
+    assert tools.known_secrets_for_log() == (frozenset(), True)
+
+
+def test_the_masks_refuse_a_list_that_is_not_whole_naming_the_env_and_what_to_do(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_redaction_secrets`` -- the list every mask takes -- raises the dedicated
+    exception, and so does the live mask. Its message names the tool and the
+    ``.env`` and says what to check; it carries the failure's type name but not
+    its text, nothing of the ``.env``, and never says a secret was found. Red
+    before the fix: the list came back without the other tool's value."""
+    _kb, other = _two_tools(monkeypatch, tmp_path)
+    env = other / ".env"
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", env, errno.EACCES)
+        _failing_at(patch, "stat", env, errno.EACCES)
+        with pytest.raises(Exception) as raised:
+            tools._redaction_secrets()
+        with pytest.raises(Exception) as live:
+            tools.redact_known_secrets("text with other-secret-abcdef")
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert isinstance(live.value, tools.KnownSecretsIncomplete)
+    message = str(raised.value)
+    assert "「other」" in message
+    assert os.fspath(env) in message
+    assert "PermissionError" in message
+    assert "權限" in message and "磁碟狀態" in message and "重試" in message
+    assert "a-failure-text-never-shown" not in message
+    assert "other-secret-abcdef" not in message and "OTHER_KEY" not in message
+    assert "發現" not in message and "含有" not in message
+
+
+def test_every_source_that_cannot_be_read_is_a_gap_and_the_message_counts_the_rest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each source that could not be read is a gap; the message names the first
+    and how many more there are. Red before the fix: the list came back without
+    either tool's value."""
+    kb, other = _two_tools(monkeypatch, tmp_path)
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", kb / ".env", errno.EIO)
+        _failing_at(patch, "stat", kb / ".env", errno.EIO)
+        _failing_at(patch, "open", other / ".env", errno.EACCES)
+        with pytest.raises(Exception) as raised:
+            tools.known_secret_values()
+
+    assert isinstance(raised.value, tools.KnownSecretsIncomplete)
+    assert [gap.tool for gap in raised.value.gaps] == ["kb", "other"]
+    assert "另有 1 處也讀不到" in str(raised.value)
+
+
+def test_tools_dir_keeps_a_path_not_made_yet_and_the_list_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Components that do not exist yet are kept as written: a tools directory not
+    created yet still has its path, holds no packages, and the list is whole. Not
+    red at HEAD; it pins what the stricter resolution must not take away."""
+    root = tmp_path / "not-yet" / "tools"
+    _install_tools(monkeypatch, root)
+
+    assert tools.tools_dir() == root.resolve()
+    assert tools.known_secret_values() == frozenset()
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset())
+
+
+def test_a_tools_dir_whose_link_cannot_be_looked_at_raises_and_leaves_the_list_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``via`` is a link and the setting reads ``via/../tools``: resolved, that is
+    ``tools`` beside the link's target. When the look at ``via`` fails, nothing
+    can tell it is a link, so the path is not resolved at all -- the lookup raises
+    ``ToolsDirUnresolvedError``, naming the configured path, the failure's type
+    and what to do -- rather than answered with ``tools`` beside ``via``, another
+    directory, by folding ``..`` as text. Nothing turns that into "no tools" or
+    "no secrets": the known secrets are not whole. Red before the fix: the lookup
+    raised the bare ``PermissionError``, which named neither the path nor what to
+    do."""
+    base = tmp_path.resolve()
+    (base / "deep" / "inner").mkdir(parents=True)
+    os.symlink(base / "deep" / "inner", base / "via")
+    configured = base / "via" / ".." / "tools"
+    _install_tools(monkeypatch, configured)
+    assert tools.tools_dir() == base / "deep" / "tools"
+
+    with monkeypatch.context() as patch:
+        _failing_at(patch, "lstat", base / "via", errno.EACCES)
+        with pytest.raises(Exception) as unresolved:
+            tools.tools_dir()
+        with pytest.raises(tools.KnownSecretsIncomplete) as raised:
+            tools.known_secret_values()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (str(configured), "PermissionError")
+    message = str(unresolved.value)
+    assert str(configured) in message
+    assert "PermissionError" in message
+    assert "TOOLS_DIR" in message
+    [gap] = raised.value.gaps
+    assert (gap.tool, gap.path, gap.error) == (None, str(configured), "PermissionError")
+
+
+def test_a_tools_dir_in_a_link_loop_raises_naming_it_and_the_list_is_not_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``loop`` is a link to itself, so the setting ``loop/tools`` cannot be
+    resolved. That is no "nothing there" -- only ``ENOENT`` and ``ENOTDIR`` are
+    -- so the lookup raises ``ToolsDirUnresolvedError`` naming the configured
+    path and the failure's type, and the known secrets are not whole. Red before
+    the fix: the lookup raised the bare ``OSError``, which named neither the path
+    nor what to do."""
+    base = tmp_path.resolve()
+    os.symlink(base / "loop", base / "loop")
+    configured = base / "loop" / "tools"
+    _install_tools(monkeypatch, configured)
+
+    with pytest.raises(Exception) as unresolved:
+        tools.tools_dir()
+    with pytest.raises(tools.KnownSecretsIncomplete) as raised:
+        tools.known_secret_values()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (str(configured), "OSError")
+    assert str(configured) in str(unresolved.value)
+    [gap] = raised.value.gaps
+    assert (gap.tool, gap.path, gap.error) == (None, str(configured), "OSError")
+
+
+def test_a_tools_dir_under_a_file_is_kept_as_configured_and_holds_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The setting reads ``via/../plain/tools``, where ``via`` is a link into
+    ``deep/inner`` and ``deep/plain`` is a regular file: the path runs through a
+    file, so no directory can be there, as surely as one not made yet. It is
+    answered as configured, made absolute only -- the link not followed and
+    ``..`` not folded, which would name ``plain/tools`` beside ``via``, a
+    directory holding a package -- and nothing is under it: no packages, not the
+    feature being off, and the known secrets are whole without that package's
+    value. Red before the fix: resolving the setting raised
+    ``NotADirectoryError``."""
+    base = tmp_path.resolve()
+    (base / "deep" / "inner").mkdir(parents=True)
+    (base / "deep" / "plain").write_text("a file\n", encoding="utf-8")
+    os.symlink(base / "deep" / "inner", base / "via")
+    _make_tool(base / "plain" / "tools", "kb", "print('x')\n", dotenv="KB_KEY=beside-via-abcdef\n")
+    configured = base / "via" / ".." / "plain" / "tools"
+    _install_tools(monkeypatch, configured)
+
+    assert str(tools.tools_dir()) == str(configured)
+    assert tools.list_tools() == []
+    assert tools.acquire_shared_tools_lock() is None
+    assert tools.known_secret_values() == frozenset()
+    assert tools._collect_known_secrets() == tools.KnownSecrets(frozenset())
+
+
+def test_a_relative_tools_dir_under_a_file_is_made_absolute(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A relative setting whose path runs through a file is answered against the
+    working directory, as an absolute path. Red before the fix: resolving it
+    raised ``NotADirectoryError``."""
+    (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _install_tools(monkeypatch, Path("plain") / "tools")
+
+    assert tools.tools_dir() == Path(os.getcwd()) / "plain" / "tools"
+
+
+def test_a_tools_dir_under_a_file_that_cannot_be_made_absolute_raises_naming_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relative setting whose path runs through a file is made absolute against
+    the working directory; when that directory is gone, it cannot be, and the
+    lookup raises ``ToolsDirUnresolvedError`` like any other failure to resolve
+    the path, not the bare failure of the working directory. Red before the fix:
+    the lookup raised the bare ``NotADirectoryError``."""
+    _install_tools(monkeypatch, Path("plain") / "tools")
+
+    def through_a_file(path: Any, *args: Any, **kwargs: Any) -> str:
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", os.fspath(path))
+
+    def gone() -> str:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "realpath", through_a_file)
+        patch.setattr(os, "getcwd", gone)
+        with pytest.raises(Exception) as unresolved:
+            tools.tools_dir()
+
+    assert type(unresolved.value).__name__ == "ToolsDirUnresolvedError"
+    assert isinstance(unresolved.value, tools.ToolsDirUnresolvedError)
+    assert (unresolved.value.path, unresolved.value.error) == (
+        os.path.join("plain", "tools"),
+        "FileNotFoundError",
+    )
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_body_masked_whole_live_but_recorded_while_its_env_is_unreadable_is_not_recorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A PEM-like value registered from a single-quoted ``.env`` line keeps ``\\n``
+    as two characters; the text holds it with a real line break, so the live mask,
+    with the whole list, finds nothing to mask. When the body is recorded the
+    tool's directory cannot be looked at, so the list is not whole: each body is
+    stored as the marker saying it was not recorded -- not the one saying a secret
+    was found -- and no byte of the JSONL file holds the value, which the file's
+    own escaping would otherwise spell. Red before the fix: each body was stored
+    as the marker saying a secret was found."""
+    from afterthread import main
+
+    root = tmp_path / "tools"
+    secret = "kb-pem-head\\nkb-pem-body"
+    version = _make_tool(root, "kb", "print('x')\n", dotenv="KB_KEY='kb-pem-head\\nkb-pem-body'\n")
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    assert secret in tools.known_secret_values()
+    assert tools.redact_known_secrets(text) == text
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", llm_log._secret_provider)
+    main._configure_secret_redaction()
+    llm_log._reset_for_tests()
+    package = _package_path(version)
+    package.chmod(0)
+    try:
+        recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
+        recorder.begin_attempt([{"role": "user", "content": text}])
+        recorder.record_response(text)
+        recorder.finish(outcome="ok", error=None)
+    finally:
+        package.chmod(0o700)
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] != llm_log._REDACTION_MARKER
+    assert attempt["request_messages"][0]["content"] == llm_log._UNCHECKED_MARKER
+    assert attempt["response_content"] == llm_log._UNCHECKED_MARKER
+
+
+def test_the_ai_log_masks_a_known_value_holding_a_crlf_in_its_normalized_form_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The AI log, wired to the tools registry the way the app wires it, masks a
+    value an installed tool's ``.env`` gives with a CRLF both as it is and with
+    an LF in the CRLF's place -- the form text read with universal newlines holds
+    it in."""
+    from afterthread import main
+
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", dotenv='KB_KEY="kb-head\\r\\nkb-tail"\n')
+    _install_tools(monkeypatch, root)
+    tools._ENV_VALUE_CACHE.clear()
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", llm_log._secret_provider)
+    main._configure_secret_redaction()
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "it read kb-head\nkb-tail back"}])
+    recorder.record_response("and wrote kb-head\r\nkb-tail too")
+    recorder.finish(outcome="ok", error=None)
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    marker = llm_log._REDACTION_MARKER
+    assert attempt["request_messages"][0]["content"] == f"it read {marker} back"
+    assert attempt["response_content"] == f"and wrote {marker} too"
 
 
 def test_redaction_marker_matches_llm_log() -> None:
@@ -3338,6 +4869,33 @@ def test_mask_known_secrets_source_identical_in_both_modules() -> None:
     )
 
 
+def test_match_forms_source_identical_in_both_modules() -> None:
+    """tools._match_forms and llm_log._match_forms MUST be byte-for-byte identical:
+    the live mask and the stored-body mask take the same values in the same forms,
+    so a value masked in a live tool result is masked in the AI 日誌 too. A future
+    edit applied to one copy and not mirrored to the other fails here."""
+    assert inspect.getsource(tools._match_forms) == inspect.getsource(llm_log._match_forms)
+
+
+@pytest.mark.parametrize("name", ["_Fixed", "_Record", "_encode_spans", "_touches_free_text"])
+def test_the_encoder_and_search_a_written_text_is_checked_with_are_source_identical_in_both_modules(
+    name: str,
+) -> None:
+    """``llm_log`` keeps its own copy of the encoder that writes a JSON line and
+    marks its fixed content, and of the search that checks it, for the same
+    leaf/layering reason it keeps its own mask. A JSON file and a JSONL line are
+    written and checked alike only while the copies are the same; an edit
+    applied to one copy and not the other fails here."""
+    assert inspect.getsource(getattr(tools, name)) == inspect.getsource(getattr(llm_log, name))
+
+
+def test_min_secret_len_matches_llm_log() -> None:
+    """tools._MIN_SECRET_LEN and llm_log._MIN_SECRET_LEN MUST be the same value:
+    each ``_match_forms`` looks the floor up BY NAME in its own module, so identical
+    source would still keep different values if the two modules disagreed."""
+    assert tools._MIN_SECRET_LEN == llm_log._MIN_SECRET_LEN
+
+
 def test_redact_known_secrets_masks_and_skips_short(monkeypatch: pytest.MonkeyPatch) -> None:
     """redact_known_secrets masks every known value and SKIPS values under the
     6-char floor (mirroring llm_log._redact), replacing with the shared marker."""
@@ -3358,6 +4916,21 @@ def test_redact_known_secrets_longest_first(monkeypatch: pytest.MonkeyPatch) -> 
     assert "abcdefXYZ789" not in out
     assert "XYZ789" not in out  # the suffix a shorter-first pass would have leaked
     assert out.count(tools._REDACTION_MARKER) == 1
+
+
+def test_redact_known_secrets_masks_a_value_and_its_normalized_form_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nab`` and its normalized form ``ab\\nab`` overlap in the text: the
+    value's occurrence ends where the form's begins. Both are found on the text as
+    it is and their ranges merged, so one marker covers the two -- masking one and
+    then looking for the other would leave a piece of it -- and the text's other
+    line breaks stay as they were."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"ab\r\nab"}))
+
+    out = tools.redact_known_secrets("head\r\nab\r\nab\nab tail\r\n")
+
+    assert out == f"head\r\n{tools._REDACTION_MARKER} tail\r\n"
 
 
 def test_redact_known_secrets_masks_trailing_prefix_fragment(
@@ -3839,6 +5412,70 @@ def test_delete_tool_removes_package(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert _delete_outcome("echo") is None  # already gone
 
 
+@pytest.mark.parametrize(
+    ("where", "look_fails", "seen_gone"),
+    [
+        ("missing", False, True),
+        ("file/child", False, True),
+        ("present", True, False),
+        ("present", False, False),
+    ],
+    ids=["missing", "under-a-file", "look-fails", "present"],
+)
+def test_seen_gone_only_when_the_look_says_nothing_is_there(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    where: str,
+    look_fails: bool,
+    seen_gone: bool,
+) -> None:
+    """``_seen_gone`` is True only when ``lstat`` says nothing is there: no such
+    entry, or a component above it that is a file. A look that fails any other
+    way says nothing about the path, and a path that is there is not gone."""
+    (tmp_path / "present").mkdir()
+    (tmp_path / "file").write_text("a file\n", encoding="utf-8")
+    path = tmp_path / where
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", path, errno.EIO) if look_fails else []
+        answer = tools._seen_gone(path)
+
+    assert answer is seen_gone
+    assert len(failed) == int(look_fails)
+
+
+def test_delete_reports_removed_only_once_its_remains_are_seen_gone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at the stale path the package is renamed to fails, so nothing
+    can tell whether its removal finished. The deletion reports it retained,
+    with that path, rather than removed, and the directory, keys included, is
+    still there once the looks work again. A check that reads a failed look as
+    "not there", as ``os.path.lexists`` does, would report it removed."""
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", dotenv="KEY=value\n")
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    token = "0123456789abcdef" * 2
+    monkeypatch.setattr(tools, "uuid4", lambda: SimpleNamespace(hex=token))
+    stale = tools._stale_backup_path(base, "echo", token)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", stale, errno.EIO)
+        result = delete_tool("echo")
+
+    assert isinstance(result, tools.ToolRemovalResult)
+    assert (result.outcome, result.retained_path, result.retention_reason) == (
+        "retained",
+        stale,
+        "cleanup_failed",
+    )
+    assert len(failed) >= 1
+    assert stale.is_dir()
+    assert (stale / ".env").is_file()
+
+
 def test_delete_during_an_execution_returns_busy_and_leaves_package_untouched(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4127,6 +5764,219 @@ def test_a_delete_landing_while_a_call_prepares_is_locked_out(
     assert _package_path(pkg).is_dir()
 
 
+# --- the shared lock taken from a coroutine: handed back however the wait ends ---
+
+
+def _counting_handover() -> tuple[tools._LockHandover, list[int]]:
+    closed: list[int] = []
+    return tools._LockHandover(close=closed.append), closed
+
+
+def test_a_descriptor_taken_after_its_waiter_gave_up_is_closed_once_by_the_worker() -> None:
+    handover, closed = _counting_handover()
+
+    handover.abandon()
+    assert closed == []
+    assert handover.hand_over(7) is None
+
+    assert closed == [7]
+
+
+def test_a_descriptor_handed_over_before_its_waiter_gave_up_is_closed_once_by_the_waiter() -> None:
+    handover, closed = _counting_handover()
+
+    assert handover.hand_over(7) == 7
+    assert closed == []
+    handover.abandon()
+
+    assert closed == [7]
+
+
+def test_a_failed_acquisition_goes_out_of_the_coroutine_as_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Not None, which reads as the feature being off: a request would go on unlocked."""
+    failure = tools.ToolsLockUnavailableError(Path("/nowhere/.lock"), "open failed: injected")
+
+    def fail() -> int | None:
+        raise failure
+
+    monkeypatch.setattr(tools, "acquire_shared_tools_lock", fail)
+
+    with pytest.raises(tools.ToolsLockUnavailableError) as raised:
+        asyncio.run(tools.acquire_shared_tools_lock_async())
+    assert raised.value is failure
+
+
+def _observed_acquisitions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[threading.Event, threading.Event]:
+    """Events set as a worker enters ``acquire_shared_tools_lock`` and as it returns."""
+    real = tools.acquire_shared_tools_lock
+    entered, returned = threading.Event(), threading.Event()
+
+    def observed() -> int | None:
+        entered.set()
+        try:
+            return real()
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(tools, "acquire_shared_tools_lock", observed)
+    return entered, returned
+
+
+def _exclusive_lock_free(root: Path) -> bool:
+    with tools.exclusive_tools_lock(root) as acquired:
+        return acquired
+
+
+async def _until(condition: Callable[[], bool], *, timeout: float = 5.0) -> bool:
+    """Whether ``condition`` holds within ``timeout``, checked as the loop runs."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.01)
+    return True
+
+
+def _cancelled_while_waiting_for_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    root: Path,
+    start: Callable[[], Awaitable[object]],
+    to_cancel: Callable[[asyncio.Future[Any]], asyncio.Future[Any]] = lambda task: task,
+) -> bool:
+    """Whether the exclusive lock comes free after ``start`` is cancelled waiting for
+    the shared lock behind a destroyer.
+
+    ``to_cancel`` picks the task to cancel from the one running ``start``, once a
+    worker is in ``acquire_shared_tools_lock``; the destroyer lets go after that
+    cancellation, and the worker takes the lock before the exclusive lock is tried.
+    """
+    entered, returned = _observed_acquisitions(monkeypatch)
+    holder = tools._open_tools_lock(root)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+
+    async def scenario() -> bool:
+        task = asyncio.ensure_future(start())
+        try:
+            assert await _until(entered.is_set)
+            to_cancel(task).cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            os.close(holder)
+        assert await _until(returned.is_set)
+        return await _until(lambda: _exclusive_lock_free(root))
+
+    return asyncio.run(scenario())
+
+
+def test_a_wait_for_the_shared_lock_cancelled_behind_a_destroyer_hands_the_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    assert _cancelled_while_waiting_for_the_lock(
+        monkeypatch, root, tools.acquire_shared_tools_lock_async
+    )
+
+
+def test_an_ai_request_cancelled_while_it_waits_for_the_tools_lock_hands_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    async def request() -> None:
+        async with _advertised_tools_lock():
+            raise AssertionError("the request went on without being cancelled")
+
+    assert _cancelled_while_waiting_for_the_lock(monkeypatch, root, request)
+
+
+def test_examples_cancelled_while_they_wait_for_the_tools_lock_hand_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    def check() -> Awaitable[tools.CheckResult]:
+        return tools.run_examples("kb", check_id="c", workflow="health_check", budget_seconds=5)
+
+    assert _cancelled_while_waiting_for_the_lock(monkeypatch, root, check)
+
+
+def test_a_tool_call_cancelled_while_it_waits_for_its_own_tools_lock_hands_it_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A handler built outside a request scope takes the lock in its own call task,
+    which is shielded from the caller: that task is the one cancelled."""
+    root = tmp_path / "tools"
+    _make_tool(root, "echo", "import sys\nsys.stdout.write('ok')\n")
+    _install_tools(monkeypatch, root)
+    handler = enabled_llm_tools()[0].handler
+    before = set(tools._CALL_TASKS)
+
+    def the_call_task(_caller: asyncio.Future[Any]) -> asyncio.Future[Any]:
+        [task] = tools._CALL_TASKS - before
+        return task
+
+    assert _cancelled_while_waiting_for_the_lock(
+        monkeypatch, root, lambda: handler({}), to_cancel=the_call_task
+    )
+
+
+def test_an_ai_request_scope_cancelled_by_an_anyio_scope_hands_the_tools_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An anyio scope's cancellation lands at every await inside it, an await in the
+    ``finally`` included, before what it awaits has run."""
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+
+    async def scenario() -> None:
+        with anyio.CancelScope() as scope:
+            async with _advertised_tools_lock():
+                scope.cancel()
+                await asyncio.sleep(0)
+                raise AssertionError("the cancelled scope let the request go on")
+
+    asyncio.run(scenario())
+
+    assert _exclusive_lock_free(root)
+
+
+def test_examples_cancelled_by_an_anyio_scope_hand_the_tools_lock_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "tools"
+    root.mkdir()
+    _install_tools(monkeypatch, root)
+    scopes: list[anyio.CancelScope] = []
+
+    def cancel_then_find_nothing(_name: str) -> str:
+        scopes[0].cancel()
+        return "not_found"
+
+    monkeypatch.setattr(tools, "checkable_tool", cancel_then_find_nothing)
+
+    async def scenario() -> None:
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await tools.run_examples("kb", check_id="c", workflow="health_check", budget_seconds=5)
+
+    asyncio.run(scenario())
+
+    assert _exclusive_lock_free(root)
+
+
 def test_a_toggle_landing_while_a_call_prepares_still_refuses_before_popen(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -4403,39 +6253,53 @@ def test_set_enabled_refuses_a_symlinked_state_file(
 def test_a_publish_whose_package_becomes_a_symlink_at_the_boundary_is_refused(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """The last containment re-check refuses an ancestor swapped for a symlink.
+    """A package that becomes a link after the first lookup is not written through.
 
     The publisher's own pre-write ``lstat`` protects the FINAL component but not
     its ancestors: it -- like ``mkstemp(dir=...)`` and ``os.replace`` -- follows
-    directories above the state filename. ``set_enabled`` therefore resolves the
-    package once to identify it, then checks containment again immediately before
-    calling the publisher.
+    directories above the state filename. ``set_enabled`` therefore looks the
+    package up once to identify it, and again before the write.
 
-    Driven at exactly that instant rather than by timing a filesystem race: the
-    re-check is replaced by a wrapper that swaps the package before delegating.
+    Driven between those two lookups rather than by timing a filesystem race: both
+    go through ``_resolve_package_dir_no_alias``, and a wrapper lets the first hand
+    back the real package unchanged, then swaps the package for a link just before
+    the second, so it is the recheck that sees the link and refuses. The first
+    lookup cannot refuse this: the package is a real directory when it looks.
+    ``resolve_current``'s ``lstat`` of the package directory, after the recheck,
+    would refuse this link as well; the tools directory itself replaced by a
+    link, which that ``lstat`` follows, is what only the recheck refuses, and it
+    is not driven here.
 
     What must hold is BOTH halves -- the toggle reports "did not happen" (the route
     turns that into a 404) and the link's target is left without so much as a temp
-    file in it."""
+    file in it, the real package's state file unchanged."""
     root = tmp_path / "tools"
     version = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n", enabled=True)
     pkg = _package_path(version)
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
     aside = root / ".moved-aside"
     before = (pkg / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME).read_bytes()
     real_resolve = tools._resolve_package_dir_no_alias
+    answers: list[tools.PackageRoot | None] = []
 
-    def swap_before_recheck(name: str) -> tools.PackageRoot | None:
-        os.rename(pkg, aside)  # the package the toggle resolved, moved away
-        pkg.symlink_to(elsewhere, target_is_directory=True)
-        return real_resolve(name)
+    def swap_before_the_second_lookup(name: str) -> tools.PackageRoot | None:
+        if len(answers) == 1:  # the first lookup has identified the package
+            os.rename(pkg, aside)  # the package the toggle resolved, moved away
+            pkg.symlink_to(elsewhere, target_is_directory=True)
+        answer = real_resolve(name)
+        answers.append(answer)
+        return answer
 
-    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", swap_before_recheck)
+    monkeypatch.setattr(tools, "_resolve_package_dir_no_alias", swap_before_the_second_lookup)
 
     assert set_enabled("echo", False) is False
 
+    # The first lookup handed back the real package; the recheck, after the swap, refused it.
+    assert answers == [tools.PackageRoot(base / "echo"), None]
     assert list(elsewhere.iterdir()) == []  # nothing written THROUGH the link
     assert (
         aside / tools._META_DIRNAME / tools._PACKAGE_STATE_FILENAME
@@ -4512,15 +6376,116 @@ def test_delete_internal_alias_removes_only_link(
     assert "alias" not in listed  # the phantom invalid row is gone
 
 
+def _stale_entries_for(base: Path, name: str) -> list[str]:
+    """The entries under ``base`` awaiting collection for ``name``, recognized by
+    the name ``_stale_backup_path`` gives them."""
+    prefix = tools._stale_backup_path(base, name, "").name
+    return sorted(entry for entry in os.listdir(base) if entry.startswith(prefix))
+
+
+def _assert_package_intact(package: Path) -> None:
+    """``package`` is still a real directory whose current version has its manifest."""
+    assert stat.S_ISDIR(os.lstat(package).st_mode)
+    assert (_resolved_version(package) / "tool.json").is_file()
+
+
+def test_delete_leaves_an_alias_and_its_target_untouched_when_its_look_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The deletion's look at ``tools/alias`` fails once; the next look would see
+    the link, and a resolve that follows it lands on ``tools/real``. A look that
+    fails cannot tell a link from a directory, so the deletion touches nothing:
+    the answer is None (the route's 404), ``real`` keeps its files, the alias is
+    still the same link, and nothing of the alias's sits in the stale namespace.
+    The one failure is spent on the deletion's first look at the alias."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    link_text = os.readlink(alias)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=1)
+        outcome = _delete_outcome("alias")
+
+    assert outcome is None
+    assert failed == [str(alias)]
+    _assert_package_intact(real)
+    assert os.readlink(alias) == link_text
+    assert _stale_entries_for(alias.parent, "alias") == []
+
+
+def test_delete_never_renames_an_alias_whose_every_look_fails_into_the_stale_namespace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every look at ``tools/alias`` fails, so nothing can tell it is a link: a
+    lookup whose looks all fail hands the alias path back as written, and
+    renaming that would move the link itself into the stale namespace, report it
+    retained, and leave it there, since the stale sweep never collects a link.
+    The deletion's failed look touches nothing: the answer is None, the alias is
+    still the same link where it was, and ``real`` keeps its files."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    link_text = os.readlink(alias)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO)
+        outcome = _delete_outcome("alias")
+
+    assert outcome is None
+    assert len(failed) >= 1
+    _assert_package_intact(real)
+    assert os.readlink(alias) == link_text
+    assert _stale_entries_for(alias.parent, "alias") == []
+
+
+def test_delete_never_reaches_the_target_of_a_link_put_in_place_after_its_look(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools/alias`` is a real, empty directory when the deletion's one look
+    sees it, and becomes a link to ``tools/real`` right after. A look cannot see
+    a change that comes after it, so it passes the name on as a directory. What
+    keeps ``real`` safe is the package lookup the deletion then asks: it looks at
+    the name again without following it, and takes what its resolve gave only if
+    that is exactly ``<tools_dir>/alias``; either check alone refuses the link
+    here. The answer is None, ``real`` keeps its files, and the link is left
+    where it was. This case is why the deletion goes through that lookup after
+    its own look. Red for a lookup that follows the link: ``real`` was renamed
+    and removed."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").mkdir()
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    real, alias = base / "real", base / "alias"
+    real_lstat = os.lstat
+    swapped: list[str] = []
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        answer = real_lstat(path, *args, **kwargs)
+        if not swapped and isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            swapped.append(str(alias))
+            os.rmdir(alias)
+            os.symlink(real, alias, target_is_directory=True)
+        return answer
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        outcome = _delete_outcome("alias")
+
+    assert swapped == [str(alias)]
+    assert outcome is None
+    _assert_package_intact(real)
+    assert os.readlink(alias) == str(real)
+    assert _stale_entries_for(base, "alias") == []
+
+
 def test_set_enabled_refuses_internal_alias(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """set_enabled must never act on a package THROUGH an internal alias:
-    tools/<alias> -> tools/<real> resolves inside the root, so absent the
-    pre-resolve symlink block a toggle on the alias would land the state file
-    INSIDE the REAL package -- switching off a tool the operator addressed by
-    another name. The alias PATCH is refused (False) and the real package is left
-    byte-for-byte untouched, state file included."""
+    tools/<alias> -> tools/<real> resolves inside the root. The lookup sees the
+    link at the name and refuses it; a lookup that followed the link would land
+    the state file INSIDE the REAL package -- switching off a tool the operator
+    addressed by another name. The alias PATCH is refused (False) and the real
+    package is left byte-for-byte untouched, state file included."""
     root = tmp_path / "tools"
     real_version = _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n", enabled=True)
     (root / "alias").symlink_to(root / "real", target_is_directory=True)
@@ -4532,6 +6497,200 @@ def test_set_enabled_refuses_internal_alias(
     assert _state_path(real_version).is_file()  # and package state was untouched
     real = {t["name"]: t for t in list_tools()}["real"]
     assert real["enabled"] is True  # the real package's flag never flipped
+
+
+def _real_and_alias(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Path, Path]:
+    """``tools/real``, a package, and ``tools/alias``, a link to it, spelled as
+    ``tools_dir`` spells them."""
+    root = tmp_path / "tools"
+    _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "real", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+    return base / "real", base / "alias"
+
+
+def test_an_alias_whose_first_look_fails_addresses_no_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The look ``is_symlink`` takes at ``tools/alias`` fails once and answers "not
+    a link"; the resolve after it follows the link to ``tools/real``. What the
+    resolve gave is not ``tools/alias``, so the name addresses no package. Red
+    before the fix: the name was handed ``tools/real``."""
+    real, alias = _real_and_alias(monkeypatch, tmp_path)
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(real)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=1)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(alias)]
+    assert found is None
+
+
+def test_an_alias_to_a_same_named_directory_under_another_parent_addresses_no_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools/alias`` is a link to ``tools/nested/alias``: a real directory inside
+    the root, so the containment passes, with the same last name as the link. The
+    look at the link fails once, and what the resolve gave is compared whole:
+    ``tools/nested/alias`` is not ``tools/alias``, so the name addresses no
+    package. Red before the fix: the name was handed ``tools/nested/alias``."""
+    root = tmp_path / "tools"
+    _make_tool(root / "nested", "alias", "import sys\nsys.stdout.write('x')\n")
+    (root / "alias").symlink_to(root / "nested" / "alias", target_is_directory=True)
+    _install_tools(monkeypatch, root)
+    base = tools.tools_dir()
+    assert base is not None
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", base / "alias", errno.EIO, times=1)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(base / "alias")]
+    assert found is None
+
+
+@pytest.mark.parametrize("failing", [0, 1, 2], ids=["no-fault", "first-look", "both-looks"])
+def test_a_real_package_is_addressed_when_its_first_looks_fail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: int
+) -> None:
+    """A real package's name hands out its directory with no fault, and when the
+    first looks at it fail -- ``is_symlink``'s, then the resolve's too, which keeps
+    a component it cannot look at as written: the package's own path. A failed
+    look never turns a real package into no package, which the record purges
+    would take for one that is gone. Not red before the fix; red for an alias
+    check made a strict ``lstat``."""
+    real, _alias = _real_and_alias(monkeypatch, tmp_path)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", real, errno.EIO, times=failing)
+        found = tools._resolve_package_dir_no_alias("real")
+
+    assert found == tools.PackageRoot(real)
+    assert len(failed) == failing
+
+
+def test_an_alias_whose_looks_all_fail_is_handed_out_as_itself_never_its_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both looks at ``tools/alias`` fail, ``is_symlink``'s and the resolve's, so
+    nothing tells it is a link and the resolve keeps it as written. The name is
+    handed ``tools/alias`` itself, never ``tools/real``, and what acts on a
+    package looks at it without following the link: it has no current version.
+    Not red before the fix: it pins what refuses an alias the check on the
+    result cannot see."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+
+    with monkeypatch.context() as patch:
+        failed = _failing_at(patch, "lstat", alias, errno.EIO, times=2)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert failed == [str(alias)] * 2
+    assert found == tools.PackageRoot(alias)
+    assert found is not None and isinstance(tools.resolve_current(found), tools.Unresolved)
+
+
+def test_an_alias_seen_by_its_first_look_is_refused_when_the_resolve_cannot_look_at_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``is_symlink`` sees ``tools/alias`` is a link, while the resolve cannot look
+    at it and keeps the alias path as written -- which the check on the result
+    then finds equal. The pre-check is what refuses it. Not red before the fix:
+    it pins the pre-check the check on the result does not replace."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+    real_realpath = os.path.realpath
+
+    def realpath(path: Any, *args: Any, **kwargs: Any) -> str:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            return str(alias)
+        return real_realpath(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "realpath", realpath)
+        found = tools._resolve_package_dir_no_alias("alias")
+
+    assert found is None
+
+
+def test_a_real_package_under_a_root_spelled_in_another_case_is_addressed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a file system that ignores case, a ``TOOLS_DIR`` spelled in another case
+    than its directory still names it, and both ``tools_dir`` and the resolve keep
+    that spelling: the real package's path is its own. Not red before the fix: it
+    pins that the check on the result refuses no package for the root's case."""
+    _make_tool(tmp_path / "Tools", "real", "import sys\nsys.stdout.write('x')\n")
+    if not (tmp_path / "TOOLS").exists():
+        pytest.skip("this file system tells case apart")
+    _install_tools(monkeypatch, tmp_path / "TOOLS")
+    base = tools.tools_dir()
+    assert base is not None and base.name == "TOOLS"
+
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(base / "real")
+
+
+def test_a_root_through_a_file_addresses_no_package_the_configured_path_cannot_reach(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` reads ``file/..``, where ``file`` is a regular file and
+    ``real`` beside it a package. The configured path cannot pass through the
+    file, so ``tools_dir`` keeps it as configured; the resolve of ``file/../real``
+    folds the ``..`` as text and lands on ``real``, which the configured path
+    cannot reach, so the name addresses no package. Red before the fix: the name
+    was handed ``real``."""
+    base_dir = tmp_path.resolve()
+    _make_tool(base_dir, "real", "import sys\nsys.stdout.write('x')\n")
+    (base_dir / "file").write_text("a file\n", encoding="utf-8")
+    configured = base_dir / "file" / ".."
+    _install_tools(monkeypatch, configured)
+    assert str(tools.tools_dir()) == str(configured)
+
+    assert tools._resolve_package_dir_no_alias("real") is None
+
+
+def test_a_root_whose_answer_changes_during_the_lookup_still_addresses_its_package(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``tools_dir`` answers with one root, then a moment later with another, and
+    both hold a package ``real``. The root is taken once: the resolve and the check
+    on it work from the first answer, and the package under it is addressed --
+    not refused, which the record purges would take for a package that is gone.
+    Red before the fix: the package was looked up under the second root."""
+    first = tmp_path.resolve() / "first"
+    second = tmp_path.resolve() / "second"
+    for root in (first, second):
+        _make_tool(root, "real", "import sys\nsys.stdout.write('x')\n")
+    answers = iter([first, second])
+    monkeypatch.setattr(tools, "tools_dir", lambda: next(answers))
+
+    assert tools._resolve_package_dir_no_alias("real") == tools.PackageRoot(first / "real")
+
+
+def test_set_enabled_refuses_an_alias_whose_every_look_says_it_is_no_link(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every ``is_symlink`` answer for ``tools/alias`` is "not a link", the answer
+    a look that fails gives, while the resolve follows the link to ``tools/real``.
+    The first lookup refuses the name, since what the resolve gave is not
+    ``tools/alias``: the toggle reports "did not happen" and the real package
+    keeps its flag. Red without that check on the result: the toggle switches off
+    ``real``."""
+    _real, alias = _real_and_alias(monkeypatch, tmp_path)
+    real_islink = os.path.islink
+
+    def islink(path: Any) -> bool:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == str(alias):
+            return False
+        return real_islink(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os.path, "islink", islink)
+        toggled = set_enabled("alias", False)
+
+    assert toggled is False
+    assert {t["name"]: t["enabled"] for t in list_tools()}["real"] is True
 
 
 def test_set_enabled_toggles_a_package_whose_manifest_is_oversized(
@@ -4692,6 +6851,73 @@ def test_parameters_schema_over_size_limit_listed_invalid(
     assert (big_version / "tool.json").stat().st_size < _MANIFEST_MAX_BYTES
 
 
+# Where a manifest can hold a lone surrogate once it is parsed: an unpaired
+# \uD800-\uDFFF escape -- what ``json.dumps`` writes for one -- in any string, a key
+# or a value, at any depth.
+_UNENCODABLE_PLACES: dict[str, dict[str, Any]] = {
+    "description": {"description": "search \ud800 the kb"},
+    "a_parameter_description": {
+        "parameters": {
+            "type": "object",
+            "properties": {"q": {"type": "string", "description": "q \udcff"}},
+        }
+    },
+    "a_parameter_name": {
+        "parameters": {"type": "object", "properties": {"q\udfff": {"type": "string"}}}
+    },
+    "a_field_nothing_reads": {"x-notes": ["fine", "\udbff"]},
+}
+
+
+def _manifest_with_unencodable_text(name: str, place: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": "test tool",
+        "parameters": {"type": "object", "properties": {}},
+        "entry": [sys.executable, "run.py"],
+        **_UNENCODABLE_PLACES[place],
+    }
+
+
+@pytest.mark.parametrize("place", list(_UNENCODABLE_PLACES))
+def test_a_manifest_with_a_string_that_cannot_be_encoded_lists_invalid_without_its_text(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, place: str
+) -> None:
+    """A manifest holds an unpaired surrogate escape in ``place``. The tools list
+    still loads, with the other tool as usual; that version is invalid, its error
+    says why, and none of its text -- its description -- is on the row."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", tool_json=_manifest_with_unencodable_text("kb", place))
+    _make_tool(root, "plain", "print('x')\n")
+    _install_tools(monkeypatch, root)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()["tools"]}
+    assert (rows["kb"]["valid"], rows["kb"]["error"]) == (False, tools._MANIFEST_UNENCODABLE)
+    assert not rows["kb"]["description"]
+    assert (rows["plain"]["valid"], rows["plain"]["description"]) == (True, "test tool")
+
+
+@pytest.mark.parametrize("place", list(_UNENCODABLE_PLACES))
+def test_a_manifest_with_a_string_that_cannot_be_encoded_is_neither_advertised_nor_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, place: str
+) -> None:
+    """The same manifest: the tool is not among the tools an AI request advertises,
+    whose specs encode, and a check of its examples is refused as an invalid tool."""
+    root = tmp_path / "tools"
+    _make_tool(root, "kb", "print('x')\n", tool_json=_manifest_with_unencodable_text("kb", place))
+    _make_tool(root, "plain", "print('x')\n")
+    _install_tools(monkeypatch, root)
+
+    advertised = enabled_llm_tools()
+
+    assert [tool.spec["function"]["name"] for tool in advertised] == ["plain"]
+    assert json.dumps([tool.spec for tool in advertised], ensure_ascii=False).encode("utf-8")
+    assert tools.checkable_tool("kb") == "invalid"
+
+
 def test_hidden_directories_never_listed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """A dot-directory is never a package: the installer stages in-progress
     builds under <tools_dir>/.staging, and listing that as a broken package
@@ -4803,11 +7029,15 @@ def test_read_tool_meta_refuses_oversized_sidecar(tmp_path: Path) -> None:
 def test_read_tool_meta_survives_pathological_nesting(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A deeply nested sidecar exhausts the stack INSIDE json.loads, which raises
-    RecursionError -- not the ValueError the parse guard used to catch alone.
+    """A sidecar nested deeply enough to exhaust the stack INSIDE json.loads
+    raises RecursionError -- not the ValueError the parse guard used to catch
+    alone. It degrades to None like any other unusable sidecar, and the row
+    still lists.
 
-    It degrades to None like any other unusable sidecar, and the row still
-    lists."""
+    Whether such a sidecar can exist at all depends on the interpreter: the
+    nesting has to fit under the reader's size cap AND exhaust the stack. Where
+    it cannot, this skips, and the guard is held on every interpreter by
+    ``test_read_tool_meta_degrades_a_recursion_error_to_none``."""
     root = tmp_path / "tools"
     pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
     _install_tools(monkeypatch, root)
@@ -4815,13 +7045,58 @@ def test_read_tool_meta_survives_pathological_nesting(
     # exhaustion rather than at sys.getrecursionlimit() (setrecursionlimit does
     # not move it), and shallower nesting simply PARSES -- which would leave this
     # test green for the wrong reason: the result would degrade to None on the
-    # not-a-JSON-object check instead of on the guard under test.
-    depth = 120_000
+    # not-a-JSON-object check instead of on the guard under test. A deeper nesting
+    # needs at least as much stack, so the deepest one the size cap admits is the
+    # one to try: if it parses, no admissible depth exhausts the stack.
+    depth = (_AI_META_MAX_BYTES - 1) // 2
     nested = "[" * depth + "]" * depth
     assert len(nested.encode("utf-8")) < _AI_META_MAX_BYTES  # not the size guard refusing it
-    with pytest.raises(RecursionError):
+    try:
         json.loads(nested)
+    except RecursionError:
+        pass
+    else:
+        pytest.skip(
+            "this interpreter does not exhaust its stack within the sidecar size cap: "
+            f"the deepest nesting that fits ({depth} levels) parses"
+        )
     _sidecar(pkg).write_text(nested, encoding="utf-8")
+
+    assert tools.read_tool_meta(_version_root(pkg)) is None
+    listed = list_tools()
+    assert [row["name"] for row in listed] == ["echo"]
+
+
+def test_read_tool_meta_degrades_a_recursion_error_to_none(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The parse guard itself, on any interpreter: when parsing the sidecar
+    raises RecursionError, the summary degrades to None and the row still lists.
+
+    ``read_tool_meta`` parses the sidecar with the ``json.loads`` of the ``json``
+    module ``tools`` imported. That call is made to raise for the sidecar's text
+    alone; every other parse runs for real. The sidecar is a valid summary, read
+    back as one before the parse is broken, so nothing but the RecursionError
+    guard can turn it into None."""
+    root = tmp_path / "tools"
+    pkg = _make_tool(root, "echo", "import sys\nsys.stdout.write('x')\n")
+    _install_tools(monkeypatch, root)
+    marker = "summary-whose-parse-overflows"
+    _sidecar(pkg).write_text(
+        json.dumps({"summary": marker, "updated_at": "2026-10-29T00:00:00+00:00"}),
+        encoding="utf-8",
+    )
+    readable = tools.read_tool_meta(_version_root(pkg))
+    assert readable is not None and readable["summary"] == marker
+
+    real_loads = tools.json.loads
+
+    def overflowing_loads(text: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(text, str) and marker in text:
+            raise RecursionError("maximum recursion depth exceeded while decoding a JSON array")
+        return real_loads(text, *args, **kwargs)
+
+    monkeypatch.setattr(tools.json, "loads", overflowing_loads)
 
     assert tools.read_tool_meta(_version_root(pkg)) is None
     listed = list_tools()
@@ -4916,6 +7191,542 @@ def test_write_tool_meta_keys_survive_a_secret_that_equals_one(
         assert stored["summary"] == "這個工具會查 KB"
         assert stored["llm_log_id"] == 7
         assert stored["origin"]["openapi_url"] == "http://kb.example/o.json"
+
+
+# A PEM registered from a single-quoted ``.env`` line keeps ``\n`` as two
+# characters; the summary holds the key with a real line break, which the JSON of
+# the file writes as exactly those two characters.
+_PEM_SECRET = "kb-pem-head\\nkb-pem-body"
+_PEM_TEXT = "it signs with kb-pem-head\nkb-pem-body"
+
+
+def test_a_summary_that_spells_a_secret_only_as_written_reaches_no_byte_of_summary_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_summary_that_spells_a_secret_only_as_written_is_the_marker_by_its_field_check_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With the whole-file check taken away, the field check on its own writes the
+    summary as the marker: the one text field cannot show which check did it."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+    monkeypatch.setattr(tools, "_touches_free_text", lambda *args: False)
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_the_field_check_counts_the_start_of_a_known_value_ending_the_text() -> None:
+    """The text is checked with the mask's own matcher, as its written form is, so
+    the start of a known value at its end counts there too: the end of a text may
+    be where a value was cut off. After the scrub, this text ends with the first
+    seven characters of the value, a quote among them, which the file writes as
+    ``\\"``, so only the text ends with them; the value is not whole in either."""
+    known = 'abc\ufffd\ufffd\ufffd"-and-the-rest'
+    value = 'it ends abc\udcff"'
+    scrubbed = tools._utf8_safe(value)
+    assert known not in scrubbed
+    assert not tools._spells_a_secret(scrubbed, [known])
+
+    assert tools._redacted(value, [known]) == tools._REDACTION_MARKER
+
+
+def test_a_sidecar_text_the_field_check_lets_through_is_caught_by_the_whole_file_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The field check passes the summary as it is; the check of the whole file as
+    it is written still sees the secret its JSON spells inside the summary, and
+    the summary is written as the marker."""
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({_PEM_SECRET}))
+    monkeypatch.setattr(tools, "_redacted", lambda value, *rest: value)
+
+    assert _write_meta(pkg, summary=_PEM_TEXT) is True
+
+    assert _PEM_SECRET.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_write_tool_meta_writes_nothing_when_a_field_no_check_fixed_holds_a_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``llm_log_process`` is written as the caller gives it, through no field
+    check and no shape check: free text no marker replaces. A known secret in it
+    is still in the file once the summary is the marker, so nothing is written."""
+    secret = "process-borne-secret-abcdef"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert _write_meta(pkg, summary="沒有秘密的說明", llm_log_process=f"token-{secret}") is False
+
+    assert not _sidecar(pkg).exists()
+
+
+# --- a JSON file checked as it is written -----------------------------------
+
+
+def _unmarked(value: Any) -> Any:
+    """``value`` with the marks of ``tools._encode_spans`` taken off."""
+    if isinstance(value, tools._Fixed):
+        return _unmarked(value.value)
+    if isinstance(value, tools._Record):
+        return {key: _unmarked(item) for key, item in value.fields.items()}
+    if isinstance(value, dict):
+        return {key: _unmarked(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_unmarked(item) for item in value]
+    return value
+
+
+# Characters that each take a different way through the encoder: plain, every
+# escape, a control character, DEL, non-ASCII, an astral one, a lone surrogate.
+_ENCODER_ALPHABET = list('ab"\\\n\r\t\b\f\x00\x1f\x7f 中😀\udcff•/')
+
+
+def _random_text(rng: random.Random) -> str:
+    return "".join(rng.choice(_ENCODER_ALPHABET) for _ in range(rng.randint(0, 5)))
+
+
+def _random_marked(rng: random.Random, depth: int) -> Any:
+    """Random JSON data, some of it marked, nested at most four containers deep."""
+    kind = rng.randint(0, 11 if depth < 4 else 6)
+    if kind == 0:
+        return None
+    if kind == 1:
+        return rng.choice([True, False])
+    if kind == 2:
+        return rng.randint(-(10**15), 10**15)
+    if kind == 3:
+        return rng.choice([0.5, -1.25, 1e300, 0.0, float("nan"), float("inf")])
+    if kind in (4, 5, 6):
+        return _random_text(rng)
+    if kind == 7:
+        return tools._Fixed(_random_marked(rng, depth + 1))
+    if kind == 8:
+        return [_random_marked(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    if kind == 9:
+        return tuple(_random_marked(rng, depth + 1) for _ in range(rng.randint(0, 3)))
+    fields = {
+        _random_text(rng) + str(index): _random_marked(rng, depth + 1)
+        for index in range(rng.randint(0, 3))
+    }
+    return tools._Record(fields) if kind == 10 else fields
+
+
+def test_the_written_text_is_what_json_dumps_writes_for_every_shape() -> None:
+    """The encoder the whole-file checks look at writes, character for character,
+    what ``json.dumps(..., ensure_ascii=False)`` writes for the same data with the
+    marks taken off, flat and indented: empty and nested containers, tuples,
+    every escape, lone surrogates, numbers of every kind. Its free ranges lie in
+    the text, in order and apart. Seeded, so a failing case comes back."""
+    rng = random.Random(20261031)
+    for case in range(3000):
+        value = _random_marked(rng, 0)
+        for indent in (None, 2):
+            text, free = tools._encode_spans(value, indent)
+            expected = json.dumps(_unmarked(value), ensure_ascii=False, indent=indent)
+            assert text == expected, (case, indent)
+            reached = 0
+            for start, end in free:
+                assert reached <= start < end <= len(text), (case, indent, free)
+                reached = end
+
+
+# Each part of a written text, and what of it is free text: (marked data, indent,
+# the free text in order). Everything not listed is fixed content.
+_FIXED_OR_FREE: dict[str, tuple[Any, int | None, list[str]]] = {
+    "the keys of a record": (tools._Record({"summary": tools._Fixed("s")}), None, []),
+    "a fixed string": (
+        tools._Record({"updated_at": tools._Fixed("2026-10-31T00:00:00+00:00")}),
+        None,
+        [],
+    ),
+    "fixed numbers, null, true and false": (
+        tools._Record({"n": tools._Fixed(7), "none": None, "yes": True, "no": tools._Fixed(False)}),
+        None,
+        [],
+    ),
+    "a fixed list, indented": (
+        tools._Record({"kept": tools._Fixed(["files-a", "files-b"])}),
+        2,
+        [],
+    ),
+    "a fixed mapping, keys and all": (tools._Fixed({"k": "v", "n": [1, "x"]}), None, []),
+    "a text, escapes as written": (tools._Record({"summary": 'a\n"b'}), None, ['a\\n\\"b']),
+    "an empty text": (tools._Record({"summary": ""}), None, []),
+    "the marker a degrade puts in": (
+        tools._Record({"summary": tools._Fixed(tools._REDACTION_MARKER)}),
+        None,
+        [],
+    ),
+    "a marker inside a text": (
+        tools._Record({"summary": tools._REDACTION_MARKER}),
+        None,
+        [tools._REDACTION_MARKER],
+    ),
+    "a value nothing vouched for": (tools._Record({"process": "tok", "n": 7}), None, ["tok", "7"]),
+    "a record in a list, indented": (
+        tools._Record(
+            {"omitted": [tools._Record({"path": "x.txt", "reason": tools._Fixed("secret_name")})]}
+        ),
+        2,
+        ["x.txt"],
+    ),
+    "the keys of a mapping that is not a record": ({"k": tools._Fixed("v")}, None, ["k"]),
+}
+
+
+@pytest.mark.parametrize("part", list(_FIXED_OR_FREE))
+def test_each_part_of_a_written_text_is_free_text_or_fixed_content_as_it_is_written(
+    part: str,
+) -> None:
+    """The free ranges hold exactly the listed text: what is between the quotes of
+    a text, as written, and the whole of a value nothing vouched for. Quotes,
+    punctuation, indentation, keys of a record, ``null``/``true``/``false``,
+    everything fixed and the marker a degrade puts in are fixed content; a marker
+    that is part of a text is text."""
+    value, indent, expected = _FIXED_OR_FREE[part]
+
+    text, free = tools._encode_spans(value, indent)
+
+    assert [text[start:end] for start, end in free] == expected
+
+
+def test_an_occurrence_overlapping_one_in_fixed_content_is_still_found() -> None:
+    """``aaaaaa`` begins at the start, wholly in fixed content, and passes there.
+    It begins again one and two characters later, where it takes in the free
+    ``aa``: those are found. A search that steps past the whole value after an
+    occurrence, as the mask's own does, would miss them."""
+    assert tools._touches_free_text("aaaaaaaa", [(6, 8)], ["aaaaaa"]) is True
+
+
+def test_an_occurrence_passes_in_fixed_content_and_counts_when_it_takes_in_free_text() -> None:
+    """Each occurrence is judged, not each value: one wholly in fixed content
+    passes, and the same value where it takes in even one free character -- at
+    either end of the free range -- counts."""
+    assert tools._touches_free_text("abcdefgh|xyz", [(9, 12)], ["abcdefgh"]) is False
+    assert tools._touches_free_text("abcdefgh|abcdefgh", [(9, 17)], ["abcdefgh"]) is True
+    assert tools._touches_free_text("abcdefXY", [(6, 8)], ["bcdefX"]) is True
+    assert tools._touches_free_text("XYabcdef", [(0, 2)], ["Yabcde"]) is True
+    assert tools._touches_free_text("XYabcdef", [(0, 2)], ["abcdef"]) is False
+
+
+def test_an_occurrence_ending_on_the_first_free_character_is_found_after_an_exempt_one() -> None:
+    """``aaaaaa`` begins at the start, wholly in fixed content, and passes there.
+    It begins once more, one character later, where its last character is the
+    first free one, and nowhere after that. The search past the exempt
+    occurrence starts early enough to see that one: it is found."""
+    assert tools._touches_free_text("aaaaaaab", [(6, 8)], ["aaaaaa"]) is True
+
+
+def test_an_occurrence_ending_where_free_text_begins_takes_in_none_of_it_and_passes() -> None:
+    """``abcdef`` ends at the position where the free ``XY`` begins: it holds no
+    free character, so it passes."""
+    assert tools._touches_free_text("abcdefXY", [(6, 8)], ["abcdef"]) is False
+
+
+def test_summary_json_is_written_as_it_is_when_a_known_value_lies_only_in_its_timestamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A known value equal to a stretch of ``updated_at`` lies wholly in fixed
+    content: the file holds it, and the summary is written as it is, not as the
+    marker."""
+    stamp_part = "2026-01-01T00:00"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({stamp_part}))
+
+    assert _write_meta(pkg, summary="這個工具會查 KB") is True
+
+    assert stamp_part.encode("utf-8") in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == "這個工具會查 KB"
+
+
+def test_an_occurrence_ending_where_the_summary_text_begins_is_fixed_and_the_text_is_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The known value ``{"summary": "`` is all that comes before the summary
+    text: the brace, the key, the separator and the opening quote. It ends
+    exactly where the summary text begins and takes in none of it. It is fixed
+    content: the file holds it, and the summary is written as it is, not as the
+    marker."""
+    opening = '{"summary": "'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({opening}))
+
+    assert _write_meta(pkg, summary="這個工具會查 KB") is True
+
+    written = _sidecar(pkg).read_bytes()
+    assert written.startswith((opening + "這個工具會查 KB").encode("utf-8"))
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == "這個工具會查 KB"
+
+
+@pytest.mark.parametrize("field", ["instructions", "summary"])
+def test_a_known_value_from_a_key_into_a_text_reaches_no_byte_of_the_sidecar(
+    field: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The value begins in a key and the punctuation after it, and runs into the
+    start of the text: neither the text alone nor the key does hold it, the file
+    as written does. That text is written as the marker."""
+    secret = f'{field}": "DO-NOT-STORE-12345'
+    text = "DO-NOT-STORE-12345 more"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    if field == "summary":
+        assert _write_meta(pkg, summary=text) is True
+    else:
+        assert _write_meta(pkg, summary="s", origin={"instructions": text}) is True
+
+    meta = pkg / tools._META_DIRNAME
+    for name in (tools._SUMMARY_FILENAME, tools._ORIGIN_FILENAME):
+        if (meta / name).exists():
+            assert secret.encode("utf-8") not in (meta / name).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    written = stored["summary"] if field == "summary" else stored["origin"]["instructions"]
+    assert written == tools._REDACTION_MARKER
+
+
+def test_a_known_value_from_a_text_into_the_timestamp_after_it_reaches_no_byte_of_summary_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary is ``abc``, shorter than the trailing fragment the mask
+    guards, and the value runs on through the quote and the next key into the
+    timestamp, which is fixed content. The file as written would hold it whole;
+    the summary is written as the marker."""
+    secret = 'abc", "updated_at": "2026-01-01T00:00:00+00:00'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert _write_meta(pkg, summary="abc") is True
+
+    assert secret.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_across_two_texts_and_the_key_between_them_reaches_no_byte_of_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The value runs from the end of ``source``, through the key of the next
+    field, into the start of ``openapi_url``: two texts with fixed content
+    between. Both are written as the marker."""
+    secret = 'left", "openapi_url": "right'
+    root = tmp_path / "build"
+    (root / tools._META_DIRNAME).mkdir(parents=True)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(root),
+        {
+            "source": "from the left",
+            "openapi_url": "right/openapi.json",
+            "instructions": None,
+            "feedback": None,
+            "previous": None,
+        },
+    )
+
+    assert written is True
+    data = (root / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    assert secret.encode("utf-8") not in data
+    origin = json.loads(data)
+    assert origin["source"] == origin["openapi_url"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_wholly_in_the_marker_and_the_next_key_is_written_once_the_text_is_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The first value takes in the summary, so every text is written as the
+    marker. The second runs from the end of that marker through the next key:
+    once the marker is in, it lies wholly in fixed content -- the marker a
+    degrade puts in, a quote, a key -- and the file is written with it."""
+    takes_in_the_text = 'summary": "plain'
+    across_the_marker = '秘密已遮蔽]•••", "updated_at": "'
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(
+        tools, "known_secret_values", lambda: frozenset({takes_in_the_text, across_the_marker})
+    )
+
+    assert _write_meta(pkg, summary="plain words") is True
+
+    data = _sidecar(pkg).read_bytes()
+    assert takes_in_the_text.encode("utf-8") not in data
+    assert across_the_marker.encode("utf-8") in data
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_a_known_value_from_the_marker_into_llm_log_process_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the summary is the marker, the second value runs from that marker,
+    through every fixed field, into ``llm_log_process`` -- written as the caller
+    gives it, vouched for by nothing. The marker beside it does not vouch for it
+    either: nothing is written."""
+    takes_in_the_text = 'summary": "plain'
+    into_the_process = (
+        '•••", "updated_at": "2026-01-01T00:00:00+00:00", "llm_log_id": null, '
+        '"llm_log_process": "tok'
+    )
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(
+        tools, "known_secret_values", lambda: frozenset({takes_in_the_text, into_the_process})
+    )
+
+    assert _write_meta(pkg, summary="plain words", llm_log_process="tok-1") is False
+
+    assert not _sidecar(pkg).exists()
+
+
+@pytest.mark.parametrize("field_check", ["whole", "mask only", "none"])
+def test_a_marker_inside_a_text_is_text_to_the_whole_file_check(
+    field_check: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two values are known: ``abcdef``, and one that holds the marker. Masking
+    ``xabcdefy`` spells the second exactly, and a text can hold it as typed. The
+    field check catches it; with the field check cut down to the mask alone, or
+    taken away, the whole-file check still does: a marker inside a text is part
+    of the text, and only the marker a degrade puts in is fixed content."""
+    spelled = "x" + tools._REDACTION_MARKER + "y"
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"abcdef", spelled}))
+    if field_check == "mask only":
+        monkeypatch.setattr(
+            tools,
+            "_redacted",
+            lambda value, secrets, cap=None: tools._mask_known_secrets(value, secrets),
+        )
+    elif field_check == "none":
+        monkeypatch.setattr(tools, "_redacted", lambda value, *rest: value)
+    summary = spelled if field_check == "none" else "xabcdefy"
+
+    assert _write_meta(pkg, summary=summary) is True
+
+    assert spelled.encode("utf-8") not in _sidecar(pkg).read_bytes()
+    stored = tools.read_tool_meta(_version_root(pkg))
+    assert stored is not None
+    assert stored["summary"] == tools._REDACTION_MARKER
+
+
+def test_sidecars_in_which_nothing_known_occurs_are_json_dumps_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Nothing known occurs in them: ``origin.json`` is ``json.dumps`` and a new
+    line, and ``summary.json`` is ``json.dumps``, byte for byte -- non-ASCII,
+    escapes, a fixed vid, ``null`` and a number included."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({"kb-live-key-abcdef"}))
+    pkg = tmp_path / "pkg"
+    meta_dir = pkg / tools._META_DIRNAME
+    meta_dir.mkdir(parents=True)
+    origin = {
+        "source": '來源 "引號"\n第二行',
+        "openapi_url": None,
+        "instructions": "指示\t與\\反斜線",
+        "feedback": "回饋",
+        "previous": "20260101T000000Z-abcdef",
+    }
+    summary = {
+        "summary": '說明 "引號"\n',
+        "updated_at": "2026-01-01T00:00:00+00:00",
+        "llm_log_id": 7,
+        "llm_log_process": "token-0123",
+    }
+
+    assert tools.write_origin_meta(tools.BuildRoot(pkg), origin) is True
+    assert tools.write_tool_meta(_version_root(pkg), summary) is True
+
+    origin_text = json.dumps(origin, ensure_ascii=False) + "\n"
+    assert (meta_dir / tools._ORIGIN_FILENAME).read_bytes() == origin_text.encode("utf-8")
+    summary_text = json.dumps(summary, ensure_ascii=False)
+    assert (meta_dir / tools._SUMMARY_FILENAME).read_bytes() == summary_text.encode("utf-8")
+
+
+# What one lone surrogate in a name is written as once it is made encodable.
+_SPELLED_BY_THE_SCRUB = "kb-���-key"
+
+
+@pytest.mark.parametrize("found", ["a hit", "an unreadable entry"])
+def test_validate_checks_the_path_it_names_again_after_its_surrogates_are_replaced(
+    found: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``kb-\\udcff-key`` holds no known value as it is read. Making it encodable
+    for the message writes three U+FFFD for the lone surrogate, which complete
+    ``kb-���-key``. The path the refusal names is checked after that, so the value
+    does not reach the message -- named for a hit, or for an entry the scan
+    could not read."""
+    pkg = _staged_pkg(
+        tmp_path / "stage", tool_json=_kbsearch_manifest(), run_py="import sys\nprint('x')\n"
+    )
+    monkeypatch.setattr(
+        tools, "_redaction_secrets", lambda: tools._match_forms([_SPELLED_BY_THE_SCRUB])
+    )
+    name = "kb-\udcff-key"
+    scan = (
+        tools.SecretScanDone(hits=(tools.SecretHit(path=name, kind="name"),), skipped=())
+        if found == "a hit"
+        else tools.SecretScanDone(
+            hits=(), skipped=(tools.SecretScanSkip(path=name, reason="unreadable"),)
+        )
+    )
+    monkeypatch.setattr(tools, "scan_embedded_secrets", lambda root, secrets=None: scan)
+
+    error = tools.validate_tool_content(tools.BuildRoot(pkg), "staged")
+
+    assert error is not None
+    assert _SPELLED_BY_THE_SCRUB not in error
+    assert error.startswith(tools._REDACTION_MARKER)
+
+
+def test_write_tool_meta_requires_updated_at_in_the_shape_the_backend_stamps(
+    tmp_path: Path,
+) -> None:
+    """``updated_at`` is fixed content to the whole-file check because its shape
+    is fixed: ``datetime.now(UTC).isoformat()``, what ``store_summary_meta``
+    stamps. A string of any other shape is refused rather than written as fixed
+    content."""
+    pkg = tmp_path / "pkg"
+    (pkg / tools._META_DIRNAME).mkdir(parents=True)
+    for stamp in ("yesterday", "2026-01-01", "2026-01-01T00:00:00Z"):
+        meta = {"summary": "s", "updated_at": stamp}
+        assert tools.write_tool_meta(_version_root(pkg), meta) is False
+    assert not _sidecar(pkg).exists()
+    stamped = {"summary": "s", "updated_at": datetime.now(UTC).isoformat()}
+    assert tools.write_tool_meta(_version_root(pkg), stamped) is True
 
 
 def test_write_tool_meta_drops_unknown_keys_and_containers(
@@ -5437,12 +8248,10 @@ _SURROGATE_FFFD = "�" * 3
 def test_utf8_safe_matches_llm_log() -> None:
     """tools._utf8_safe and llm_log._utf8_safe MUST agree on every input.
 
-    Deliberately duplicated rather than imported (llm_log stays a leaf
-    observability module that must not import the tool runtime, and the reverse
-    edge would create exactly the coupling both docstrings forbid -- the same
-    duplication-with-rationale the redaction marker carries). Pinned equal on a
-    probe set, mirroring test_redaction_marker_matches_llm_log, so the two can
-    never silently drift into disagreeing about what a corrupt code point
+    ``tools._utf8_safe`` is the shared definition (``afterthread.utf8.encodable``,
+    which the API schemas use too); ``llm_log`` keeps a copy of its own. Pinned
+    equal on a probe set, mirroring test_redaction_marker_matches_llm_log, so the
+    two can never silently drift into disagreeing about what a corrupt code point
     becomes."""
     probes = [
         "",
@@ -5545,24 +8354,29 @@ def test_write_tool_meta_scrubs_a_surrogate_bearing_summary(tmp_path: Path) -> N
     assert _SURROGATE_FFFD in _sidecar(pkg).read_text(encoding="utf-8")
 
 
-def test_write_tool_meta_refuses_a_surrogate_bearing_updated_at(tmp_path: Path) -> None:
-    """``updated_at`` is the one caller string that rides through verbatim, so it
-    is the field the fail-closed guard still has to cover.
-
-    The serialize+encode used to sit OUTSIDE that try, so this raised
-    UnicodeEncodeError straight out of write_tool_meta -- a PATCH answering 500
-    where its contract says False (-> 404). Scrubbing it would only paper over a
-    caller bug (every real caller stamps a machine timestamp), so the refusal is
-    the honest answer -- and the previous sidecar survives it."""
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"updated_at": "2026\ud800"},
+        {"updated_at": "2026-01-01T00:00:00+00:00", "llm_log_process": "token\ud800"},
+    ],
+    ids=["updated_at", "llm_log_process"],
+)
+def test_write_tool_meta_refuses_a_surrogate_bearing_caller_string(
+    tmp_path: Path, fields: dict[str, str]
+) -> None:
+    """A caller string that would reach the file with a lone surrogate --
+    ``updated_at``, which its shape check refuses, or ``llm_log_process``, written
+    as given, whose encode the fail-closed guard catches -- answers False where a
+    PATCH's contract says False (-> 404), not a 500. Scrubbing either would only
+    paper over a caller bug, so the refusal is the honest answer -- and the
+    previous sidecar survives it."""
     pkg = tmp_path / "pkg"
     pkg.mkdir()
     assert _write_meta(pkg, summary="好的說明") is True
     before = _sidecar(pkg).read_bytes()
 
-    assert (
-        tools.write_tool_meta(_version_root(pkg), {"summary": "s", "updated_at": "2026\ud800"})
-        is False
-    )
+    assert tools.write_tool_meta(_version_root(pkg), {"summary": "s", **fields}) is False
 
     assert _sidecar(pkg).read_bytes() == before
     assert not list(pkg.glob(f"{tools._AI_META_FILENAME}.*"))
@@ -5743,22 +8557,22 @@ def _swap_the_package_once(
     caller's last look and closes at ``os.replace``, and everything in it belongs
     to ``write_tool_meta`` -- a redactor sweep of the whole tools directory, a
     JSON encode, an mkstemp, a write, an fsync. So the swap is driven from one of
-    those steps (``_redacted``, the first) rather than from a thread race, which
-    makes it deterministic AND pins the window to exactly where the finding puts
-    it. Delete-then-reinstall-the-same-name is the swap that costs no job slot at
+    those steps (``_redacted``) rather than from a thread race, which makes it
+    deterministic AND pins the window to exactly where the finding puts it.
+    Delete-then-reinstall-the-same-name is the swap that costs no job slot at
     all (D40 r5 O5-3), so it is the one a summary can genuinely lose a race to.
 
-    Fires ONCE (the writer redacts three fields), and returns an accessor for the
-    replacement package."""
+    Fires ONCE (the writer calls ``_redacted`` more than once), and returns an
+    accessor for the replacement package."""
     root_pkg = root / name
     state: dict[str, Path] = {}
     real_redacted = tools._redacted
 
-    def swap_then_redact(value: str | None) -> str | None:
+    def swap_then_redact(value: str | None, *rest: Any) -> str | None:
         if "pkg" not in state:
             shutil.rmtree(root_pkg)
             state["pkg"] = _make_tool(root, name, replacement_run_py)
-        return real_redacted(value)
+        return real_redacted(value, *rest)
 
     monkeypatch.setattr(tools, "_redacted", swap_then_redact)
     return lambda: state["pkg"]

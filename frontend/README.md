@@ -53,7 +53,7 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
 | `/items/new` | `ItemNewPage` | 手動新增項目的表單頁（沿用 `ItemForm` 元件）。 |
 | `/items/$itemId` | `ItemDetailPage` | 單筆項目詳情：完整欄位、progress 歷史（可追加一筆）、狀態/階段快速修改、`ItemAiActions` 提供的「AI 補齊」（enrich）／「AI 進度更新」（assist-update）兩個操作、刪除。 |
 | `/items/$itemId/edit` | `ItemEditPage` | 手動編輯項目的表單頁（沿用 `ItemForm` 元件）。 |
-| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結、提意見送出 AI 修訂、唯讀的「設定」與「最近執行」；列上顯示最近一次執行的結果，可修的失敗有「請 AI 修正」；`?job=<id>` 接上其他頁面發起的修正工作）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
+| `/tools` | `ToolsPage` | 「已安裝工具」（清單／啟停／刪除，每列可展開讀取／重新產生 AI 總結、提意見送出 AI 修訂、唯讀的「設定」與「最近執行」；列上顯示最近一次執行的結果，可修的失敗有「請 AI 修正」；`?job=<id>` 接上其他頁面發起的修正工作；修訂沒有發布時，這一輪的成果會存成草稿，該列顯示草稿提示（狀態、輪數、上一輪怎麼結束、需要你動手的事、檔案路徑）並可「接續修正」「加上說明後接續…」「發布草稿」（不經 AI，直接把草稿目前的檔案發布成新版本）或「放棄」，修訂工作卡片也說明成果存到哪裡，並在草稿仍是那一份時提供接續與發布）與「安裝新工具」（貼 OpenAPI JSON 網址 + 指示，AI 背景建置、輪詢進度）兩個分頁；細節見根目錄 README「KB 工具安裝指南」。 |
 | `/llm-logs` | `LlmLogsPage` | AI 日誌：呼叫 `GET /api/llm/logs` 列出最近的 LLM 互動，每筆可展開讀取 `GET /api/llm/logs/{id}` 取得的請求/回應內容（每則受 `LLM_LOG_BODY_MAX_CHARS` 截斷）；支援 `?log=<id>` 深連結（`工具` 頁的安裝／修訂結果會連過來）：在清單裡就自動展開該列，不在清單裡（比最近 50 筆更舊）就直接向詳情端點取那一筆、單獨顯示在清單上方，真的被擠出保留區才說明它已經不在；連結若標明自己來自**另一個**後端行程（`?logProcess=`，見下方慣例）則一律不展開，只說明編號已被重新配發。 |
 | （其他） | `NotFoundPage` | 404 fallback（router 的 `defaultNotFoundComponent`）。 |
 
@@ -78,6 +78,11 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   中文，狀態／階段的顯示文字集中在 `constants/labels.js`（`STATUS_META` /
   `STAGE_META`）避免各處重覆定義；API 錯誤訊息的 zh-TW 映射集中在
   `api/client.js` 的 `messageFor`。
+- **`/api/tools/` 底下帶值的路徑一律由 `api/toolPaths.js` 組**：帶工具名稱的用
+  `toolApiPath(name, ...words)`，工作的用 `toolJobApiPath(jobId)`；每一段都經
+  `encodeURIComponent`，名稱裡有 `#`、`?`、`/`、`%`、空白或替代字元（U+FFFD）也只是
+  一段，不會把路徑截斷或打到別的路由。路由自己的字（`summary`、`draft`）各當一個參數
+  傳，查詢字串接在回傳的路徑後面。不要把值直接插進 `/api/tools/` 的字串或用 `+` 接。
 - **Code-point 長度計數**：任何鏡射後端長度上限的前端驗證，一律用
   `utils/text.js` 的 `codePointLength`，而不是 JS 原生的 `.length` /
   `maxLength`。原生 `.length` 數的是 UTF-16 code unit，多數 emoji 與部分 CJK
@@ -244,7 +249,8 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   AI 總結裡（總結讀不到時整個面板會提早返回，卡片會跟著消失）。「最近執行」的修正按鈕在清單
   重新讀取中或讀取失敗時停用：`fixable` 是讀取當下的判斷。purge 的請求內容與措辭在 `utils/toolRunsPurge.js`，元件是 `ToolRunsPurgeDialog`／
   `ToolRunStatsBar`。AI 結果旁的工具失敗提醒（擷取、補齊、協助更新）在
-  `components/ToolFailureNotice.jsx`，分組與「能不能送出」的判斷在 `utils/toolFailures.js`；
+  `components/ToolFailureNotice.jsx`，分組、「能不能送出」的判斷、按下後的流程（`requestFix`）與
+  提醒的畫面（`failureNoticeView`）在 `utils/toolFailures.js`；
   `/tools?job=<id>` 的驗證（`toolsJobSearch`）也在那裡，工具頁以 `useSearch` 讀取。範例的驗證
   （「最近執行」的驗證狀態、工作卡片上的逐個結果、可以附上的失敗紀錄）在 `utils/toolChecks.js`；
   「跑一次範例」是一種 job，沿用修訂的工作追蹤與寫入閘。工作流的中文名稱 `WORKFLOW_LABELS` 在 `constants/labels.js`，時間與耗時的
@@ -266,6 +272,163 @@ chunk size 提示，非錯誤）、`pnpm test`（vitest，全數通過）；`pnp
   token 的連結維持原本行為**（`工具` 頁總結面板的連結就是這種：後端在**回應當下**
   就把非本行程的 `llm_log_id` 改成 `null`，所以它不需要也無從提出主張；使用者自己
   存下來的網址同理——「說不出來」不可以被講成「我確定它過期了」）。
+- **工具的草稿（沒發布的修訂）**：修訂沒有發布時，後端把這一輪的成果存成一份草稿
+  （格式與狀態見 `docs/web-v7-design.md`），`GET /api/tools` 的每一列帶 `draft`；可接續的
+  草稿可以再送一輪修訂接著做，也可以不經 AI 直接發布。前端的判斷全在純函式
+  `utils/toolDraft.js`（發布的確認框與送出的組成在 `utils/toolDraftPublish.js`），元件只照它們畫：
+  - `draftView(draft, { currentVid })` 把草稿轉成畫面：標題、說明句、`buttons`、輪數、
+    上一輪怎麼結束、模型寫的「需要你動手」與總結摘錄、路徑（草稿目前的檔案、整個草稿目錄
+    `draft_dir`、保留下來的舊檔案目錄 `kept`，各附「複製路徑」，並說明草稿目錄裡可能還有
+    沒列出的目錄）。元件是 `components/DraftNotice.jsx`，掛在該列的修訂工作卡片之下。
+    「複製路徑」是 `components/CopyPathButton.jsx`：瀏覽器只在安全環境（https 或 localhost）
+    開放剪貼簿，用網路位址開後端時無法自動複製，按鈕旁會說明；所以用它的地方都要把路徑本身
+    顯示成文字（草稿提示放在點一下就全選的區塊，工作卡片寫在句子裡），讓人一定能自己選取複製。
+    **`buttons`**：可接續（`open`）給「接續修正」「加上說明後接續…」「發布草稿」與「放棄」；
+    「發布草稿」與兩個接續按鈕同進同出，條件只有一個：草稿能自稱（`draftContinuation` 不是
+    null），所以其他狀態的說明句不叫人按它。處理中（`running`）與發布中（`publishing`）
+    不給按鈕；其餘狀態（已過期、無法使用、已發布、結果未知）只能放棄。「已發布」的說明
+    不說放棄就好：這份草稿可能是修訂的一輪發布的，也可能是操作者自己按「發布草稿」發布的；
+    發布後草稿留下來，可能是沒能刪掉，也可能是後端發現它和發布的內容不同（被改過、多了東西、
+    有東西沒進版本）、或無法確認，所以說明句請使用者先到路徑取回需要的內容再放棄。
+    後端 `ToolDraft.state` 的每個值都要有文案：`toolDraft.test.js` 手抄一份後端的狀態清單，
+    斷言 `KNOWN_DRAFT_STATES` 與它相同；後端新增狀態時，要先補這份清單，測試才會要求補文案。
+  - **文字不說草稿的檔案是哪一輪的**：保存沒存成的一輪也算一輪，操作者也可能手改過檔案，
+    所以草稿提示只說輪數（嘗試的次數），被中斷的一輪說「上一輪沒有正常結束，它的進度沒有
+    存進草稿」；說明檔記成 `interrupted` 的一輪（`last.finished_at` 是 null）照樣顯示，不帶
+    結束時間。唯一說出輪次的是剛保存成功的那張卡片「進度已保存（第 N 輪）」。
+  - **接續**：`draftContinuation(draft)` 從清單的草稿取出 `draft_id`、`generation`、
+    `base_vid`，只有 `open` 而且三者都在才有；`utils/toolSummary.js` 的
+    `buildReviseRequest({ ..., continuation })` 把它送成 `draft_id`、`draft_generation`，
+    `expected_vid` 用草稿的 `base_vid`，`feedback`（這一輪的說明）與 `run_ids` 都可以省略。
+    用的一律是清單的身分、不是 job 的：草稿在讀到之後變了，後端回 `draft_changed`，不會接續
+    沒看過的那一份。「接續修正」「加上說明後接續…」在 `components/DraftContinueButtons.jsx`
+    （草稿提示與工作卡片共用）；說明的上限與其他 AI 輸入一樣是 20,000 個 code point
+    （`continuationNote`），可以留空。接續是一次版本寫入，所以按鈕跟「送出修訂」一樣受
+    `versionWritesBlocked` 管；「接續修正」的 handler（`continueDraft`）按下時再查一次寫入閘
+    與該列的草稿，說明框的送出（`sendNoted`）只再查寫入閘（見下一條）。
+  - **先開框、後送出的按鈕，送的是開框時看到的那一份**：「加上說明後接續…」（草稿提示與工作
+    卡片）與「最近執行」每一筆的「加上說明…」，在開框時記下要做的事，送出時照記下的送：
+    前者記下畫面上那份草稿的身分（`draftContinuation`），後者記下當時的 `recordFixView`——接續
+    哪一份，或從目前版本重新開始——框裡的標題、說明與送出鈕也照它。送出時的請求由
+    `toolDraft.js` 的 `reviseVariables(tool, target, feedback)` 組成，`target` 是記下的那件事，
+    不從送出當下的清單重新推。框開著時草稿被換掉、被接續過或被放棄，後端回 `draft_gone`、
+    `draft_changed`；記下的是重新開始而工具已經有草稿時回 `draft_pending`。這些碼照
+    `reviseRefusalNotification` 說明、照 `versionWriteConflictReaction` 重讀清單；前端不在
+    送出前自己比對清單、改送另一個動作。記下的接續帶著草稿的 `base_vid`；重新開始用該列的
+    版本，版本一換整列重掛（`toolIdentityConsumers` 的 `rowKey`），框也跟著關掉。草稿提示與
+    卡片的說明框跟它的按鈕在一起：按鈕離開畫面（草稿不在了、不能再接續、卡片不再提供），
+    框也關掉，什麼都不送。工具頁上按下就送、沒有框的按鈕（「接續修正」、「接續修正（附上
+    這筆）」、紀錄與範例驗證的「請 AI 修正」）按下時畫面上的就是清單的，照舊在按下時從該列取。
+  - **附上紀錄的修正**：草稿可接續時，該列上一筆失敗與「最近執行」每一筆的「請 AI 修正」
+    換成「接續修正（附上這筆）」，旁邊的「加上說明…」也是接續（`recordFixView`）；其他狀態
+    照舊停用並說明原因。範例驗證失敗的「請 AI 修正」不接續，有草稿時照舊停用。
+  - **發布草稿**（不經 AI）：把草稿目前的檔案發布成新版本，接著照常跑範例；新版本一開始沒有
+    AI 總結，需要時另按「重新產生」。
+    - **按鈕**在草稿提示與工作卡片上（`components/DraftPublishButton.jsx`），出現的條件和
+      「接續修正」完全相同：工具列看 `draftView`，卡片看 `jobDraftView` 的 `buttons`，兩處的
+      `buttons` 給 `continue` 的同時給 `publish`；它是一次版本寫入，所以和「送出修訂」一樣受
+      `versionWritesBlocked` 管。「放棄」仍只在工具列。
+    - **先開框、後送出**：按下先開確認框，不直接送。框的說明（`draftPublishConfirmation`）講
+      不經 AI 與不產生 AI 總結、哪些情況不發布（草稿裡有項目含已知的秘密值或查不了；根目錄的
+      `.env` 與 `.afterthread.meta` 不會進新版本，它們裡面有秘密或有檔案打不開，不會因此拒絕）、哪些情況發布後
+      草稿仍留著。
+      開框時記下要發布的那一份（`draftPublishTarget`：工具名、`draft_id`、`generation`、草稿的
+      `base_vid`），確認時照記下的送：`buildDraftPublishRequest` 把它組成
+      `POST /api/tools/{name}/draft/publish`，body 恰為 `draft_id`、`draft_generation`、
+      `expected_vid`（草稿的 `base_vid`），不看送出當下的清單。框開著時列上的草稿換了或沒了，
+      後端回 `draft_gone` 或 `draft_changed`；按鈕離開畫面，框也關掉，什麼都不送。送出的
+      handler（`publishDraft`）只再查一次寫入閘。元件只持有開框時記下的那一份，確認時交給
+      `onPublish`；記什麼、送什麼都在純函式，`toolDraftPublish.test.js` 驗「開框時看到 A、
+      列上換成 B，送出的仍是 A」。
+    - **job**：送出後是一個 `kind` 為 `publish_draft` 的 job，和修訂共用同一個追蹤欄位
+      （`activeJob`，多一個 `kind` 供第一次輪詢回來前使用）、輪詢、全頁的鎖（送出的 pending
+      併入 `ownSummaryBusy`）與歸屬；成功後版本會換，卡片和成功的修訂一樣落到清單上方，
+      標題由 `orphanedJobHeading` 決定。
+    - **卡片的字跟著 job 的 `kind`**（`toolInstall.js` 的 `toolJobCopy`、`toolJobOutcomeView`）：
+      標題「發布草稿完成／失敗」，跑中與找不到 job 的說明都不說修訂或 AI，沒有「查看 AI 日誌」
+      （沒有 session），也不顯示停止原因、交接筆記、「需要你動手」。範例的結果照修訂卡片。
+      進度卡片 `ToolJobProgress` 這些依 kind 而異的字不寫死在元件裡，都從 `toolJobCopy` 取。
+    - **被拒**：見下面「發布被拒」。
+  - **其他頁面不接續，也不發布草稿**：`ToolFailureNotice` 的「請 AI 修正」按下時讀一次清單，工具有草稿
+    （不分狀態，判準同 `reviseBlockedByDraft`）就不送出，只說明工具有一份草稿、請到工具頁接續
+    或放棄（`fixDecision` 回 `draft`），旁邊就是「到工具頁查看」；沒有草稿才送第一輪，不帶
+    草稿身分。那一頁看不到草稿「需要你動手」的事，從那裡接續，操作者可能在改設定之前就付了一輪
+    的錢。
+  - **「無法使用」有兩種形狀**：說明檔讀不出來時，`draft_id`、`generation`、
+    `attempts`、`base_vid`、`last` 都是 null；說明檔讀得出來、檔案目錄卻不見時，這些
+    欄位有值。兩種的 `path` 都是草稿目錄，`draftView` 兩種都讀得了。
+  - **放棄的請求**（`buildDraftDiscardRequest`）：可讀的草稿帶 `draft_id` 與
+    `generation`，無法使用的（兩種形狀都算）帶 `discard_token`，只送其中一種，後端對
+    兩種都帶或都沒帶回 422。確認框記住使用者按下「放棄」當下看到的那一份草稿，確認時
+    送的就是那一份；其間若換成別份，後端回 `draft_changed`（`draftDiscardFailure`：
+    重讀清單並說明），不會刪到沒看過的草稿。`draft_not_found` 重讀清單，`job_busy`
+    請稍後再試；`500 draft_not_removed`（沒能確認草稿已刪除，或一開始就看不到它而沒動手）
+    照後端的訊息顯示——它寫出 `draft/` 的路徑與下一步——通知不自動關閉，並重讀清單
+    （`draft/` 可能已改名移走、只是之後的查詢失敗）；放棄成功而有殘留（`residual_path`）時，通知會說殘留在哪
+    （`draftDiscardNotification`）。確認框（`draftDiscardConfirmation`）說整個草稿目錄都會
+    刪掉，包括保留下來的舊目錄與其他內容，需要的請先取回。放棄的請求佔用後端的全域名額，
+    所以它的 pending 併入 `ownSummaryBusy`，和其他寫入一起停用。
+  - **工作卡片分兩層**：`components/ReviseDraftResult.jsx` 依
+    `jobDraftView(job, kind, context)` 畫；修訂的 job 讀它的 `draft`，發布草稿的 job
+    （`kind` 是 `publish_draft`）讀 `draft_publish`，兩者的 `draft_id`、`generation`
+    是同一套欄位。
+    - **這一輪自己的結果一律顯示**，不看清單：它可能是成果唯一的取回位置。「進度已保存
+      （第 N 輪）」之後帶後端的附註（`reason`，例如保留了上一份檔案目錄）與另外留著的路徑
+      （`retained_path`：說明檔沒確認落盤）；「未能保存（原因）」；「成果留在 <路徑>，
+      未能存成草稿」只用在 `saved` 為 false；已發布的修訂只顯示後端說草稿為什麼還在
+      （不說「進度已保存」）。
+    - **發布草稿的 job 自己的結果**同樣一律顯示，而且它不是一輪，不說「第 N 輪」或「進度已
+      保存」：成功而後端看到草稿已不在（`removed`），說草稿已刪除；成功而草稿留著，說草稿
+      留著並照後端的 `reason` 說為什麼；沒有發布時，`retained_path`（暫存或沒生效的版本
+      目錄）列出路徑並可複製，`reason`（草稿上的發布標記沒能清掉，草稿沒有恢復成發布前的
+      狀態）照後端的話顯示。失敗的 `error` 是卡片殼的一行，不重複；`draft_publish` 是 null
+      時只剩 `error`。
+    - **對目前草稿的宣稱與按鈕**只在三件事都成立時出現：卡片有對應的工具列（沒有對應的
+      卡片什麼都不說、不給按鈕）；清單的草稿與 job 的 `draft_id`、`generation` 都相同；
+      清單來自看到 job 結束**之後才發起、而且成功**的那次讀取。generation 或 `draft_id`
+      不同時說「目前的草稿已不是這張卡片對應的那一份」，不推論發生了什麼、不給按鈕；草稿
+      可接續才給「接續修正」「加上說明後接續…」「發布草稿」，「放棄」只在工具列。目前的
+      job 與從其他頁面接上的 job（`?job=`）都一樣，後者的工具列就是同名的那一列，身分比對
+      擋得住同名重裝。發布草稿失敗而標記已清掉時，`draft_publish.generation` 是清掉標記後的
+      值，所以草稿回到可接續時，卡片會把三個按鈕給回來。
+    - **「之後才發起」怎麼判斷**（`utils/toolList.js`）：每次讀清單在**開始時**取一個遞增的
+      編號（`readToolList`，存在清單資料裡的 `readSeq`；`ToolFailureNotice` 讀同一個快取鍵，
+      也走它），看到 job 結束時從同一個計數器取一個標記（`markListReads`），卡片比較兩者
+      （`listReadAfter`）。重讀失敗不會產生資料，畫面上的清單保有舊編號，所以不算；結束前就
+      在飛、結束後才回來的讀取編號比標記小，也不算。job 結束後的重讀（`rereadToolList`）先
+      取消在飛的讀取再讀：第一次載入還在飛時，react-query 會讓新的重讀直接併進那次舊的讀取
+      （query-core 的 `Query.fetch` 在沒有資料時沿用執行中的 retryer），那次讀取的編號早於
+      標記。計數器放在模組層：快取裡的清單活得比頁面元件久，元件重掛時計數器若從零開始，舊
+      清單的編號會大過新的標記。只看「重讀已 settle」（`settledJobId`）不夠：`finally` 在
+      重讀失敗時也會跑。那個旗標仍只管寫入閘。
+    - 它和 `ReviseStopNotice`（說這一輪為何停止）各管一件事，分開。
+  - 上一輪的停止原因沿用 `utils/toolJobStop.js` 的詞彙（`toolJobStopReason`）；草稿
+    沒有保存工具回合數，所以句子不帶「用了 N／M 次」。
+  - **`draft_pending`**（送出一次從目前版本重新開始的修訂，工具卻有草稿）：後端依草稿狀態
+    給兩種說法（可接續時說接續或放棄，其他說先放棄）。工具頁用 `reviseRefusalNotification`
+    的通知照原文顯示（訊息本身就是指示，不自動關閉），並依 `versionWriteConflictReaction`
+    重讀清單，讓該列顯示出訊息說的草稿；其他頁面（`ToolFailureNotice`）只在清單讀到之後才
+    出現的草稿會遇到它，`fixRefusalMessage` 用和清單上有草稿時同一句話說明並請使用者到工具頁。
+  - **接續被拒**：`draft_gone`（草稿已不在或換成另一份）、`draft_changed`（讀到之後被改
+    過）、`draft_unusable`（看不到、說明檔讀不出或檔案目錄不在）、`draft_publishing`（正在
+    發布、已發布或結果未知）。工具頁一律重讀清單（`versionWriteConflictReaction` 回
+    `refresh`），通知用我們自己的話說明發生了什麼（`reviseRefusalNotification`；後兩種的
+    下一步在草稿本身，不自動關閉）；其他頁面不送接續，收不到這四個碼。草稿的 `base_vid` 已不是
+    `current` 時，後端回的是 `version_mismatch`，照舊處理。
+  - **發布被拒**：發布草稿收到同樣四個碼，意思相同，通知另用發布的措辭（標題「發布未送出：…」，
+    `publishRefusalNotification`）。每個碼在 `toolSummary.js` 的 `DRAFT_REFUSALS` 是一列，同時放
+    接續與發布兩種措辭，碼的集合只有一份（`DRAFT_REFUSAL_CODES`），重讀清單的反應
+    （`versionWriteConflictReaction`）也共用，所以兩邊不會各自漏一個碼。`job_busy`、
+    `version_mismatch`、404 與 422 走一般失敗通知（標題「無法發布草稿」）：`job_busy` 不重讀清單，
+    `version_mismatch` 重讀。
+  - **有草稿時，從目前版本重新開始的修訂停用並在旁邊說明原因**：「送出修訂」與範例驗證
+    失敗的「請 AI 修正」在該列的 `draft` 不是 null 時停用（不分狀態，`draft_id` 是 null 的
+    「無法使用」也算），判準與原因句只在 `utils/toolDraft.js` 的 `reviseBlockedByDraft(draft)`，
+    可接續的草稿另外指向「接續修正」；元件（`components/ReviseBlockedNote.jsx`）只畫它的
+    回答，送出的 handler 在按下時也再查一次；跑一次範例、重新產生、丟掉這一版、刪除與
+    「放棄」不是修訂，不停用。
+  - 路徑旁的「複製路徑」靠瀏覽器的剪貼簿，只有 https 或 localhost 才開放；開不了時
+    會說明，路徑區塊點一下就全選，仍可手動複製。
 - **沒有 jsdom ⇒ 寫錯的 prop 名稱沒有任何閘門擋得住**：`pnpm lint`（Biome）不做
   型別檢查、`pnpm build`（Vite）只轉譯不檢型別、`pnpm test`（vitest）在 node 環境
   下完全不 render 元件。一個拼錯的 Mantine prop 是合法 JS／合法 JSX，會被靜默

@@ -1,13 +1,24 @@
 """Tests for schema-level contracts in afterthread.schemas."""
 
-from typing import Any
+import json
+import typing
+from typing import Annotated, Any
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from afterthread import schemas
 from afterthread.main import app
-from afterthread.schemas import ToolInstallRequest
+from afterthread.schemas import (
+    ToolDeleteResponse,
+    ToolDiscardResponse,
+    ToolDraft,
+    ToolDraftDiscardResponse,
+    ToolInstallRequest,
+    ToolJobDraft,
+    ToolJobDraftPublish,
+)
 from afterthread.services.memory_ai import SECTION_FIELD_ORDER
 
 
@@ -194,7 +205,10 @@ def test_only_by_id_routes_declare_404() -> None:
     for an unknown/evicted/post-restart job, the two AI-summary routes
     under /api/tools/{name}/summary -- D40 -- which 404 when the named tool does
     not exist, TOOLS_DIR being unset included, and POST /api/tools/{name}/revise,
-    plus the version-addressed discard, which 404 on the same gate), the settings and
+    plus the version-addressed discard, which 404 on the same gate), the draft
+    discard (DELETE /api/tools/{name}/draft, a 404 for a missing tool or a tool with
+    no draft), the draft publish (POST /api/tools/{name}/draft/publish, a 404 for
+    a missing tool), the settings and
     run-list reads under /api/tools/{name}, and the by-id run record read and delete
     (/api/tool-runs/{run_id}, web-v6 §6), and the 跑一次範例 submit
     (POST /api/tools/{name}/check, web-v6 §10). The collection, review, health,
@@ -225,6 +239,8 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tools/{name}", "patch"),
         ("/api/tools/{name}", "delete"),
         ("/api/tools/{name}/versions/{vid}", "delete"),
+        ("/api/tools/{name}/draft", "delete"),
+        ("/api/tools/{name}/draft/publish", "post"),
         ("/api/tools/jobs/{job_id}", "get"),
         ("/api/tools/{name}/summary", "get"),
         ("/api/tools/{name}/summary/regenerate", "post"),
@@ -235,3 +251,180 @@ def test_only_by_id_routes_declare_404() -> None:
         ("/api/tool-runs/{run_id}", "delete"),
         ("/api/tools/{name}/check", "post"),
     }
+
+
+# --- backend paths in responses ----------------------------------------------
+
+# A directory name read on Linux decodes with a lone surrogate for each byte that
+# is not UTF-8 (here ``\xff``); made encodable, the surrogate becomes three
+# replacement characters.
+_NOT_UTF8_PATH = "/srv/tools-\udcff/kb/.afterthread.meta/draft"
+_MADE_ENCODABLE = "/srv/tools-���/kb/.afterthread.meta/draft"
+
+# The response fields that state a path on the backend's own filesystem, as
+# decided by hand, with what else each model needs to be valid.
+_UNUSABLE_DRAFT: dict[str, Any] = {
+    "draft_id": None,
+    "generation": None,
+    "attempts": None,
+    "state": "unusable",
+    "interrupted": False,
+    "base_vid": None,
+    "path": "/srv/tools/kb/.afterthread.meta/draft",
+    "draft_dir": "/srv/tools/kb/.afterthread.meta/draft",
+    "kept": [],
+    "discard_token": "0" * 64,
+    "last": None,
+}
+_BACKEND_PATH_FIELDS: dict[tuple[type[BaseModel], str], dict[str, Any]] = {
+    (ToolDraft, "path"): _UNUSABLE_DRAFT,
+    (ToolDraft, "draft_dir"): _UNUSABLE_DRAFT,
+    (ToolDraft, "kept"): _UNUSABLE_DRAFT,
+    (ToolDraftDiscardResponse, "residual_path"): {},
+    (ToolDeleteResponse, "retained_path"): {
+        "outcome": "retained",
+        "retention_reason": "cleanup_failed",
+        "runs_deleted": False,
+    },
+    (ToolDiscardResponse, "retained_path"): {
+        "outcome": "retained",
+        "retention_reason": "cleanup_failed",
+    },
+    (ToolJobDraft, "retained_path"): {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": "沒能存成草稿",
+    },
+    (ToolJobDraftPublish, "retained_path"): {
+        "draft_id": "0" * 32,
+        "generation": 2,
+        "removed": False,
+        "reason": None,
+    },
+}
+# The listed fields that state a list of paths, each one made encodable.
+_BACKEND_PATH_LISTS = {(ToolDraft, "kept")}
+
+
+def _carries(annotation: Any, check: object) -> bool:
+    """Whether ``check`` is ``Annotated`` metadata anywhere inside ``annotation``."""
+    if typing.get_origin(annotation) is Annotated:
+        base, *metadata = typing.get_args(annotation)
+        return any(item == check for item in metadata) or _carries(base, check)
+    return any(_carries(arg, check) for arg in typing.get_args(annotation))
+
+
+def _fields_typed_backend_path() -> set[tuple[type[BaseModel], str]]:
+    """Every field of every model in ``afterthread.schemas`` whose type carries
+    ``BackendPath``'s check, however deep."""
+    check = typing.get_args(schemas.BackendPath)[1]
+    found: set[tuple[type[BaseModel], str]] = set()
+    for model in vars(schemas).values():
+        if not (
+            isinstance(model, type)
+            and issubclass(model, BaseModel)
+            and model.__module__ == schemas.__name__
+        ):
+            continue
+        for name, info in model.model_fields.items():
+            if any(item == check for item in info.metadata) or _carries(info.annotation, check):
+                found.add((model, name))
+    return found
+
+
+def test_backend_path_makes_a_path_encodable_and_leaves_an_encodable_one_as_it_is() -> None:
+    """A path whose name is not UTF-8 comes back with replacement characters, and
+    encodes; a path that encodes already, CJK included, comes back unchanged."""
+    adapter = TypeAdapter(schemas.BackendPath)
+
+    made = adapter.validate_python(_NOT_UTF8_PATH)
+
+    assert made == _MADE_ENCODABLE
+    made.encode("utf-8")
+    for path in ("/srv/tools/kb", "/srv/工具/kb/草稿"):
+        assert adapter.validate_python(path) == path
+
+
+def test_the_listed_backend_path_fields_are_exactly_the_fields_typed_backend_path() -> None:
+    """The fields listed as stating a backend path take the one type, and no other
+    field does: a listed field typed plain ``str`` drops out of what is found
+    here, and a field given the type without being listed is found. A new field
+    that states a path, typed plain ``str`` and not listed, is in neither."""
+    found = _fields_typed_backend_path()
+
+    assert found
+    assert found == set(_BACKEND_PATH_FIELDS)
+
+
+@pytest.mark.parametrize(
+    ("model", "field"),
+    list(_BACKEND_PATH_FIELDS),
+    ids=lambda value: getattr(value, "__name__", value),
+)
+def test_each_listed_backend_path_field_answers_a_path_that_is_not_utf8_made_encodable(
+    model: type[BaseModel], field: str
+) -> None:
+    """Built with a path that does not encode as UTF-8, the response holds it made
+    encodable and serializes: one such character would fail the encode of the
+    whole response."""
+    listed = (model, field) in _BACKEND_PATH_LISTS
+    sent = [_NOT_UTF8_PATH] if listed else _NOT_UTF8_PATH
+    expected = [_MADE_ENCODABLE] if listed else _MADE_ENCODABLE
+    answer = model.model_validate({**_BACKEND_PATH_FIELDS[(model, field)], field: sent})
+
+    assert getattr(answer, field) == expected
+    assert json.loads(answer.model_dump_json())[field] == expected
+
+
+def test_tools_and_the_schemas_make_text_encodable_with_one_definition() -> None:
+    """``tools._utf8_safe`` and ``BackendPath``'s check are one function, so a path
+    the services write and a path a response states are made encodable alike."""
+    from afterthread import utf8
+    from afterthread.services import tools
+
+    assert tools._utf8_safe is utf8.encodable
+    assert typing.get_args(schemas.BackendPath)[1].func is utf8.encodable
+
+
+def test_the_revise_request_takes_a_draft_id_shaped_as_the_draft_store_mints_it() -> None:
+    """The schema spells the draft id's pattern rather than import the tool
+    subsystem; it is the draft store's own."""
+    from afterthread.services import tool_drafts
+
+    assert schemas._DRAFT_ID_PATTERN == tool_drafts.DRAFT_ID_PATTERN
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [{"draft_id": "a" * 32}, {"draft_generation": 1}],
+    ids=["id-alone", "generation-alone"],
+)
+def test_a_revise_request_names_a_draft_by_both_its_id_and_generation_or_neither(
+    fields: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        schemas.ToolReviseRequest.model_validate(
+            {"feedback": "x", "expected_vid": "20260728T010203Z-abcdef", **fields}
+        )
+
+
+def test_a_revise_request_attaches_as_many_runs_as_one_revise_carries() -> None:
+    """The request's cap on ``run_ids`` is the number of records a revise carries
+    and a draft keeps: more would be attached and then dropped unseen."""
+    from afterthread.services import tool_drafts, tool_runs
+
+    assert schemas._REVISE_RUN_IDS_MAX == tool_runs.RUNS_PER_REVISE == tool_drafts._RUNS_KEPT
+
+
+def test_a_revise_request_naming_a_draft_needs_neither_feedback_nor_runs() -> None:
+    """Continuing a draft is something to do on its own; without one, a request
+    with neither feedback nor runs still has nothing to do."""
+    continuing = schemas.ToolReviseRequest.model_validate(
+        {"expected_vid": "20260728T010203Z-abcdef", "draft_id": "a" * 32, "draft_generation": 1}
+    )
+
+    assert (continuing.feedback, continuing.run_ids) == (None, [])
+    with pytest.raises(ValidationError):
+        schemas.ToolReviseRequest.model_validate({"expected_vid": "20260728T010203Z-abcdef"})

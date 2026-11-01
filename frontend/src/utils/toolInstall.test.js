@@ -4,9 +4,11 @@ import {
 	isSecretName,
 	isTerminalToolJobState,
 	isToolJobActive,
+	orphanedJobHeading,
 	secretNameError,
 	secretValueError,
 	TOOL_JOB_POLL_MS,
+	toolJobCopy,
 	toolJobOutcomeView,
 	toolJobQueryEnabled,
 	toolJobRefetchInterval,
@@ -300,5 +302,103 @@ describe("toolJobOutcomeView", () => {
 				title: "修訂失敗",
 			});
 		}
+	});
+});
+
+describe("toolJobOutcomeView for the publish of a draft", () => {
+	const published = toolJobOutcomeView(
+		{ state: "succeeded", outcome: "published" },
+		"publish_draft",
+	);
+	const failed = toolJobOutcomeView(
+		{ state: "failed", outcome: "failed" },
+		"publish_draft",
+	);
+
+	it("is green when the draft was published and red when it was not", () => {
+		expect(published).toMatchObject({ tone: "success", color: "green" });
+		expect(failed).toMatchObject({ tone: "failed", color: "red" });
+		expect(published.title).not.toBe(failed.title);
+	});
+
+	it("is titled for publishing the draft, and for neither a revision, an installation nor the AI", () => {
+		for (const view of [published, failed]) {
+			expect(view.title).toContain("發布草稿");
+			expect(view.title).not.toMatch(/修訂|安裝|AI/);
+		}
+	});
+
+	it("is a failed publish, never the builder declining, whatever the outcome says", () => {
+		const view = toolJobOutcomeView(
+			{ state: "failed", outcome: "not_published" },
+			"publish_draft",
+		);
+		expect(view).toMatchObject({ tone: "failed", color: "red" });
+		expect(view.title).toBe(failed.title);
+	});
+});
+
+describe("toolJobCopy", () => {
+	const KINDS = ["install", "revise", "publish_draft"];
+
+	it("gives each kind of job its own words", () => {
+		for (const field of ["verb", "working", "unknownOutcome"]) {
+			const words = KINDS.map((kind) => toolJobCopy(kind)[field]);
+			expect(new Set(words).size, field).toBe(KINDS.length);
+		}
+		const succeeded = KINDS.map((kind) => toolJobCopy(kind).succeeded("kb"));
+		expect(new Set(succeeded).size).toBe(KINDS.length);
+		for (const sentence of succeeded) {
+			expect(sentence).toContain("「kb」");
+		}
+	});
+
+	it("titles each kind's outcome with the verb it is given", () => {
+		for (const kind of KINDS) {
+			const { verb } = toolJobCopy(kind);
+			expect(
+				toolJobOutcomeView({ state: "succeeded" }, kind).title,
+				kind,
+			).toContain(verb);
+			expect(
+				toolJobOutcomeView({ state: "failed", outcome: "failed" }, kind).title,
+				kind,
+			).toContain(verb);
+		}
+	});
+
+	it("words the publish of a draft without a revision, an installation or the AI", () => {
+		const words = toolJobCopy("publish_draft");
+		for (const text of [
+			words.verb,
+			words.working,
+			words.unknownOutcome,
+			words.succeeded("kb"),
+			orphanedJobHeading("publish_draft", "kb"),
+		]) {
+			expect(text).not.toMatch(/修訂|安裝|AI/);
+		}
+	});
+
+	it("links the AI log for the kinds that run a session, and not for a publish", () => {
+		expect(toolJobCopy("install").showsAiLog).toBe(true);
+		expect(toolJobCopy("revise").showsAiLog).toBe(true);
+		expect(toolJobCopy("publish_draft").showsAiLog).toBe(false);
+	});
+
+	it("words a kind it does not list as an install", () => {
+		for (const kind of ["something_new", undefined, null]) {
+			expect(toolJobCopy(kind)).toBe(toolJobCopy("install"));
+		}
+	});
+});
+
+describe("orphanedJobHeading", () => {
+	it("names the tool and which job it is, apart for a publish and a revise", () => {
+		const publish = orphanedJobHeading("publish_draft", "kb");
+		const revise = orphanedJobHeading("revise", "kb");
+		expect(publish).toContain("「kb」");
+		expect(revise).toContain("「kb」");
+		expect(publish).not.toBe(revise);
 	});
 });

@@ -16,6 +16,12 @@ HTTP API，並在最後驗證前端 production build 能正常提供 SPA。
 
 ### 前置需求
 
+- `bash` 4 以上（腳本用關聯陣列 `declare -A` 記各階段結果）。macOS 內建的
+  `/bin/bash` 是 3.2，執行到 `declare -A` 就以 `invalid option` 停下。
+- `setsid`（util-linux；每個伺服器在自己的行程群組裡啟動，結束時整組回收）。
+  macOS 沒有這個指令，缺它時伺服器起不來。
+- `curl`（打 HTTP API）
+- `date` 要支援 `+%N`（Phase C 量測逾時降級的經過時間）
 - `uv`（啟動後端：`uv run uvicorn`）
 - `pnpm`（前端 `build` / `preview`；Phase D 執行前會自動跑 `pnpm install --frozen-lockfile`，不需手動預先安裝前端相依套件）
 - `python3`（mock 伺服器為純標準函式庫；腳本也用它做 JSON 斷言）
@@ -89,6 +95,11 @@ README 安裝的方式完全一樣——然後用 `curl` 打這個打包後的�
 
 ### 前置需求
 
+- `setsid`（同 `smoke.sh`：後端在自己的行程群組裡啟動）。macOS 沒有這個指令，
+  缺它時後端起不來。
+- `curl`、`python3`（打 HTTP，並用 `python3` 做 JSON 與回應標頭的斷言）
+- GNU `stat`（`init-env` 的檔案權限檢查用 `stat -c %a`）。macOS 內建的 `stat`
+  沒有 `-c`，那一項檢查會失敗。
 - `uv`（提供 `uvx`）
 - `pnpm`（前端 build，`scripts/build-wheel.sh` 會呼叫）
 - 在**同一台機器第一次**執行時需要網路：`uvx` 要把 wheel 的依賴解析、下載進它

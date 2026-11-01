@@ -11,6 +11,8 @@
 // AI 日誌 deep link it hands out, and the AI 日誌 page's rule for resolving one.
 // Both halves live together deliberately -- see that section's header.
 
+import { toolApiPath } from "../api/toolPaths.js";
+
 // --- react-query cache keys for one tool's summary ---------------------------
 
 const TOOL_SUMMARY_KEY_ROOT = "tool-summary";
@@ -85,42 +87,187 @@ export function acceptSummaryForVersion(currentVid, detail) {
 // A revise may attach failing run records (web-v6 §8.1): `runIds`. The one-click
 // fix sends ONLY those and the expected version -- no words, no form -- so an
 // empty feedback is left out of the body rather than sent blank.
-export function buildReviseRequest({ name, currentVid, feedback, runIds }) {
-	const body = { expected_vid: currentVid };
+//
+// A round that continues the tool's draft names that draft: `continuation` is
+// toolDraft.draftContinuation's answer for the list's draft, or null for a revise
+// that starts over. Its id and generation go as `draft_id` / `draft_generation`,
+// and the version expected is the one the draft was made from (`base_vid`), not
+// the row's: the backend checks the round against the draft it continues. Words
+// and records are optional then too -- the round's own `feedback`, and records
+// attached to it.
+export function buildReviseRequest({
+	name,
+	currentVid,
+	feedback,
+	runIds,
+	continuation = null,
+}) {
+	const body = {
+		expected_vid: continuation === null ? currentVid : continuation.baseVid,
+	};
+	if (continuation !== null) {
+		body.draft_id = continuation.draftId;
+		body.draft_generation = continuation.generation;
+	}
 	if (feedback) {
 		body.feedback = feedback;
 	}
 	if (runIds?.length) {
 		body.run_ids = runIds;
 	}
-	return { path: `/api/tools/${name}/revise`, body };
+	return { path: toolApiPath(name, "revise"), body };
+}
+
+// A tool's draft published as it is, with no round of the AI. The body names the
+// draft exactly as the confirmation recorded it when it opened -- its id, its
+// generation, and the version it was made from (`expected_vid`) -- and nothing else:
+// there are no words and no records to attach. The recorded fields are the whole
+// request; whatever else the caller holds (the job attribution key, the row as it
+// is when this is sent) decides none of it.
+export function buildDraftPublishRequest({
+	name,
+	draftId,
+	generation,
+	baseVid,
+}) {
+	return {
+		path: toolApiPath(name, "draft", "publish"),
+		body: {
+			draft_id: draftId,
+			draft_generation: generation,
+			expected_vid: baseVid,
+		},
+	};
 }
 
 export function buildRegenerateRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/summary/regenerate`,
+		path: toolApiPath(name, "summary", "regenerate"),
 		body: { expected_vid: currentVid },
 	};
 }
 
 export function buildDiscardRequest({ name, currentVid }) {
 	return {
-		path: `/api/tools/${name}/versions/${currentVid}`,
+		path: toolApiPath(name, "versions", currentVid),
 	};
 }
 
-// The revise submit's one refusal whose MESSAGE is the instruction (web-v6
-// §5.2): `env_policy` comes back before any job exists, and its text names the
-// .env/config.env keys the operator has to move. So it gets its own title and
-// stays on screen until dismissed -- the next step is editing a file, and a toast
-// that closes after a few seconds takes the key names with it. Every other
-// error keeps the generic red notification (null here).
+// A round that continues a draft, and a publish of one as it is, are refused when
+// the draft they name is not the tool's draft as the backend reads it now. Each
+// refusal says what happened, in our words, chosen by its code and by which of the
+// two was sent, and the list is read again (versionWriteConflictReaction) so the row
+// shows the draft as it is:
+// * draft_gone: the draft is not there any more, or another one took its place (a
+//   draft made again after a discard has a new id);
+// * draft_changed: the same draft was written to since the list was read (another
+//   round continued it, for one);
+// * draft_unusable: it cannot be seen, its manifest cannot be read, or its files
+//   directory is gone -- it can only be discarded, so the files come first;
+// * draft_publishing: a publish from it is going, went through, or did not say how
+//   it ended -- it can be neither continued nor published.
+// `keepOpen` marks the codes that stay until dismissed: the next step is on the
+// draft, not a retry. Each code is one entry holding both wordings, so the codes the
+// two meet are one list (DRAFT_REFUSAL_CODES) and cannot come apart.
+const DRAFT_UNUSABLE_MESSAGE =
+	"這份草稿目前無法使用：看不到它、說明檔讀不出來，或檔案目錄不在了。正在重新讀取清單；需要的檔案請先到草稿目錄取回，再放棄它。";
+
+const DRAFT_REFUSALS = {
+	draft_gone: {
+		continue: {
+			title: "接續未送出：草稿已不在",
+			message:
+				"要接續的草稿已經不在了，或已換成另一份。正在重新讀取清單，請看過目前的狀態再決定。",
+		},
+		publish: {
+			title: "發布未送出：草稿已不在",
+			message:
+				"要發布的草稿已經不在了，或已換成另一份。正在重新讀取清單，請看過目前的狀態再決定。",
+		},
+	},
+	draft_changed: {
+		continue: {
+			title: "接續未送出：草稿已經變更",
+			message:
+				"草稿在你看到之後已經變更（例如在另一個分頁接續過）。正在重新讀取清單，請看過最新的草稿再決定要不要接續。",
+		},
+		publish: {
+			title: "發布未送出：草稿已經變更",
+			message:
+				"草稿在你看到之後已經變更（例如在另一個分頁處理過），所以沒有發布。正在重新讀取清單，請看過最新的草稿再決定要不要發布。",
+		},
+	},
+	draft_unusable: {
+		keepOpen: true,
+		continue: {
+			title: "接續未送出：草稿無法使用",
+			message: DRAFT_UNUSABLE_MESSAGE,
+		},
+		publish: {
+			title: "發布未送出：草稿無法使用",
+			message: DRAFT_UNUSABLE_MESSAGE,
+		},
+	},
+	draft_publishing: {
+		keepOpen: true,
+		continue: {
+			title: "接續未送出：草稿正在發布或已發布",
+			message:
+				"這份草稿正在發布、已經發布，或不確定發布有沒有完成，所以不能接續。正在重新讀取清單，請照草稿提示的說明處理。",
+		},
+		publish: {
+			title: "發布未送出：草稿正在發布或已發布",
+			message:
+				"這份草稿正在發布、已經發布，或不確定發布有沒有完成，所以不能再發布。正在重新讀取清單，請照草稿提示的說明處理。",
+		},
+	},
+};
+
+// The codes a refusal of a round that continues a draft, or of a publish of one, can
+// carry beyond the ones every version write can: the four above.
+export const DRAFT_REFUSAL_CODES = Object.freeze(Object.keys(DRAFT_REFUSALS));
+
+// The orange notification for a refusal above, worded for `action` ("continue" or
+// "publish"); null for any other error.
+function draftRefusalNotification(error, action) {
+	if (error?.status !== 409 || !Object.hasOwn(DRAFT_REFUSALS, error?.code)) {
+		return null;
+	}
+	const { keepOpen = false, [action]: wording } = DRAFT_REFUSALS[error.code];
+	return {
+		color: "orange",
+		...wording,
+		...(keepOpen ? { autoClose: false } : {}),
+	};
+}
+
+// The revise submit's refusals whose MESSAGE is the instruction: `env_policy`
+// comes back before any job exists, and its text names the .env/config.env keys the
+// operator has to move; `draft_pending` comes back when a revise that starts over
+// meets a draft, and its text says what the draft allows (continue it or discard
+// it, or only discard it). So each gets its own title and stays on screen until
+// dismissed -- the next step is editing a file or acting on a draft, and a toast
+// that closes after a few seconds takes the key names, or the instruction, with it.
+// The four refusals of a continued round are worded above. Every other error keeps
+// the generic red notification (null here).
 //
 // The attached run records (web-v6 §8.3) are the other refusal made before any
 // job: a record purged meanwhile (404 -- whose ApiError message is the generic
 // 找不到項目, so the copy is ours) or one of another tool (422, the backend's
 // own words).
 export function reviseRefusalNotification(error) {
+	if (error?.status === 409 && error?.code === "draft_pending") {
+		return {
+			color: "orange",
+			title: "修訂未送出：這個工具有未完成的修正",
+			message: error.message,
+			autoClose: false,
+		};
+	}
+	const draftRefusal = draftRefusalNotification(error, "continue");
+	if (draftRefusal !== null) {
+		return draftRefusal;
+	}
 	if (error?.status === 404 && error?.code === "run_not_found") {
 		return {
 			color: "orange",
@@ -142,6 +289,15 @@ export function reviseRefusalNotification(error) {
 	};
 }
 
+// What the 工具 page says when a publish of a draft (POST .../draft/publish) is
+// refused for the draft it names: the four codes of DRAFT_REFUSALS, worded for a
+// publish. Null for every other error, which the page meets as it meets any failed
+// version write: job_busy and version_mismatch keep their generic notification and
+// their reaction (versionWriteConflictReaction), and a 404 means the tool is gone.
+export function publishRefusalNotification(error) {
+	return draftRefusalNotification(error, "publish");
+}
+
 // Structured 409s are instructions, not interchangeable conflicts. Keeping the
 // dispatch pure makes it impossible for UI code to branch on translated message
 // text, and gives the no-refetch cases an explicit default.
@@ -150,6 +306,13 @@ export function versionWriteConflictReaction({ status, code } = {}) {
 		return null;
 	}
 	if (code === "version_mismatch") {
+		return "refresh";
+	}
+	// The tool has a draft the list on screen may not show (made by a job this page
+	// did not see end, or from another tab), or the draft a continued round or a
+	// publish named is not the one the backend has: the list is read again so the
+	// row shows what the refusal talks about.
+	if (code === "draft_pending" || DRAFT_REFUSAL_CODES.includes(code)) {
 		return "refresh";
 	}
 	if (code === "job_busy" || code === "ai_job_in_progress") {

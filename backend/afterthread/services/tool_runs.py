@@ -15,10 +15,15 @@ added to a ``.env`` after the run was written is hidden too (invariant I).
 
 from __future__ import annotations
 
+import errno
 import logging
+import os
+import re
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import ColumnElement, Engine, case, func
@@ -27,7 +32,7 @@ from sqlmodel import Session, col, create_engine, select
 
 from afterthread.config import get_settings
 from afterthread.db import enable_sqlite_foreign_keys
-from afterthread.models import ToolCheck, ToolRun
+from afterthread.models import SQLITE_MAX_INT, ToolCheck, ToolRun
 from afterthread.services import llm_log, tools
 
 _logger = logging.getLogger("afterthread.tool_runs")
@@ -74,6 +79,15 @@ def _storable(text: str | None, cut: Any, cap: int) -> str | None:
     the piece of a secret a cut-then-redact order could leave behind. The scrub
     is what lets sqlite3 take the text at all -- a model's tool arguments can
     carry a lone surrogate, which it refuses to encode.
+
+    Not covered: the scrub comes after the redaction, and it writes a lone
+    surrogate as three U+FFFD, so a known value that itself holds three U+FFFD in
+    a row can be completed by it in the stored text. Only the arguments and the
+    message can carry a surrogate: the output is decoded with errors="replace"
+    before it is redacted. The cut can complete one too: ``_head`` and ``_tail``
+    put a marker beside what they keep, and a known value that holds the marker's
+    text can be completed by the marker and the text kept next to it. The reads
+    that hand the bodies on (``view``, ``attach_for_revise``) mask them again.
     """
     if text is None:
         return None
@@ -374,20 +388,66 @@ class PurgeScope:
     orphans_only: bool = False
 
 
-def orphan_names(session: Session) -> list[str]:
-    """The record names whose package no longer exists, sorted.
+def _package_seen_gone(base: Path, name: str) -> bool:
+    """Whether a look sees that no package is at ``<base>/<name>``, not merely none seen.
 
-    Empty when the tools directory is not configured OR not there (an unmounted
-    volume, a renamed directory): then NO name resolves, and calling every
-    record an orphan would hand a purge the whole table for a condition the
-    operator may fix in a minute. The same "missing root is the feature off"
-    reading ``tools._scan_all`` and the tools lock apply.
+    A package here is what the tools list has a row for (``tools._scan_all``): a
+    directory at the name, or a link there that leads to a directory, listed as
+    an invalid row whose 刪除 removes the link alone, its records with it.
+
+    Gone: a name no package can have (``tools._NAME_RE``), whatever is there; an
+    ``lstat`` that says nothing is there, or that something above it is not a
+    directory; something there that is neither a directory nor a link -- a file,
+    a socket -- which deleting the tool by that name refuses; or a link whose
+    ``stat``, which follows it, says the same of where it leads, finds the links
+    lead back into themselves (``ELOOP``), or sees no directory there.
+
+    There, as far as anyone can tell, when either look fails any other way -- a
+    directory on the way that denies search, an I/O error: that look saw nothing.
+
+    No existing look answers this. ``tools._seen_gone`` takes anything it sees
+    for present, a file included; the lookup by name
+    (``tools._resolve_package_dir_no_alias``) answers None when its ``is_dir``
+    look fails and for a link alike; the scan's ``is_dir`` reads a failed look as
+    no directory.
+    """
+    if not tools._NAME_RE.match(name):
+        return True
+    path = base / name
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError, NotADirectoryError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(mode):
+        try:
+            mode = os.stat(path).st_mode
+        except FileNotFoundError, NotADirectoryError:
+            return True
+        except OSError as error:
+            return error.errno == errno.ELOOP
+    return not stat.S_ISDIR(mode)
+
+
+def orphan_names(session: Session) -> list[str]:
+    """The record names whose package is seen gone (``_package_seen_gone``), sorted.
+
+    A look that fails makes no orphan, nor does a link at the name that leads to
+    a directory.
+
+    Empty when the tools directory is not configured OR not seen as a directory
+    (an unmounted volume, a renamed directory): a look under a directory that is
+    not there says gone for every name, and calling every record an orphan would
+    hand a purge the whole table for a condition the operator may fix in a
+    minute. The same "missing root is the feature off" reading
+    ``tools._scan_all`` and the tools lock apply.
     """
     base = tools.tools_dir()
     if base is None or not base.is_dir():
         return []
     names = session.exec(select(ToolRun.tool_name).distinct()).all()
-    return sorted(name for name in names if tools._resolve_package_dir_no_alias(name) is None)
+    return sorted(name for name in names if _package_seen_gone(base, name))
 
 
 def _conditions(session: Session, scope: PurgeScope) -> list[ColumnElement[bool]] | None:
@@ -427,11 +487,13 @@ def purge(
     between -- is never swept along with it (invariant J). Ids only grow
     (AUTOINCREMENT), which is what makes the bound exact.
 
-    The orphan scope also drops the verdicts (``tool_check``) of tools that no
-    longer exist: a tool's delete normally removes them with its records, and
-    when that failed this scope is where the operator is sent (``delete_for_tool``).
-    They are not counted -- they are not records, and nothing shows them once
-    their tool is gone.
+    The orphan scope also drops the verdicts (``tool_check``) of tools whose
+    package is seen gone: a tool's delete normally removes them with its records,
+    and when that failed this scope is where the operator is sent
+    (``delete_for_tool``). Gone is read as for the records
+    (``_package_seen_gone``), so a tool whose look fails keeps both. They are not
+    counted -- they are not records, and nothing shows them once their tool is
+    gone.
     """
     conditions = _conditions(session, scope)
     if dry_run:
@@ -462,16 +524,17 @@ def purge(
 
 
 def _delete_gone_verdicts(session: Session) -> None:
-    """Delete the verdicts of every tool whose package no longer exists.
+    """Delete the verdicts of every tool whose package is seen gone.
 
-    The same reading of "gone" as ``orphan_names``, over the verdicts' own
-    names: nothing at all while the tools directory is unset or missing.
+    The same reading of "gone" as ``orphan_names`` (``_package_seen_gone``), over
+    the verdicts' own names: nothing at all while the tools directory is unset
+    or not seen as a directory.
     """
     base = tools.tools_dir()
     if base is None or not base.is_dir():
         return
     names = session.exec(select(ToolCheck.tool_name).distinct()).all()
-    gone = [name for name in names if tools._resolve_package_dir_no_alias(name) is None]
+    gone = [name for name in names if _package_seen_gone(base, name)]
     if gone:
         session.exec(
             sql_delete(ToolCheck)
@@ -575,6 +638,11 @@ class AttachedRun:
     purge of the record while the revise is queued or running changes nothing
     about what the builder is shown. The texts are masked against the secrets
     known at that moment, the same second mask a read applies.
+
+    ``purged``: the record is no longer in the database -- a continuation's draft
+    keeps a summary of the records earlier rounds attached, and this is that
+    summary alone, read back from the draft (``reread_for_revise``). It has no
+    texts and cannot be run again; an empty text never means that by itself.
     """
 
     id: int
@@ -587,6 +655,7 @@ class AttachedRun:
     args: str | None
     stdout: str | None
     stderr: str | None
+    purged: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -613,21 +682,139 @@ def attach_for_revise(session: Session, tool_name: str, run_ids: list[int]) -> A
     if any(rows[run_id].tool_name != tool_name for run_id in run_ids):
         return AttachedRuns(refusal="run_not_for_tool")
     secrets = tools._redaction_secrets()
-    attached = []
-    for run_id in run_ids:
-        row = rows[run_id]
-        attached.append(
-            AttachedRun(
-                id=run_id,
-                started_at=_naive_utc(row.started_at).replace(tzinfo=UTC),
-                workflow=row.workflow,
-                vid=row.vid,
-                outcome=row.outcome,
-                exit_code=row.exit_code,
-                message=_masked(row.message, secrets),
-                args=_masked(row.args, secrets),
-                stdout=_masked(row.stdout, secrets),
-                stderr=_masked(row.stderr, secrets),
-            )
-        )
-    return AttachedRuns(runs=tuple(attached))
+    return AttachedRuns(runs=tuple(_copied(rows[run_id], secrets) for run_id in run_ids))
+
+
+def _copied(row: ToolRun, secrets: list[str]) -> AttachedRun:
+    """A record as a revise carries it, its texts masked with ``secrets``."""
+    assert row.id is not None
+    return AttachedRun(
+        id=row.id,
+        started_at=_naive_utc(row.started_at).replace(tzinfo=UTC),
+        workflow=row.workflow,
+        vid=row.vid,
+        outcome=row.outcome,
+        exit_code=row.exit_code,
+        message=_masked(row.message, secrets),
+        args=_masked(row.args, secrets),
+        stdout=_masked(row.stdout, secrets),
+        stderr=_masked(row.stderr, secrets),
+    )
+
+
+# What a run record is written with, for a kept summary to be read as one. The
+# outcomes are the writer's own constants (``tools.RUN_*``), which the API spells
+# on its own (``schemas.ToolRunOutcome``) and a test pins equal; the workflows have
+# no one definition -- each caller names its own (``capture``, ``verify``, ...) --
+# so a workflow is checked against their common shape, a lowercase identifier.
+_RUN_OUTCOMES = frozenset(
+    {
+        tools.RUN_OK,
+        tools.RUN_FAILED,
+        tools.RUN_OUTPUT_OVERFLOW,
+        tools.RUN_TIMEOUT,
+        tools.RUN_START_FAILED,
+        tools.RUN_REFUSED,
+        tools.RUN_ERROR,
+    }
+)
+_WORKFLOW_SHAPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _summary_only(entry: dict[str, Any]) -> AttachedRun | None:
+    """A record a draft keeps a summary of, when the record itself is gone: that
+    summary, marked ``purged``. None when the summary cannot stand for a record
+    -- a field missing, or one not of the shape the backend writes it in, as a
+    hand edit or a mask over it leaves it: a start time that does not read as
+    one, a vid that is not one (``tools._VID_RE``), an outcome not among those a
+    run is recorded with, a workflow that is not a lowercase identifier.
+
+    The manifest writes these fields as free text, masked with the secrets known
+    then; checked here, they are backend values again and go into a prompt as a
+    record's from the database do.
+    """
+    workflow = entry.get("workflow")
+    vid = entry.get("vid")
+    outcome = entry.get("outcome")
+    started = entry.get("started_at")
+    if not (
+        isinstance(workflow, str)
+        and isinstance(vid, str)
+        and isinstance(outcome, str)
+        and isinstance(started, str)
+    ):
+        return None
+    if not (
+        _WORKFLOW_SHAPE.fullmatch(workflow)
+        and tools._VID_RE.fullmatch(vid)
+        and outcome in _RUN_OUTCOMES
+    ):
+        return None
+    try:
+        started_at = datetime.fromisoformat(started)
+    except ValueError:
+        return None
+    return AttachedRun(
+        id=entry["id"],
+        started_at=started_at if started_at.tzinfo else started_at.replace(tzinfo=UTC),
+        workflow=workflow,
+        vid=vid,
+        outcome=outcome,
+        exit_code=entry.get("exit_code"),
+        message=None,
+        args=None,
+        stdout=None,
+        stderr=None,
+        purged=True,
+    )
+
+
+def reread_for_revise(
+    session: Session, tool_name: str, recorded: tuple[dict[str, Any], ...]
+) -> tuple[AttachedRun, ...]:
+    """The records a continued draft keeps (its manifest's ``runs``), read again.
+
+    Lenient, unlike ``attach_for_revise``: a record still in the database for
+    this tool is copied and masked as a newly attached one is; one that is gone --
+    purged, or no longer this tool's -- is answered by the summary the draft
+    keeps, marked ``purged`` (``_summary_only``), never refused. A summary that
+    cannot stand for a record is left out. Fail-closed on the secret scan like
+    every read. An id past what SQLite holds -- a hand edit -- is not looked up,
+    since the lookup would raise rather than miss: no record has it.
+    """
+    ids = [entry["id"] for entry in recorded if entry["id"] <= SQLITE_MAX_INT]
+    rows = (
+        {row.id: row for row in session.exec(select(ToolRun).where(col(ToolRun.id).in_(ids)))}
+        if ids
+        else {}
+    )
+    secrets = tools._redaction_secrets() if rows else []
+    reread: list[AttachedRun] = []
+    for entry in recorded:
+        row = rows.get(entry["id"])
+        if row is not None and row.tool_name == tool_name:
+            reread.append(_copied(row, secrets))
+        elif (summary := _summary_only(entry)) is not None:
+            reread.append(summary)
+    return tuple(reread)
+
+
+# How many records one revise carries -- what one request may attach, which the
+# request schema spells on its own and a test pins equal -- and so how many a
+# draft keeps for its next round.
+RUNS_PER_REVISE = 3
+
+
+def merged_for_revise(
+    attached: tuple[AttachedRun, ...], reread: tuple[AttachedRun, ...]
+) -> tuple[AttachedRun, ...]:
+    """The records a continuing round carries: the newly attached first, then those
+    its draft kept, each id once, at most ``RUNS_PER_REVISE`` -- the order of
+    attaching, not of running."""
+    merged: list[AttachedRun] = []
+    seen: set[int] = set()
+    for run in (*attached, *reread):
+        if run.id not in seen:
+            seen.add(run.id)
+            merged.append(run)
+    return tuple(merged[:RUNS_PER_REVISE])

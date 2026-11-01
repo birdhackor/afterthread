@@ -31,7 +31,9 @@ Three sinks, in decreasing durability, all fed from one finished record:
    request) could inflate a "bounded" 50-entry ring to hundreds of MB;
 2. an OPTIONAL JSONL file (``settings.llm_log_file``), off by default because a
    record carries personal memory content and landing it on disk must be an
-   operator choice, not a default;
+   operator choice, not a default. Each line is checked once more as it is
+   appended (``_checked_line``), so a line can hold a marker where the ring holds
+   a body: the same shape, not always the same text;
 3. the single stdlib INFO summary line above, which is what the uvicorn console
    shows live.
 
@@ -44,10 +46,12 @@ the INFO log are done OUTSIDE that lock so a slow disk never serializes every
 concurrent interaction behind one writer.
 """
 
+import bisect
 import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -84,7 +88,9 @@ class LlmAttempt:
     never rewrite an already-recorded attempt. Every message's content here has
     already passed through ``_stored_body`` (UTF-8-safe, then size-capped at
     ``settings.llm_log_body_max_chars``), so ``request_messages`` is exactly
-    what a reader of the ring/JSONL/detail API sees -- never the raw original.
+    what a reader of the ring and the detail API sees, and what a JSONL line
+    holds unless its own check put a marker in place of a body
+    (``_checked_line``) -- never the raw original.
 
     ``response_content`` is the raw completion text, likewise passed through
     ``_stored_body`` (or None when the attempt produced no usable content or
@@ -350,10 +356,21 @@ def _aggregate_usage(attempts: list[LlmAttempt]) -> dict[str, int | None] | None
 # duplicated rather than shared -- llm_log stays leaf); a test pins the two equal.
 _REDACTION_MARKER = "•••[秘密已遮蔽]•••"
 
+# Stored in place of a body that could not be checked against the whole list of
+# known secrets (``_checked_as_stored_and_written``): it says the body was not
+# recorded and why, and not that a secret was found -- which is what
+# ``_REDACTION_MARKER`` says, and what may send a reader to rotate a key. Written
+# the way that marker is, a CJK body in the •••[…]••• fence: no run of ASCII
+# characters in it is as long as ``_MIN_SECRET_LEN``, so no value of ASCII
+# characters, as keys and tokens are, can equal it or be found in it.
+_UNCHECKED_MARKER = "•••[無法確認是否含已知秘密，本文未記錄]•••"  # noqa: RUF001
+
 # Values shorter than this are NEVER redacted (see `_redact`): a 1-5 char value
 # would shred ordinary prose (imagine redacting every "1234"), and a real API
 # key / token is never that short -- so the floor costs no real coverage while
-# removing the false-positive hazard entirely.
+# removing the false-positive hazard entirely. The floor is a value's own: the
+# newline-normalized form of a value at it is matched whatever its length
+# (`_match_forms`).
 _MIN_SECRET_LEN = 6
 
 # Hard ceiling on how many mask ranges a single call collects before giving up on
@@ -374,21 +391,27 @@ _MAX_MASK_RANGES = 10_000
 # The known-secret provider. A CALLABLE, deliberately not a static set, because
 # the secret set CHANGES at runtime: installing a tool adds its .env values, and
 # an in-flight install registers its form secret before that .env even exists
-# (see tools.known_secret_values). llm_log is a leaf OBSERVABILITY module and
+# (see tools._collect_known_secrets). llm_log is a leaf OBSERVABILITY module and
 # must not import the tool subsystem to learn where secrets come from, so it
 # takes this hook and the application entrypoint (main._configure_secret_
-# redaction) injects tools.known_secret_values once at startup -- the same
+# redaction) injects tools.known_secrets_for_log once at startup -- the same
 # leaf/provider inversion _configure_app_logging uses for the log handler.
-_secret_provider: Callable[[], Iterable[str]] | None = None
+#
+# It answers ``(values, complete)``: the values it could read, and whether that
+# is all of them. A provider never has to raise to say it could not read some
+# source -- it says so -- and a body is never checked against a list that is
+# missing values as if that list were whole (see ``_checked_as_stored_and_written``).
+_secret_provider: Callable[[], tuple[Iterable[str], bool]] | None = None
 
 
-def set_secret_provider(provider: Callable[[], Iterable[str]] | None) -> None:
-    """Install the callable that yields the values `_redact` masks out.
+def set_secret_provider(provider: Callable[[], tuple[Iterable[str], bool]] | None) -> None:
+    """Install the callable that yields the values `_redact` masks out, and whether
+    they are all of them.
 
     Idempotent overwrite (last writer wins) -- main calls it once at startup, and
     a test may swap in its own provider and restore it. Passing None disables
-    redaction entirely (the default state before wiring), which is exactly the
-    byte-identical "no known secrets" behavior every path had before D36.
+    redaction entirely (the default state before wiring): there are then no known
+    secrets, which is a whole answer, not a missing one.
     """
     global _secret_provider
     _secret_provider = provider
@@ -402,10 +425,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     copy of this. It is DUPLICATED in each module, not hoisted into a shared home, for
     the same leaf/layering reason the marker is (see ``_REDACTION_MARKER``); the two
     copies MUST stay byte-for-byte in LOCKSTEP so a value masked in a live tool result
-    and one masked in the log are indistinguishable. ``secrets`` are the known values
-    already filtered to ``>= _MIN_SECRET_LEN`` -- each caller produces that list under
-    its OWN failure direction (tools lets a provider error propagate/fail-closed; llm_log
-    swallows one and records unredacted), then hands the masking here.
+    and one masked in the log are indistinguishable. ``secrets`` are the known values in
+    their match forms (``_match_forms``: each value at ``_MIN_SECRET_LEN`` or above, and
+    its newline-normalized form, which may be shorter) -- each caller produces that list
+    under its OWN failure direction (tools lets a provider error propagate/fail-closed;
+    llm_log swallows one and stores, in place of the body, the marker saying it was not
+    recorded), then hands the masking here.
 
     Every mask range is computed against the PRISTINE ``text`` and only THEN applied,
     which is load-bearing (H1). The older order -- full-value ``str.replace`` FIRST, then
@@ -422,9 +447,10 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     secret cut by an EARLIER truncation boundary leaves a prefix the full-value match can
     never catch; a false positive only masks a tail of already-truncated text, and
     INTERIOR fragments are prevented at their sources -- the summary/openapi slices in
-    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut); (2)
-    merge overlapping/adjacent ranges; (3) build the output in ONE pass, emitting exactly
-    one marker per merged range.
+    tool_builder and the tool-args preview in llm.py all redact BEFORE they cut) -- a
+    form shorter than the floor only ever matches whole; (2) merge overlapping/adjacent
+    ranges; (3) build the output in ONE pass, emitting exactly one marker per merged
+    range.
 
     Collecting every occurrence in step (1) is BOUNDED two ways (D36 round-5), because a
     legitimate secret can itself be adversarial input to this search. First, the find
@@ -434,11 +460,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     happens to look like that -- step past each other instead of registering one range
     per shifted start. This can still leave a residual of up to ``len(value) - 1``
     characters at a repeated run's tail (a strict remainder of the run length modulo
-    ``len(value)``); at the ``_MIN_SECRET_LEN`` floor -- the shortest value ever reaches
-    here, and exactly the reported case -- that residual is itself under the floor,
-    exactly as unredactable as any other short substring by the SAME rationale that
-    floor already encodes, and a residual landing at the very END of ``text`` is still
-    separately caught by the trailing-fragment guard above regardless of length. Second,
+    ``len(value)``); for a value at the ``_MIN_SECRET_LEN`` floor -- exactly the reported
+    case -- that residual is itself under the floor, and for a normalized form shorter
+    than the floor it is shorter still, exactly as unredactable as any other short
+    substring by the SAME rationale that floor already encodes, and a residual landing at
+    the very END of ``text`` is still separately caught by the trailing-fragment guard
+    above regardless of length. Second,
     stepping is not sufficient by itself: a sufficiently large low-entropy document can
     still cross ``_MAX_MASK_RANGES`` one ``len(value)``-sized step at a time, so
     collection STOPS the instant it would and this returns the marker ALONE for the
@@ -447,6 +474,12 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     before it is ever sorted, the merge in step (2) is O(n log n) on that bounded n
     rather than on the size of ``text``, and step (3)'s output build remains the single
     pass it always was.
+
+    What it checks is the text it is given. Text a caller puts beside the answer
+    afterwards -- a heading, a prefix, a separator, a truncation marker -- is outside
+    it, and with the text next to it can spell a known value that holds that text; so
+    can a marker this puts in, with the text beside it. A caller that needs its text
+    checked as it is finally used checks it there.
     """
     if not secrets:
         return text
@@ -503,15 +536,57 @@ def _mask_known_secrets(text: str, secrets: list[str]) -> str:
     return "".join(out)
 
 
-def _secret_snapshot() -> list[str]:
-    """The redactable known-secret values, materialized ONCE. [] when there are
-    none, when no provider is wired, or when asking failed.
+def _match_forms(values: Iterable[str]) -> list[str]:
+    """The forms known values are matched and masked in, sorted: each value at the
+    ``_MIN_SECRET_LEN`` floor or above, and that value with its line breaks
+    normalized -- each CRLF, then each lone CR, made an LF.
+
+    Text read in universal-newline mode -- a file read as text, the output of a
+    subprocess -- has its line breaks normalized that way before anything matches
+    or masks it, so a value holding a CR is found there only in its normalized
+    form. The floor is the value's own: a value under it adds no form at all, and
+    the normalized form of a value at it is kept whatever its length -- a derived
+    form may be shorter than the floor. Text that differs from a value only in its
+    line breaks counts as holding it.
+
+    Passing the answer through again gives the same answer: a normalized form under
+    the floor is there beside the value it came from, and a normalized form
+    normalizes to itself. A list that went through this once can go through it again
+    without losing a form.
+    """
+    held = {value for value in values if len(value) >= _MIN_SECRET_LEN}
+    return sorted(held | {value.replace("\r\n", "\n").replace("\r", "\n") for value in held})
+
+
+@dataclass(frozen=True, slots=True)
+class _SecretSnapshot:
+    """One recorded step's known secrets: the values, and whether they are all of them.
+
+    ``values`` are the provider's strings in their match forms (``_match_forms``:
+    each one at the redactor's floor, and its newline-normalized form, whatever that
+    form's length). ``complete`` False means some source could not be read, or
+    asking failed: the values are then a part of the list, and nothing checked
+    against them can be called clean (``_checked_as_stored_and_written``).
+    """
+
+    values: list[str]
+    complete: bool
+
+
+def _secret_snapshot() -> _SecretSnapshot:
+    """The redactable known-secret values, materialized ONCE, and whether that is all.
+
+    Empty and complete when no provider is wired: there are no known secrets.
+    Empty and NOT complete when asking failed -- the call, the iteration, or an
+    answer that is not a ``(values, complete)`` pair: a failure says nothing about
+    what the secrets are, and must not read as "there are none". Otherwise the
+    provider's own word on completeness.
 
     Taken ONE per recorded step (an attempt's whole message list and its advertised
     names together, a response on its own) and handed down to every ``_stored_body``
     that step performs, rather than being re-derived per string. That is a real
-    cost, not tidiness: the provider is ``tools.known_secret_values``, which walks
-    every installed package -- an ``iterdir`` plus a ``stat`` per package, plus a
+    cost, not tidiness: the provider is ``tools.known_secrets_for_log``, which walks
+    every installed package -- an ``listdir`` plus a ``stat`` per package, plus a
     ``.env`` read on every cache miss -- and it runs on the EVENT LOOP, before the
     upstream request goes out. One sweep per string made an attempt that advertises
     N tools do N sweeps over N packages: quadratic filesystem work, synchronously,
@@ -519,15 +594,19 @@ def _secret_snapshot() -> list[str]:
 
     The provider is called INSIDE a broad `except Exception` because of the
     no-observer-failure invariant: the recorder is a pure observer of the LLM
-    call, so a broken/misconfigured secret provider must degrade to "record
-    unredacted", never raise into `begin_attempt`/`record_response`/the sink and
-    turn a successful call into a logging crash. The materialization+filter runs
-    INSIDE that guard (F5): the provider may be a LAZY iterable that raises at YIELD
-    time, and a non-str element would raise downstream, so we keep only ``str`` values
-    meeting ``_MIN_SECRET_LEN`` in the same guarded pass -- any failure (call,
-    iteration, or a bad element) still degrades to "record unredacted". The length
-    floor also drops the empty string (``str.replace("", m)`` would splice the marker
-    between every character) and a 1-5 char value (see that constant).
+    call, so a broken/misconfigured secret provider must never raise into
+    `begin_attempt`/`record_response`/the sink and turn a successful call into a
+    logging crash. The materialization+filter runs INSIDE that guard: the
+    provider may hand back a LAZY iterable that raises at YIELD time, and a non-str
+    element would raise downstream, so we keep only ``str`` values, put in their
+    match forms (``_match_forms``) in the same guarded pass -- any failure (call,
+    iteration, or a bad element) still ends in an incomplete snapshot. The
+    provider hands over the values themselves; ``_match_forms`` applies the length
+    floor to each one -- dropping the empty string (``str.replace("", m)`` would
+    splice the marker between every character) and a 1-5 char value (see that
+    constant) -- and adds the newline-normalized form of each value it keeps,
+    whatever that form's length: text this module stores was often read with
+    universal newlines, which leaves a value holding a CR only in that form.
 
     Snapshotting also makes one step's masking SELF-CONSISTENT: every string in an
     attempt is now judged against the same secret set, instead of message 1 seeing
@@ -538,15 +617,13 @@ def _secret_snapshot() -> list[str]:
     """
     provider = _secret_provider
     if provider is None:
-        return []
+        return _SecretSnapshot([], True)
     try:
-        return [
-            value
-            for value in provider()
-            if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN
-        ]
+        found, complete = provider()
+        values = _match_forms(value for value in found if isinstance(value, str))
     except Exception:
-        return []
+        return _SecretSnapshot([], False)
+    return _SecretSnapshot(values, complete is True)
 
 
 def _redact(text: str, secrets: list[str]) -> str:
@@ -556,10 +633,10 @@ def _redact(text: str, secrets: list[str]) -> str:
     a secret must be scrubbed BEFORE truncation could split it, or half of a key
     straddling the cap edge would survive in the record.
 
-    ``secrets`` is a ``_secret_snapshot`` the CALLER took (see there for why the
-    snapshot is per step rather than per string); an empty list means "nothing to
-    mask", which is the byte-identical no-known-secrets behaviour every path had
-    before D36.
+    ``secrets`` is the values of a ``_secret_snapshot`` the CALLER took (see there
+    for why the snapshot is per step rather than per string); an empty list means
+    "nothing to mask". Whether that list is whole is not this stage's question:
+    ``_checked_as_stored_and_written`` answers it for the stored text.
 
     The masking itself -- the shared ``_mask_known_secrets`` (byte-identical to
     ``tools``' copy, see that helper) -- runs inside this function's OWN guard (D36
@@ -581,7 +658,7 @@ def _redact(text: str, secrets: list[str]) -> str:
         return text
 
 
-# --- stored-body safety: redact, THEN UTF-8-safe, THEN size-capped ----------
+# --- stored-body safety: redact, UTF-8-safe, size-capped, checked as stored and as written ---
 
 
 def _utf8_safe(text: str) -> str:
@@ -624,16 +701,21 @@ def _utf8_safe(text: str) -> str:
 _BODY_TRUNCATION_MARKER = "…[紀錄過長已截斷]"
 
 
-def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
+def _stored_body(text: str, secrets: _SecretSnapshot) -> tuple[str, bool]:
     """Make ``text`` safe AND small enough to store; return (stored, truncated).
 
     The single choke point every request-message/response body passes through
-    before it is written into an attempt, in a THREE-stage order that each
+    before it is written into an attempt, in a FOUR-stage order that each
     guards a distinct hazard: ``_redact`` FIRST, then ``_utf8_safe``, then the
     hard cut to ``settings.llm_log_body_max_chars`` (with
-    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens). "Body" is its
-    origin, not its scope: an attempt's advertised tool NAMES run through it too
-    (see ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
+    ``_BODY_TRUNCATION_MARKER`` appended when a cut happens), and last the check
+    of what is stored, both as the string itself and in the form a JSON line
+    writes it (``_checked_as_stored_and_written``): a body that spells a known
+    secret in either form -- through its replacement characters, the cut or its
+    escapes -- is stored as the redaction marker, and one that could not be
+    checked as the marker saying it was not recorded. "Body" is its origin, not
+    its scope: an attempt's advertised tool NAMES run through it too (see
+    ``LlmInteractionRecorder.begin_attempt``), so that every stored string a
     record holds that could carry operator/LLM/filesystem text reaches its sinks
     through here. The one string that does not is a message's ``role``, and that
     is deliberate: it is a closed vocabulary this codebase writes itself
@@ -645,19 +727,19 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     size cut is the load-bearing reason: a secret value straddling the
     truncation edge must not be half-scrubbed and half-survive, so it has to be
     replaced while the body is still whole. (Against ``_utf8_safe`` the order is
-    harmless either way -- API keys/tokens are plain ASCII, which the surrogate
-    pass never alters -- but redact-first is the correct, edge-independent order
-    regardless.) Because this is the ONE choke point, redaction reaches ALL
-    stored bodies -- every request message and every response -- and both sinks
-    (the ring and the JSONL file) see the SAME already-redacted record.
+    not what keeps a body clean: the U+FFFD it puts in after masking can complete
+    a known value that holds them, and the last stage, which checks the stored
+    string itself, is what catches that.) Because this is the ONE choke point,
+    redaction reaches ALL stored bodies -- every request message and every
+    response. The ring and the detail API hold what this stores. The JSONL sink
+    writes it too, but checks each whole line once more as it is appended
+    (``_checked_line``), so a line can hold a marker where the ring holds the
+    body: the two sinks have the same shape, not always the same text.
 
-    ``_utf8_safe`` must in turn run before the slice: it never enlarges the text
-    (one surrogate becomes one U+FFFD), and once it has run the string holds
-    only valid Unicode scalar values, so slicing it by Python's
-    code-point-based indexing can never land inside what used to be a lone
-    surrogate. Truncating first would risk cutting a bare surrogate at the
-    boundary and handing ``_utf8_safe`` a different (index-shifted) string than
-    the one actually stored.
+    ``_utf8_safe`` must in turn run before the slice: it can lengthen the text --
+    one lone surrogate becomes three U+FFFD -- so only a cut made after it holds
+    the stored body to the cap, and the string it hands on holds only valid
+    Unicode scalar values, which any slice of it does too.
 
     Without the size cap, a broken or hostile OpenAI-*compatible* gateway
     returning a multi-MB body would be kept in full (per attempt, and echoed
@@ -674,19 +756,77 @@ def _stored_body(text: str, secrets: list[str]) -> tuple[str, bool]:
     called once per string, while the sweep behind that list is per-package
     filesystem work on the event loop (see ``_secret_snapshot``). A default would
     make "forgot to hoist it" the quiet, working spelling -- which is exactly the
-    shape the advertised names were written in.
+    shape the advertised names were written in. A snapshot that is not whole
+    stores ``_UNCHECKED_MARKER`` in place of the body
+    (``_checked_as_stored_and_written``).
     """
-    safe = _utf8_safe(_redact(text, secrets))
+    safe = _utf8_safe(_redact(text, secrets.values))
     cap = get_settings().llm_log_body_max_chars
     if len(safe) <= cap:
-        return safe, False
+        return _checked_as_stored_and_written(safe, secrets), False
     marker_len = len(_BODY_TRUNCATION_MARKER)
     if cap <= marker_len:
-        return safe[:cap], True
-    return safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER, True
+        return _checked_as_stored_and_written(safe[:cap], secrets), True
+    cut = safe[: cap - marker_len] + _BODY_TRUNCATION_MARKER
+    return _checked_as_stored_and_written(cut, secrets), True
 
 
-def _message_text(content: Any, secrets: list[str]) -> tuple[str, bool]:
+def _checked_as_stored_and_written(stored: str, secrets: _SecretSnapshot) -> str:
+    """``stored``, or a marker when it holds a known secret, as stored or as written, or may.
+
+    The last stage of ``_stored_body``. It looks at two forms of the same string,
+    because the record is handed on in two: the ring, the detail API and the
+    AI 日誌 page take ``stored`` itself, and the JSONL sink writes it as a JSON
+    string literal (``json.dumps(..., ensure_ascii=False)``, as
+    ``_write_file_sink`` does). ``_redact`` worked on the text before either form
+    existed, and each can hold what that text did not:
+
+    * as stored: what the stages after masking put in -- three U+FFFD where
+      ``_utf8_safe`` met one lone surrogate, ``_BODY_TRUNCATION_MARKER`` after a
+      cut -- was not there when the text was masked, and with the characters
+      beside it can complete a known value that holds it;
+    * as written: a line break is written as ``\\n``, a quote as ``\\"``, a
+      backslash as ``\\\\``, a control character as ``\\uXXXX``. A PEM registered
+      from a single-quoted ``.env`` line keeps its ``\\n`` as those two
+      characters, so a body holding that key with real line breaks would land on
+      disk as exactly the secret's bytes.
+
+    Neither form answers for the other. A known value that holds a character JSON
+    escapes -- three U+FFFD and a quote, say -- can be whole in ``stored`` and
+    absent from its literal, which writes the quote as ``\\"``; an escape is only
+    in the literal. Each form is checked with this module's own matcher
+    (``_mask_known_secrets``, so a whole value, a trailing prefix of one and the
+    range cap all count), and a body it would change in either form is stored as
+    ``_REDACTION_MARKER``, whole: masking inside the literal would mean cutting
+    into escapes.
+
+    It can only call a body clean against a list that is whole. When the snapshot
+    is not complete -- some ``.env`` could not be read, or asking failed -- a value
+    it lacks may be exactly what the replacement characters or the escapes spell,
+    and nothing here can tell, so ``_UNCHECKED_MARKER`` is stored instead of the
+    body: not recorded, which is not "a secret was found". The same when this
+    check itself fails: unchecked is not clean. Either way the recording goes on,
+    and the call it records is untouched: only the body is withheld.
+
+    What it does not cover: a difference of representation an exact match cannot
+    see -- a secret registered with a real line break that a body spells as the
+    two characters ``\\n``, a value encoded another way (base64, say), a ``.env``
+    value whose undecodable bytes were replaced when it was read.
+    """
+    if not secrets.complete:
+        return _UNCHECKED_MARKER
+    try:
+        if _mask_known_secrets(stored, secrets.values) != stored:
+            return _REDACTION_MARKER
+        literal = json.dumps(stored, ensure_ascii=False)[1:-1]
+        if _mask_known_secrets(literal, secrets.values) != literal:
+            return _REDACTION_MARKER
+    except Exception:
+        return _UNCHECKED_MARKER
+    return stored
+
+
+def _message_text(content: Any, secrets: _SecretSnapshot) -> tuple[str, bool]:
     """Coerce a message ``content`` to its STORED (safe, size-capped) text.
 
     Every message this codebase sends carries a plain string content, so the
@@ -738,7 +878,7 @@ def _names_elision_marker(count: int) -> str:
     return f"…[另 {count} 項工具已省略以控制紀錄大小]"
 
 
-def _bounded_tool_names(names: list[str], secrets: list[str]) -> tuple[list[str], bool]:
+def _bounded_tool_names(names: list[str], secrets: _SecretSnapshot) -> tuple[list[str], bool]:
     """Store one attempt's advertised tool names, BOUNDED. Returns (stored, cut).
 
     Each name goes through ``_stored_body`` -- the same choke point every message
@@ -895,6 +1035,7 @@ class LlmInteractionRecorder:
         "_attempts",
         "_finished",
         "_id",
+        "_known",
         "_model",
         "_started_at",
         "_started_monotonic",
@@ -908,6 +1049,10 @@ class LlmInteractionRecorder:
         self._started_at = datetime.now(UTC).isoformat()
         self._started_monotonic = time.monotonic()
         self._attempts: list[LlmAttempt] = []
+        # Every known value a step's snapshot held, for the check of the JSONL line
+        # (``_write_file_sink``): a value no longer registered when the line is
+        # written is still looked for there.
+        self._known: set[str] = set()
         self._finished = False
 
     @property
@@ -986,6 +1131,7 @@ class LlmInteractionRecorder:
         over N packages. See ``_secret_snapshot``.
         """
         secrets = _secret_snapshot()
+        self._known.update(secrets.values)
         stored: list[dict[str, str]] = []
         truncated = False
         for msg in messages:
@@ -1043,7 +1189,9 @@ class LlmInteractionRecorder:
         """
         if self._attempts:
             attempt = self._attempts[-1]
-            stored, was_truncated = _stored_body(content, _secret_snapshot())
+            secrets = _secret_snapshot()
+            self._known.update(secrets.values)
+            stored, was_truncated = _stored_body(content, secrets)
             attempt.response_content = stored
             attempt.response_chars = len(stored)
             attempt.truncated = attempt.truncated or was_truncated
@@ -1091,7 +1239,7 @@ class LlmInteractionRecorder:
                 _get_ring().append(record)
             # Both sinks below run OUTSIDE the lock: a slow disk or logging
             # handler must not serialize concurrent interactions behind it.
-            _write_file_sink(record)
+            _write_file_sink(record, self._known)
             _log_summary(record)
         except Exception:
             # Last-resort guard: the record is best-effort. Emit one safe line
@@ -1119,7 +1267,9 @@ def _record_detail(record: LlmInteractionRecord) -> dict[str, Any]:
     """Full record as a JSON-ready dict, attempt bodies included.
 
     Shared by ``get_record`` (the detail API) and the JSONL sink, so the two can
-    never disagree on the on-the-wire shape. Per-attempt ``request_chars`` /
+    never disagree on the on-the-wire shape. The sink checks the line it makes
+    from this once more (``_checked_line``) and can write a marker in place of a
+    text, which leaves the shape as it is. Per-attempt ``request_chars`` /
     ``response_chars`` / ``usage`` / ``truncated`` are this attempt's OWN
     figures (see ``LlmAttempt``) -- distinct from the top-level ``usage``
     above, which is the INTERACTION-level sum across every attempt.
@@ -1171,6 +1321,269 @@ def _record_summary(record: LlmInteractionRecord) -> dict[str, Any]:
     }
 
 
+# --- a JSONL line, checked as written ---------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _Fixed:
+    """A value written as fixed content, whole, for ``_encode_spans``.
+
+    Everything inside is fixed: a string with its quotes, a number, a list or a
+    mapping with its keys. It marks what the backend decides, never text it was
+    handed.
+    """
+
+    value: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _Record:
+    """A mapping keyed by the backend's own literals, for ``_encode_spans``: its keys
+    are fixed content, and each value is marked by what it is."""
+
+    fields: dict[str, Any]
+
+
+def _encode_spans(value: Any, indent: int | None) -> tuple[str, list[tuple[int, int]]]:
+    """``value`` as ``json.dumps(value, ensure_ascii=False, indent=indent)`` writes it,
+    and where in that text the free text is.
+
+    ``value`` is JSON data with parts marked (``_Fixed``, ``_Record``). The text is
+    the same, character for character, as ``json.dumps`` writes the data with the
+    marks taken off: the same separators (``", "`` and ``": "``, or ``","`` and a
+    new line indented by ``indent`` per level), ``[]`` and ``{}`` for an empty
+    container, and each string and number as ``json.dumps`` writes it alone.
+
+    Free text is what a check of the written text has to take as coming from
+    outside: what is between the quotes of a string, escapes as written, and the
+    digits of a number, unless it is inside a ``_Fixed``; and the keys of a
+    mapping that is not a ``_Record``. Everything else is fixed content:
+    punctuation and white space, the quotes of every string, ``null``, ``true``
+    and ``false`` (they hold no character of anything given), the keys of a
+    ``_Record``, and all of a ``_Fixed``. The free text comes back as
+    ``(start, end)`` ranges of the text, in order and apart.
+
+    A key that is not a string raises ``TypeError``, as a value of a type JSON has
+    no form for does.
+    """
+    pieces: list[str] = []
+    free: list[tuple[int, int]] = []
+    size = 0
+
+    def put(text: str, start: int = 0, end: int = 0) -> None:
+        # ``text[start:end]`` is free text.
+        nonlocal size
+        if start < end:
+            free.append((size + start, size + end))
+        pieces.append(text)
+        size += len(text)
+
+    def layout(level: int) -> tuple[str, str, str]:
+        # What opens, separates and closes the items of a container at ``level``.
+        if indent is None:
+            return "", ", ", ""
+        inner = "\n" + " " * (indent * (level + 1))
+        return inner, "," + inner, "\n" + " " * (indent * level)
+
+    def walk(item: Any, level: int, fixed: bool) -> None:
+        if isinstance(item, _Fixed):
+            walk(item.value, level, True)
+        elif isinstance(item, _Record):
+            mapping(item.fields, level, fixed, True)
+        elif isinstance(item, dict):
+            mapping(item, level, fixed, fixed)
+        elif isinstance(item, (list, tuple)):
+            if not item:
+                put("[]")
+                return
+            opening, separator, closing = layout(level)
+            put("[" + opening)
+            for index, element in enumerate(item):
+                if index:
+                    put(separator)
+                walk(element, level + 1, fixed)
+            put(closing + "]")
+        elif item is None or item is True or item is False:
+            put(json.dumps(item))
+        elif isinstance(item, str):
+            literal = json.dumps(item, ensure_ascii=False)
+            put(literal, 1, 0 if fixed else len(literal) - 1)
+        elif isinstance(item, (int, float)):
+            literal = json.dumps(item)
+            put(literal, 0, 0 if fixed else len(literal))
+        else:
+            raise TypeError(f"Object of type {type(item).__name__} is not JSON serializable")
+
+    def mapping(fields: dict[Any, Any], level: int, fixed: bool, keys_fixed: bool) -> None:
+        if not fields:
+            put("{}")
+            return
+        opening, separator, closing = layout(level)
+        put("{" + opening)
+        for index, (key, item) in enumerate(fields.items()):
+            if not isinstance(key, str):
+                raise TypeError(f"keys must be str, not {type(key).__name__}")
+            if index:
+                put(separator)
+            literal = json.dumps(key, ensure_ascii=False)
+            put(literal, 1, 0 if keys_fixed else len(literal) - 1)
+            put(": ")
+            walk(item, level + 1, fixed)
+        put(closing + "}")
+
+    walk(value, 0, False)
+    return "".join(pieces), free
+
+
+def _touches_free_text(text: str, free: list[tuple[int, int]], secrets: list[str]) -> bool:
+    """Whether a known value occurs in ``text`` where the occurrence takes in free text.
+
+    ``free`` is where the free text is, as ``_encode_spans`` gives it. Every
+    occurrence of every value counts, overlapping ones too; one that lies wholly
+    outside ``free`` -- in fixed content -- passes, since the backend's own
+    characters spell it. Only whole occurrences count: the text was not cut.
+
+    After an occurrence that passes, the search goes on from the first place an
+    occurrence could reach the next free range: those it skips lie in fixed
+    content, and every occurrence that takes in free text is still seen. Nothing
+    found is kept, and the first occurrence that takes in free text ends the
+    search; per value, the work is one pass over the text and one search for each
+    free range at most.
+    """
+    ends = [end for _, end in free]
+    for value in secrets:
+        if not value:
+            # Found everywhere and never a secret: no match form is empty.
+            continue
+        size = len(value)
+        at = text.find(value)
+        while at != -1:
+            index = bisect.bisect_right(ends, at)
+            if index == len(ends):
+                break
+            start = free[index][0]
+            if start < at + size:
+                return True
+            at = text.find(value, start - size + 1)
+    return False
+
+
+# A word a record holds from the backend's own vocabulary -- a workflow, an outcome,
+# a message's role -- is a lowercase identifier, which is the shape the callers pass
+# in. A value of this shape is fixed content in a JSON line; any other is text.
+_WORD_SHAPE = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
+def _line_document(detail: dict[str, Any], marker: str | None) -> _Record:
+    """``detail`` (``_record_detail``) marked for ``_encode_spans``, as a JSON line holds it.
+
+    Fixed content: every key -- this module's own literals, written by
+    ``_record_detail``, ``begin_attempt``, ``_apply_total_budget`` and
+    ``_extract_usage`` -- and the values whose shape the backend decides: ``id``
+    (``_allocate_id``), ``started_at`` and ``finished_at``
+    (``datetime.now(UTC).isoformat()``), ``duration_ms``, ``usage``
+    (``_extract_usage``, ``_aggregate_usage``), ``request_chars``,
+    ``response_chars`` and ``truncated``; and ``workflow``, ``outcome`` and a
+    message's ``role`` when each has ``_WORD_SHAPE``. Text: ``model``, ``error``,
+    a message's ``content``, ``response_content``, each advertised name, and a
+    word of any other shape. The value of a key not named here is free text no
+    marker replaces: nothing vouched for it.
+
+    With ``marker``, every text is the marker, fixed content, and an attempt's
+    ``request_chars`` and ``response_chars`` count the marker the line holds in
+    place of each body. Every container is new: ``detail`` holds the record's own
+    lists, which the ring keeps.
+    """
+
+    def text(value: Any) -> Any:
+        return _Fixed(marker) if marker is not None and isinstance(value, str) else value
+
+    def word(value: Any) -> Any:
+        if isinstance(value, str) and _WORD_SHAPE.fullmatch(value):
+            return _Fixed(value)
+        return text(value)
+
+    def message(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        return _Record(
+            {
+                key: word(value) if key == "role" else text(value) if key == "content" else value
+                for key, value in item.items()
+            }
+        )
+
+    def attempt(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        fields: dict[str, Any] = {}
+        for key, value in item.items():
+            if key in ("request_chars", "response_chars", "usage", "truncated"):
+                fields[key] = _Fixed(value)
+            elif key in ("response_content", "error"):
+                fields[key] = text(value)
+            elif key == "request_messages" and isinstance(value, list):
+                fields[key] = [message(entry) for entry in value]
+            elif key == "tools_advertised" and isinstance(value, list):
+                fields[key] = [text(name) for name in value]
+            else:
+                fields[key] = value
+        if marker is not None:
+            messages = item.get("request_messages")
+            if "request_chars" in fields and isinstance(messages, list):
+                bodies = sum(
+                    isinstance(entry, dict) and isinstance(entry.get("content"), str)
+                    for entry in messages
+                )
+                fields["request_chars"] = _Fixed(len(marker) * bodies)
+            if "response_chars" in fields and isinstance(item.get("response_content"), str):
+                fields["response_chars"] = _Fixed(len(marker))
+        return _Record(fields)
+
+    fields: dict[str, Any] = {}
+    for key, value in detail.items():
+        if key in ("id", "started_at", "finished_at", "duration_ms", "usage"):
+            fields[key] = _Fixed(value)
+        elif key in ("workflow", "outcome"):
+            fields[key] = word(value)
+        elif key in ("model", "error"):
+            fields[key] = text(value)
+        elif key == "attempts" and isinstance(value, list):
+            fields[key] = [attempt(entry) for entry in value]
+        else:
+            fields[key] = value
+    return _Record(fields)
+
+
+def _checked_line(detail: dict[str, Any], secrets: _SecretSnapshot) -> str | None:
+    """The line the file sink appends for ``detail``, its new line included; None for none.
+
+    ``json.dumps(detail, ensure_ascii=False)`` and a new line, made by
+    ``_encode_spans`` from ``_line_document`` and checked as it is appended, the
+    new line as fixed content: every occurrence of a known value counts,
+    overlapping ones too, and one wholly in fixed content passes
+    (``_touches_free_text``). One that takes in free text -- a key and the start
+    of a body, the end of a body and the new line -- sends every text of the line
+    to ``_REDACTION_MARKER`` and the line is checked again; one that still takes
+    in free text is in a value nothing vouched for, and there is no line. A list
+    that is not whole calls no text clean: every text of the line is
+    ``_UNCHECKED_MARKER``, and there is a line only when no free text is left.
+    Only the line changes; the ring and the detail API keep the record as stored.
+
+    Each line is checked on its own: a known value that would run from the end of
+    one line into the start of the next is not seen.
+    """
+    markers: tuple[str | None, ...] = (
+        (None, _REDACTION_MARKER) if secrets.complete else (_UNCHECKED_MARKER,)
+    )
+    for marker in markers:
+        line, free = _encode_spans(_line_document(detail, marker), None)
+        line += "\n"
+        if not free or (secrets.complete and not _touches_free_text(line, free, secrets.values)):
+            return line
+    return None
+
+
 # Serializes the ENTIRE stat -> maybe-rotate -> append sequence of the JSONL sink
 # (F8). Deliberately NOT the ring's ``_LOCK``: the design keeps slow file I/O OUT of
 # the ring's critical section (see the module docstring -- both sinks run outside
@@ -1205,11 +1618,22 @@ def _rotate_file_sink(path: str) -> None:
     the deliberate operator-robustness choice, and rotation slots in AHEAD of it
     rather than holding a long-lived handle).
 
+    A rename onto a name a file already holds replaces that file, so the target
+    is a name seen empty. Two rotations within the same second share a stamp: the
+    target is the first of ``<stamp>``, ``<stamp>-1``, ... ``<stamp>-100`` that a
+    ``lstat`` sees is not there (``FileNotFoundError``); a name where it sees
+    anything -- a file, a broken link -- is passed over for the next one. A
+    ``lstat`` that fails any other way says nothing about what is there, so that
+    rotation does not happen; neither does one with all 101 names taken. What it
+    does not cover: an entry another process makes at the name between the look
+    and the rename (this process's rotations take ``_FILE_SINK_LOCK`` in turn).
+
     Every failure is fully suppressed -- the same never-break-the-caller contract
     the sink itself carries. A missing file (the first-ever write) makes
     ``getsize`` raise ``OSError`` and simply means "nothing to rotate"; a failed
-    rename leaves the file in place and the append proceeds onto it (oversized,
-    but recorded), never surfacing an error. The broad final ``except Exception``
+    rename, or a rotation given up as above, leaves the file in place and the
+    append proceeds onto it (oversized, but recorded; the next append tries
+    again), never surfacing an error. The broad final ``except Exception``
     backstops even a pathological ``get_settings``/``strftime``, because this
     helper runs OUTSIDE ``_write_file_sink``'s own try and MUST NOT be the thing
     that breaks a recording. NO retention/deletion of the rotated segments is
@@ -1227,25 +1651,21 @@ def _rotate_file_sink(path: str) -> None:
         return
     stamp = _rotation_stamp()
     with contextlib.suppress(Exception):
-        # F8(b): two rotations within the SAME second would collide on the timestamped
-        # name (and, absent the _FILE_SINK_LOCK serialization, could clobber each
-        # other). Find a free target: ``<stamp>``, then ``<stamp>-1``, ``-2``, ... --
-        # ``lexists`` so a broken symlink or any pre-existing entry still counts as
-        # taken. Bounded: after 100 tries, GIVE UP rotating and return (the append that
-        # follows lands on the still-oversized file, one write past the cap, which the
-        # next write rotates) -- all inside the suppress, since rotation is best-effort
-        # and must never break the sink.
-        target = f"{path}.{stamp}"
-        suffix = 0
-        while os.path.lexists(target):
-            suffix += 1
-            if suffix > 100:
+        for suffix in range(101):
+            target = f"{path}.{stamp}" if suffix == 0 else f"{path}.{stamp}-{suffix}"
+            try:
+                os.lstat(target)
+            except FileNotFoundError:
+                # Seen not to be there: the only answer that lets the rename use it.
+                os.rename(path, target)
                 return
-            target = f"{path}.{stamp}-{suffix}"
-        os.rename(path, target)
+            except OSError:
+                # The look failed: an earlier segment may be there. No rotation this time.
+                return
+            # Something is there: try the next name.
 
 
-def _write_file_sink(record: LlmInteractionRecord) -> None:
+def _write_file_sink(record: LlmInteractionRecord, known: Iterable[str] = ()) -> None:
     """Append the full record as one JSON line to ``settings.llm_log_file``.
 
     Off entirely when the setting is empty (the default). Opened/written/closed
@@ -1253,20 +1673,40 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     the file between calls. Before each append, ``_rotate_file_sink`` renames the
     file aside if it has grown past ``llm_log_file_max_bytes`` (D34), so the
     still-per-write open below lands on a fresh file after a rotation. A write
-    failure must NEVER break the LLM call, so the catch below is ``Exception``,
+    failure must NEVER break the LLM call, so the catches below are ``Exception``,
     not just ``OSError``: the stated contract is "sink failures never break the
     LLM call", full stop, and an OSError-only catch does not actually keep it --
     e.g. a body that ever reached here without going through ``_utf8_safe`` could
     raise ``UnicodeEncodeError`` (a ``ValueError`` subclass, not an ``OSError``)
     on the ``.write`` below, and a future non-JSON-safe field could raise from
-    ``json.dumps`` itself. The filename is the operator's own config (not a
+    the encoder itself. The filename is the operator's own config (not a
     secret) so naming it is fine and useful, but only its CATEGORY is logged,
     never ``str(exc)`` (which could carry additional path detail without adding
     diagnostic value). ``ensure_ascii=False`` keeps CJK memory content readable
     in the file rather than escaped.
+
+    What is appended is checked as it is appended (``_checked_line``), against
+    ``known`` -- every value the recorder's steps knew, so one no longer
+    registered is still looked for -- and a snapshot taken here, which also says
+    whether the list is whole: one more sweep of the provider, made only while
+    the sink is on. When there is no line to append, one warning says so, with
+    the record's id and nothing of its content.
     """
     path = get_settings().llm_log_file.strip()
     if not path:
+        return
+    try:
+        fresh = _secret_snapshot()
+        secrets = _SecretSnapshot(sorted({*fresh.values, *known}), fresh.complete)
+        line = _checked_line(_record_detail(record), secrets)
+    except Exception as exc:
+        logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
+        return
+    if line is None:
+        logger.warning(
+            "llm log file sink left out record %s: its line would hold a known secret value",
+            record.id,
+        )
         return
     # F8(a): serialize the ENTIRE rotate + append under the dedicated _FILE_SINK_LOCK
     # (never the ring's _LOCK -- see that lock's comment) so two interactions
@@ -1274,7 +1714,6 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
     with _FILE_SINK_LOCK:
         _rotate_file_sink(path)
         try:
-            line = json.dumps(_record_detail(record), ensure_ascii=False)
             with open(path, "a", encoding="utf-8") as handle:
                 # A failure mid-write (e.g. disk full) can still leave a truncated,
                 # unparsable final line even though the whole write sits inside
@@ -1283,7 +1722,7 @@ def _write_file_sink(record: LlmInteractionRecord) -> None:
                 # transactional write (temp file + atomic rename) here, so a JSONL
                 # consumer should tolerate/skip a trailing line that fails to
                 # json.loads rather than assume every line is well-formed.
-                handle.write(line + "\n")
+                handle.write(line)
         except Exception as exc:
             logger.warning("llm log file sink write failed (%s): %s", path, type(exc).__name__)
 

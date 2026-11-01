@@ -3,13 +3,16 @@ import { describe, expect, it } from "vitest";
 import {
 	acceptSummaryForVersion,
 	buildDiscardRequest,
+	buildDraftPublishRequest,
 	buildRegenerateRequest,
 	buildReviseRequest,
 	clearLineageUnavailable,
+	DRAFT_REFUSAL_CODES,
 	deepLinkTarget,
 	logLinkSearch,
 	markLineageUnavailable,
 	ownSummaryBusy,
+	publishRefusalNotification,
 	reviseRefusalNotification,
 	summaryErrorRevalidates,
 	toolIdentityConsumers,
@@ -187,6 +190,98 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 		});
 	});
 
+	it("names the draft a round continues, and expects the draft's base version", () => {
+		const continuation = {
+			draftId: "0123456789abcdef0123456789abcdef",
+			generation: 4,
+			baseVid: "20260727T010203Z-def456",
+		};
+		expect(buildReviseRequest({ name, currentVid, continuation })).toEqual({
+			path: "/api/tools/kb_search/revise",
+			body: {
+				expected_vid: "20260727T010203Z-def456",
+				draft_id: "0123456789abcdef0123456789abcdef",
+				draft_generation: 4,
+			},
+		});
+		expect(
+			buildReviseRequest({
+				name,
+				currentVid,
+				continuation,
+				feedback: "先試第二頁",
+				runIds: [7],
+			}).body,
+		).toEqual({
+			expected_vid: "20260727T010203Z-def456",
+			draft_id: "0123456789abcdef0123456789abcdef",
+			draft_generation: 4,
+			feedback: "先試第二頁",
+			run_ids: [7],
+		});
+		expect(
+			buildReviseRequest({
+				name,
+				currentVid,
+				continuation,
+				feedback: "",
+				runIds: [],
+			}).body,
+		).toEqual({
+			expected_vid: "20260727T010203Z-def456",
+			draft_id: "0123456789abcdef0123456789abcdef",
+			draft_generation: 4,
+		});
+	});
+
+	it("sends no draft identity for a revise that starts over", () => {
+		for (const continuation of [undefined, null]) {
+			const { body } = buildReviseRequest({
+				name,
+				currentVid,
+				runIds: [7],
+				continuation,
+			});
+			expect(body).toEqual({ run_ids: [7], expected_vid: currentVid });
+		}
+	});
+
+	it("names the draft a publish goes from, and expects the draft's base version", () => {
+		expect(
+			buildDraftPublishRequest({
+				name,
+				draftId: "0123456789abcdef0123456789abcdef",
+				generation: 4,
+				baseVid: "20260727T010203Z-def456",
+			}),
+		).toEqual({
+			path: "/api/tools/kb_search/draft/publish",
+			body: {
+				draft_id: "0123456789abcdef0123456789abcdef",
+				draft_generation: 4,
+				expected_vid: "20260727T010203Z-def456",
+			},
+		});
+	});
+
+	it("sends nothing but the draft's identity with a publish, whatever else the caller holds", () => {
+		const { body } = buildDraftPublishRequest({
+			name,
+			draftId: "0123456789abcdef0123456789abcdef",
+			generation: 4,
+			baseVid: "20260727T010203Z-def456",
+			currentVid,
+			jobAttributionKey: "x",
+			feedback: "notes",
+			runIds: [7],
+		});
+		expect(Object.keys(body).sort()).toEqual([
+			"draft_generation",
+			"draft_id",
+			"expected_vid",
+		]);
+	});
+
 	it("puts expected_vid in the regenerate body", () => {
 		expect(buildRegenerateRequest({ name, currentVid })).toEqual({
 			path: "/api/tools/kb_search/summary/regenerate",
@@ -196,7 +291,7 @@ describe("Invariant K — every version-specific write carries the vid", () => {
 
 	it("puts the expected vid in the discard path", () => {
 		expect(buildDiscardRequest({ name, currentVid })).toEqual({
-			path: `/api/tools/kb_search/versions/${currentVid}`,
+			path: "/api/tools/kb_search/versions/20260728T010203Z-abc123",
 		});
 	});
 });
@@ -207,8 +302,22 @@ describe("versionWriteConflictReaction", () => {
 		["job_busy", "retry"],
 		["ai_job_in_progress", "retry"],
 		["lineage_unavailable", "delete-tool"],
+		["draft_pending", "refresh"],
+		["draft_gone", "refresh"],
+		["draft_changed", "refresh"],
+		["draft_unusable", "refresh"],
+		["draft_publishing", "refresh"],
 	])("maps %s to its distinct reaction", (code, reaction) => {
 		expect(versionWriteConflictReaction({ status: 409, code })).toBe(reaction);
+	});
+
+	it("knows exactly the four draft refusals a continued round or a publish can meet", () => {
+		expect([...DRAFT_REFUSAL_CODES].sort()).toEqual([
+			"draft_changed",
+			"draft_gone",
+			"draft_publishing",
+			"draft_unusable",
+		]);
 	});
 
 	it("never branches on a message or on status alone", () => {
@@ -560,6 +669,154 @@ describe("reviseRefusalNotification", () => {
 		).toBeNull();
 		expect(reviseRefusalNotification({ status: 404 })).toBeNull();
 		expect(reviseRefusalNotification(undefined)).toBeNull();
+	});
+
+	it("keeps a draft_pending refusal on screen with the backend's instruction", () => {
+		const message =
+			"這個工具有一份可以接續的未完成修正（草稿）。請在工具列接續它，或取回需要的檔案後放棄它。";
+		expect(
+			reviseRefusalNotification({
+				status: 409,
+				code: "draft_pending",
+				message,
+			}),
+		).toEqual({
+			color: "orange",
+			title: "修訂未送出：這個工具有未完成的修正",
+			message,
+			autoClose: false,
+		});
+	});
+
+	it("takes a draft_pending refusal by its code, not by its status alone", () => {
+		expect(
+			reviseRefusalNotification({ status: 409, code: "job_busy" }),
+		).toBeNull();
+		expect(
+			reviseRefusalNotification({ status: 400, code: "draft_pending" }),
+		).toBeNull();
+	});
+});
+
+describe("reviseRefusalNotification for a continued round's draft", () => {
+	const notice = (code) =>
+		reviseRefusalNotification({
+			status: 409,
+			code,
+			message: "the backend's words",
+		});
+
+	it.each(
+		DRAFT_REFUSAL_CODES,
+	)("says in its own words why %s sent nothing, and that the list is read again", (code) => {
+		const shown = notice(code);
+		expect(shown).not.toBeNull();
+		expect(shown.color).toBe("orange");
+		expect(shown.title).toContain("接續未送出");
+		expect(shown.message).not.toBe("the backend's words");
+		expect(shown.message).toContain("重新讀取清單");
+	});
+
+	it("tells the four apart", () => {
+		expect(notice("draft_gone").message).toContain("不在了");
+		expect(notice("draft_changed").message).toContain("已經變更");
+		expect(notice("draft_unusable").message).toContain("無法使用");
+		expect(notice("draft_unusable").message).toContain("取回");
+		expect(notice("draft_publishing").message).toContain("發布");
+		const messages = DRAFT_REFUSAL_CODES.map((code) => notice(code).message);
+		expect(new Set(messages).size).toBe(DRAFT_REFUSAL_CODES.length);
+		const titles = DRAFT_REFUSAL_CODES.map((code) => notice(code).title);
+		expect(new Set(titles).size).toBe(DRAFT_REFUSAL_CODES.length);
+	});
+
+	it("keeps up the two whose next step is on the draft itself", () => {
+		expect(notice("draft_unusable").autoClose).toBe(false);
+		expect(notice("draft_publishing").autoClose).toBe(false);
+		expect(notice("draft_gone").autoClose).toBeUndefined();
+		expect(notice("draft_changed").autoClose).toBeUndefined();
+	});
+
+	it("takes them by code and status, not by status alone", () => {
+		expect(
+			reviseRefusalNotification({ status: 400, code: "draft_gone" }),
+		).toBeNull();
+		expect(
+			reviseRefusalNotification({ status: 409, code: "draft_not_found" }),
+		).toBeNull();
+	});
+});
+
+describe("publishRefusalNotification for a draft that is not the one named", () => {
+	const error = (code) => ({
+		status: 409,
+		code,
+		message: "the backend's words",
+	});
+
+	it("checks the codes a draft can be refused with", () => {
+		expect(DRAFT_REFUSAL_CODES.length).toBeGreaterThan(0);
+	});
+
+	it.each(
+		DRAFT_REFUSAL_CODES,
+	)("words %s as a publish that was not sent, in words of its own", (code) => {
+		const published = publishRefusalNotification(error(code));
+		expect(published).not.toBeNull();
+		expect(published.color).toBe("orange");
+		expect(published.title).toContain("發布");
+		expect(published.title).not.toContain("接續");
+		expect(published.message).not.toContain("接續");
+		const continued = reviseRefusalNotification(error(code));
+		expect(published).not.toEqual(continued);
+		expect(published.title).not.toBe(continued.title);
+	});
+
+	it.each(
+		DRAFT_REFUSAL_CODES,
+	)("stays up for %s exactly when the refusal of a round that continues the draft does", (code) => {
+		// Whether the next step is on the draft does not depend on which was sent.
+		expect(publishRefusalNotification(error(code)).autoClose).toBe(
+			reviseRefusalNotification(error(code)).autoClose,
+		);
+	});
+
+	it.each(
+		DRAFT_REFUSAL_CODES,
+	)("reads the list again for %s, as for a round that continues the draft", (code) => {
+		expect(versionWriteConflictReaction({ status: 409, code })).toBe("refresh");
+	});
+
+	it("tells the codes apart", () => {
+		const messages = DRAFT_REFUSAL_CODES.map(
+			(code) => publishRefusalNotification(error(code)).message,
+		);
+		const titles = DRAFT_REFUSAL_CODES.map(
+			(code) => publishRefusalNotification(error(code)).title,
+		);
+		expect(new Set(titles).size).toBe(DRAFT_REFUSAL_CODES.length);
+		expect(new Set(messages).size).toBe(DRAFT_REFUSAL_CODES.length);
+	});
+
+	it("leaves every other error to the ordinary handling of a failed version write", () => {
+		for (const code of [
+			"job_busy",
+			"version_mismatch",
+			"draft_pending",
+			"env_policy",
+			"draft_not_found",
+		]) {
+			expect(publishRefusalNotification(error(code)), code).toBeNull();
+		}
+		expect(publishRefusalNotification({ status: 404 })).toBeNull();
+		expect(publishRefusalNotification({ status: 422 })).toBeNull();
+		expect(publishRefusalNotification(undefined)).toBeNull();
+	});
+
+	it("takes them by code and status, not by status alone", () => {
+		expect(
+			publishRefusalNotification({ status: 400, code: "draft_gone" }),
+		).toBeNull();
+		expect(publishRefusalNotification({ status: 409 })).toBeNull();
 	});
 });
 

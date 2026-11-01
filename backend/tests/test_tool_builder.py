@@ -23,32 +23,63 @@ an autouse fixture resets both around every test.
 
 import asyncio
 import contextlib
+import dataclasses
+import errno
 import hashlib
 import json
 import logging
 import os
 import shutil
+import signal
 import socket
+import stat
+import subprocess
 import sys
 import threading
 import time
+import types
+import typing
+import warnings
 from collections.abc import Awaitable, Callable, Generator
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
+from anyio.to_thread import current_default_thread_limiter
+from anyio.to_thread import run_sync as run_on_pool_thread
 from fastapi.testclient import TestClient
+from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 from sqlalchemy import Engine
 from sqlmodel import Session
+from starlette.routing import Match
 
 from afterthread.config import Settings
 from afterthread.models import SQLITE_MAX_INT
-from afterthread.services import llm_log, tool_builder, tool_meta, tool_runs, tools
-from afterthread.services.llm import LLMNotConfiguredError, LLMUpstreamError
+from afterthread.routers import tools as tools_router
+from afterthread.schemas import ToolJobStatus
+from afterthread.services import (
+    llm,
+    llm_log,
+    memory_ai,
+    token_budget,
+    tool_builder,
+    tool_drafts,
+    tool_meta,
+    tool_runs,
+    tools,
+)
+from afterthread.services.llm import (
+    LLMNotConfiguredError,
+    LlmTool,
+    LLMUpstreamError,
+    StructuredRunStats,
+)
 from afterthread.services.tool_builder import (
     _ERROR_NAME_TAKEN,
     _ERROR_OPENAPI_TOO_LARGE,
@@ -108,11 +139,68 @@ def _install_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> Sett
 
 
 def _meta_by_name(staging: Path) -> dict[str, Any]:
-    return {t.spec["function"]["name"]: t for t in _build_meta_tools(staging)}
+    return {
+        t.spec["function"]["name"]: t
+        for t in _build_meta_tools(staging, shells=tool_builder._BuilderShells())
+    }
 
 
 def _call(handler: Any, args: dict[str, Any]) -> str:
     return asyncio.run(handler(args))
+
+
+# How Linux reads back a file name that is not UTF-8 (``os.fsdecode`` of
+# ``b"notes-\xff.txt"``): a lone surrogate for the byte. APFS refuses such a name, so
+# the tests hand it over themselves.
+_NOT_UTF8_NAME = b"notes-\xff.txt".decode("utf-8", "surrogateescape")
+# That name made encodable: three U+FFFD for its one lone surrogate.
+_NOT_UTF8_SHOWN = "notes-" + "�" * 3 + ".txt"
+# A known value holding three U+FFFD -- what a ``.env`` read with replacement keeps
+# for three bytes that are not UTF-8 -- and a name, read back with one lone surrogate,
+# that spells it whole once it is made encodable.
+_SPELLED_SECRET = "key-" + "�" * 3 + "-zz"
+_SPELLS_IT_ENCODED = b"key-\xff-zz".decode("utf-8", "surrogateescape")
+
+
+def _sent_by_the_sdk(messages: list[dict[str, Any]]) -> list[bytes]:
+    """Send ``messages`` as one chat request through the real OpenAI SDK, over a mock
+    HTTP transport that answers every request; the bodies of the requests that went out.
+
+    The SDK encodes the body as UTF-8 before it sends anything: a message holding a
+    lone surrogate raises there, and no request goes out."""
+    sent: list[bytes] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl-test",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "m",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "stop",
+                        "message": {"role": "assistant", "content": "ok"},
+                    }
+                ],
+            },
+        )
+
+    async def send() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(answer)) as http_client:
+            client = AsyncOpenAI(
+                api_key="test-key",
+                base_url="http://llm.test/v1",
+                http_client=http_client,
+                max_retries=0,
+            )
+            await client.chat.completions.create(model="m", messages=typing.cast(Any, messages))
+
+    asyncio.run(send())
+    return sent
 
 
 # --- meta-tools: containment -------------------------------------------------
@@ -328,6 +416,171 @@ def test_list_dir_caps_entries_during_walk(monkeypatch: pytest.MonkeyPatch, tmp_
     assert kept[0] == "f00000.txt"
 
 
+def test_list_dir_hands_back_a_name_that_is_not_utf8_in_a_form_the_next_request_carries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``os.walk`` hands back a name that is not UTF-8, as Linux reads one back: with
+    a lone surrogate for the byte. The listing names it with replacement characters,
+    and the request that carries the listing back to the model goes out."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    def walk(top: Any, *_args: Any, **_kwargs: Any) -> Generator[tuple[str, list[str], list[str]]]:
+        yield os.fspath(top), [], [_NOT_UTF8_NAME]
+
+    monkeypatch.setattr(tool_builder.os, "walk", walk)
+    meta = _meta_by_name(staging)
+
+    listing = _call(meta["list_dir"].handler, {"path": ""})
+
+    assert listing == _NOT_UTF8_SHOWN
+    sent = _sent_by_the_sdk(
+        [
+            {"role": "user", "content": "Build the tool."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "list_dir", "arguments": '{"path": ""}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": listing},
+        ]
+    )
+    assert len(sent) == 1
+    assert json.loads(sent[0])["messages"][-1]["content"] == _NOT_UTF8_SHOWN
+
+
+@pytest.mark.parametrize(
+    ("name", "secret", "shown"),
+    [
+        (
+            "note-kb-secret-0123456789.txt",
+            "kb-secret-0123456789",
+            f"note-{tools._REDACTION_MARKER}.txt",
+        ),
+        (_SPELLS_IT_ENCODED, _SPELLED_SECRET, tools._REDACTION_MARKER),
+    ],
+    ids=["embeds_the_value", "spells_it_once_made_encodable"],
+)
+def test_list_dir_hands_the_model_no_known_value_a_name_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, secret: str, shown: str
+) -> None:
+    """A staged name embeds a known value, or -- read back with a lone surrogate --
+    spells one once its replacement characters are in. The listing the model is
+    handed does not hold the value: an embedded one is masked in place, and a
+    listing that spells one only once it is made encodable is the marker, whole."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(secret)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    def walk(top: Any, *_args: Any, **_kwargs: Any) -> Generator[tuple[str, list[str], list[str]]]:
+        yield os.fspath(top), [], [name]
+
+    monkeypatch.setattr(tool_builder.os, "walk", walk)
+    meta = _meta_by_name(staging)
+
+    assert _call(meta["list_dir"].handler, {"path": ""}) == shown
+
+
+def test_write_file_through_an_internal_link_names_what_it_wrote_with_known_values_masked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workspace holds a file whose name embeds a known value, and a link to it
+    under a plain name. A write through the link writes that file, and the success
+    names the file it wrote -- where the link leads -- with the value masked: the
+    model, which named only the link, is not handed the value."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    secret = "kb-secret-0123456789"
+    tools.register_inflight_secret(secret)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / f"note-{secret}.txt").write_text("old")
+    (staging / "link.txt").symlink_to(f"note-{secret}.txt")
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": "link.txt", "content": "new"})
+
+    assert result == f"wrote note-{tools._REDACTION_MARKER}.txt (3 characters)"
+    assert (staging / f"note-{secret}.txt").read_text() == "new"
+
+
+def test_write_file_names_a_path_that_is_not_utf8_in_a_form_the_next_request_carries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A write whose resolved path holds a lone surrogate -- a name that is not
+    UTF-8, as Linux reads one back: the success names it with replacement
+    characters, and it encodes. APFS refuses such a name, so the write itself is
+    stood in for."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    written: list[Path] = []
+
+    def write(target: Path, content: str) -> bool:
+        written.append(target)
+        return True
+
+    monkeypatch.setattr(tools, "_write_regular_file", write)
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": _NOT_UTF8_NAME, "content": "x"})
+
+    assert written == [staging.resolve() / _NOT_UTF8_NAME]
+    assert result == f"wrote {_NOT_UTF8_SHOWN} (1 characters)"
+    assert result.encode("utf-8")
+
+
+def test_write_file_names_a_path_that_spells_a_known_value_once_made_encodable_as_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A write's resolved path holds a lone surrogate, and with the replacement
+    characters made for it the path spells a known value whole: the success names
+    the path as the redaction marker. APFS refuses such a name, so the write itself
+    is stood in for."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(_SPELLED_SECRET)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    monkeypatch.setattr(tools, "_write_regular_file", lambda _target, _content: True)
+    meta = _meta_by_name(staging)
+
+    result = _call(meta["write_file"].handler, {"path": _SPELLS_IT_ENCODED, "content": "x"})
+
+    assert result == f"wrote {tools._REDACTION_MARKER} (1 characters)"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_write_file_whose_path_cannot_be_masked_writes_nothing_and_says_it_failed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An installed tool's directory cannot be looked at, so the known secrets are
+    not whole and the path a success would name cannot be masked: the write is not
+    made, and the model is told it failed, which is so."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text("KB_KEY=installed-tool-secret-abcdef\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+    package.chmod(0)
+    try:
+        result = _call(meta["write_file"].handler, {"path": "notes.txt", "content": "x"})
+    finally:
+        package.chmod(0o700)
+
+    assert result == "write_file failed: KnownSecretsIncomplete"
+    assert not (staging / "notes.txt").exists()
+
+
 # --- meta-tools: run_shell -----------------------------------------------------
 
 
@@ -340,6 +593,63 @@ def test_run_shell_happy_and_nonzero_exit(monkeypatch: pytest.MonkeyPatch, tmp_p
     assert _call(meta["run_shell"].handler, {"command": "echo hello"}) == "hello\n"
     failed = _call(meta["run_shell"].handler, {"command": "echo bad >&2; exit 3"})
     assert failed.startswith("command failed (exit 3): bad")
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_run_shell_whose_output_cannot_be_masked_says_the_command_ran_and_hands_none_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command ran and printed an installed tool's secret, and that tool's
+    directory cannot be looked at, so its ``.env`` -- and the secret -- is not in
+    the known list. None of the output is handed to the builder, and it is told
+    the command ran and how it ended, so it does not run it again as one that
+    never ran. Red before the fix: the list was taken as whole without that
+    ``.env``, and the secret reached the builder unmasked."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    secret = "installed-tool-secret-abcdef"
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text(f"KB_KEY={secret}\n", encoding="utf-8")
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    meta = _meta_by_name(staging)
+    package.chmod(0)
+    try:
+        result = _call(meta["run_shell"].handler, {"command": f"echo {secret}"})
+    finally:
+        package.chmod(0o700)
+
+    assert secret not in result
+    assert result == tools.output_withheld_text("command", 0)
+
+
+@pytest.mark.parametrize("tool", ["read_file", "run_shell"])
+def test_a_meta_tool_masks_a_known_value_holding_a_crlf_in_the_text_it_reads_back(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tool: str
+) -> None:
+    """An installed tool's ``.env`` gives a value holding a CRLF, and the builder
+    reads its very bytes back: a staged file through read_file, a command's output
+    through run_shell. Both read text with universal newlines, so what comes back
+    holds the value with an LF in place of the CRLF -- and that form is masked
+    too, though it is shorter than the floor."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    package = root / "kb"
+    package.mkdir(parents=True)
+    (package / ".env").write_text('KB_KEY="ab\\r\\ncd"\n', encoding="utf-8")
+    assert "ab\r\ncd" in tools.known_secret_values()
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "notes.txt").write_bytes(b"prefix ab\r\ncd suffix")
+    meta = _meta_by_name(staging)
+
+    if tool == "read_file":
+        result = _call(meta["read_file"].handler, {"path": "notes.txt"})
+    else:
+        result = _call(meta["run_shell"].handler, {"command": "cat notes.txt"})
+
+    assert result == f"prefix {tools._REDACTION_MARKER} suffix"
 
 
 def test_run_shell_cwd_is_staging(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -449,6 +759,45 @@ def test_run_shell_omits_tls_no_verify_when_off(
 
     result = _call(meta["run_shell"].handler, {"command": 'echo "T=${TLS_NO_VERIFY:-unset}"'})
     assert "T=unset" in result
+
+
+_FLOOD_RESULT = ("y\n" * 1000)[: 1000 - len(tools._OUTPUT_TRUNCATION_MARKER)] + (
+    tools._OUTPUT_TRUNCATION_MARKER
+)
+
+
+@pytest.mark.parametrize("abort", ["omitted", "never-set"])
+@pytest.mark.parametrize(
+    ("command", "timeout", "expected"),
+    [
+        ("printf out", 30.0, "out"),
+        ("printf bad; exit 3", 30.0, "command failed (exit 3): bad"),
+        ("sleep 30", 0.3, "command timed out after 0.3 seconds"),
+        ("yes", 30.0, _FLOOD_RESULT),
+    ],
+    ids=["exits", "fails", "times-out", "overflows"],
+)
+def test_run_shell_subprocess_without_a_stop_signal_answers_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    command: str,
+    timeout: float,
+    expected: str,
+    abort: str,
+) -> None:
+    """With no stop signal -- none passed, or one that is never set -- a command
+    answers exactly as before the signal existed: its output, its failure, its
+    timeout, its output cut at the cap."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    stop = () if abort == "omitted" else (None, threading.Event())
+
+    started = time.monotonic()
+    result = tool_builder._run_shell_subprocess(staging, command, timeout, 1000, *stop)
+
+    assert result == expected
+    assert time.monotonic() - started < 5
 
 
 # --- InstallResult sanitizer ---------------------------------------------------
@@ -626,7 +975,10 @@ def _fake_generate(
     RECEIVED it: the staging workspace exactly as it was copied (a revise), the
     secret registry mid-session, or a package being deleted under a running
     build. The real thing is a multi-minute session, so this window is otherwise
-    unreachable from a test."""
+    unreachable from a test.
+
+    ``model_cls`` and ``stats`` are captured as given (``stats`` is None when the
+    caller passed none, which is what an install does)."""
     captured: dict[str, Any] = {}
 
     async def fake(
@@ -638,14 +990,17 @@ def _fake_generate(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         captured.update(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
+            model_cls=model_cls,
             workflow=workflow,
             tools=tools,
             max_tool_rounds=max_tool_rounds,
             timeout_seconds=timeout_seconds,
+            stats=stats,
         )
         if side_effect is not None:
             side_effect()
@@ -1012,6 +1367,30 @@ def test_run_install_rejects_manifest_name_mismatch(
     assert not (root / "kbsearch").exists()
 
 
+def test_run_install_refuses_a_manifest_with_a_string_that_cannot_be_encoded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder wrote a tool.json whose description holds an unpaired surrogate
+    escape: the install fails as it is about to publish, with the scan's own
+    reason, and nothing is installed -- no version that would only list invalid
+    afterwards."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    manifest = {**_package_manifest("kbsearch"), "description": "search \ud800 the kb"}
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "s", "ready": True},
+        files={"tool.json": json.dumps(manifest), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build"))
+
+    assert outcome.ok is False
+    assert outcome.error == "工具包驗證失敗：" + tools._MANIFEST_UNENCODABLE  # noqa: RUF001
+    assert not (root / "kbsearch").exists()
+
+
 def test_run_install_rejects_existing_name(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     root = tmp_path / "tools"
     (root / "kbsearch").mkdir(parents=True)  # pre-existing package of that name
@@ -1180,6 +1559,34 @@ def test_strip_builder_sidecars_removes_only_root_version_metadata(tmp_path: Pat
     assert (staging / tools._AI_META_FILENAME).is_file()
     assert (staging / "sub" / tools._STATE_FILENAME).is_file()
     assert (staging / "sub" / tools._META_DIRNAME / "keep").read_text(encoding="utf-8") == "content"
+
+
+def test_the_env_and_metadata_strips_take_their_names_from_stripped_root_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_strip_builder_env`` and ``_strip_builder_sidecars`` find what they remove
+    by the names ``tool_drafts.STRIPPED_ROOT_NAMES`` lists -- the list a
+    continuation's copy of a draft withholds: with every name there changed, the
+    two strips together remove each changed name and nothing else."""
+    renamed = {reason: f".renamed-{reason}" for reason in tool_drafts.STRIPPED_ROOT_NAMES}
+    assert renamed
+    for reason, name in renamed.items():
+        monkeypatch.setitem(tool_drafts.STRIPPED_ROOT_NAMES, reason, name)
+    base = tmp_path.resolve() / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    for name in renamed.values():
+        (staging / name).write_text("KEY=placed\n", encoding="utf-8")
+    (staging / ".env").write_text("KEY=kept\n", encoding="utf-8")
+    (staging / tools._META_DIRNAME).mkdir()
+
+    _keys, env_error = tool_builder._strip_builder_env(tools.BuildRoot(staging), base)
+    sidecar_error = tool_builder._strip_builder_sidecars(staging)
+
+    assert (env_error, sidecar_error) == (None, None)
+    assert sorted(entry.name for entry in staging.iterdir()) == sorted(
+        [".env", tools._META_DIRNAME]
+    )
 
 
 def test_strip_builder_sidecars_unlinks_root_metadata_symlink_only(tmp_path: Path) -> None:
@@ -1569,6 +1976,77 @@ def test_cleanup_staging_still_removes_an_honest_staging(tmp_path: Path) -> None
     assert not (base / tool_builder._STAGING_DIRNAME).exists()
 
 
+def _refuse_lstat(
+    monkeypatch: pytest.MonkeyPatch, path: Path, *, active: list[bool] | None = None
+) -> list[str]:
+    """``os.lstat`` of exactly ``path`` fails with EIO -- while ``active[0]`` is
+    true, when given -- and every other path is looked at as before. Returns the
+    paths it failed."""
+    real_lstat = os.lstat
+    target = os.fspath(path)
+    refused: list[str] = []
+
+    def lstat(candidate: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        spelled = os.fspath(candidate) if isinstance(candidate, str | os.PathLike) else None
+        if spelled is not None and spelled == target and (active is None or active[0]):
+            refused.append(spelled)
+            raise OSError(errno.EIO, os.strerror(errno.EIO), spelled)
+        return real_lstat(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    return refused
+
+
+@pytest.mark.parametrize("unseen", ["tools-directory", "staging-shell", "workspace"])
+def test_verify_staging_root_refuses_a_workspace_whose_place_cannot_be_looked_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unseen: str
+) -> None:
+    """That the workspace is still the real directory inside ``<base>/.staging``
+    rests on looking at the tools directory, the shell and the workspace itself.
+    When one of those looks fails it is not known, and the workspace is refused as
+    unverified -- not passed as the honest one a look skipping the failure finds."""
+    base = tmp_path.resolve() / "tools"
+    staging = base / tool_builder._STAGING_DIRNAME / "buildid"
+    staging.mkdir(parents=True)
+    looked_at = {
+        "tools-directory": base,
+        "staging-shell": base / tool_builder._STAGING_DIRNAME,
+        "workspace": staging,
+    }[unseen]
+    refused = _refuse_lstat(monkeypatch, looked_at)
+
+    error = tool_builder._verify_staging_root(staging, base)
+
+    assert error is not None
+    assert error == tool_builder._ERROR_STAGING_UNVERIFIED
+    assert refused
+
+
+def test_cleanup_staging_removes_nothing_through_a_staging_shell_it_cannot_look_at(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The ``.staging`` shell is a link to an external directory holding a real
+    ``<uuid>`` subdirectory, and the shell cannot be looked at. A resolution that
+    skips that failure finds the workspace inside the shell, and the rmtree after
+    it deletes the external directory through the link; the gate refuses what it
+    could not look at, and the external directory survives."""
+    base = tmp_path.resolve() / "tools"
+    base.mkdir()
+    external = tmp_path.resolve() / "external"
+    victim = external / "buildid"
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("survive", encoding="utf-8")
+    shell = base / tool_builder._STAGING_DIRNAME
+    shell.symlink_to(external, target_is_directory=True)
+    refused = _refuse_lstat(monkeypatch, shell)
+
+    tool_builder._cleanup_staging(shell / "buildid", base)
+
+    assert victim.is_dir()
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "survive"
+    assert refused
+
+
 def test_cleanup_takes_the_whole_session_including_a_shell_holding_env(tmp_path: Path) -> None:
     """The reason cleanup targets ``session_root`` and not the build directory.
 
@@ -1703,7 +2181,11 @@ def test_run_shell_receives_injected_secret(
     staging.mkdir()
     meta = {
         t.spec["function"]["name"]: t
-        for t in _build_meta_tools(staging, secret_env={"KB_API_KEY": "shell-secret-123456"})
+        for t in _build_meta_tools(
+            staging,
+            secret_env={"KB_API_KEY": "shell-secret-123456"},
+            shells=tool_builder._BuilderShells(),
+        )
     }
 
     result = _call(meta["run_shell"].handler, {"command": 'echo "K=$KB_API_KEY"'})
@@ -2976,6 +3458,7 @@ def test_router_list_tools(
                 "current_vid": _TEST_VID,
                 "lineage": "sole",
                 "last_run": None,
+                "draft": None,
             }
         ]
     }
@@ -2988,6 +3471,77 @@ def test_router_list_tools_empty_when_unconfigured(
     response = client.get("/api/tools")
     assert response.status_code == 200
     assert response.json() == {"tools": []}
+
+
+def test_router_answers_an_operator_facing_failure_without_its_full_stop(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure written for the operator goes out as its message, under its
+    code, with the closing full stop left off: the page may go on after it (the
+    tools list's note on a stale list does). Red before the fix: a bare 500 with
+    no message."""
+    gap = tools.SecretSourceGap("kb", "/srv/tools/kb/.env", "PermissionError")
+    failure = tools.KnownSecretsIncomplete((gap,))
+
+    def failing(**_kwargs: Any) -> list[dict[str, Any]]:
+        raise failure
+
+    monkeypatch.setattr(tools, "list_tools", failing)
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    response = lenient.get("/api/tools")
+
+    assert str(failure).endswith("。")
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    assert response.json() == {
+        "detail": {"code": "known_secrets_incomplete", "message": str(failure)[: -len("。")]}
+    }
+
+
+def test_router_list_tools_empty_when_the_tools_dir_runs_through_a_file(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` runs through a regular file: no tools directory can be
+    there, as surely as one not made yet, so the list is empty -- not a 500. Red
+    before the fix: resolving the setting raised ``NotADirectoryError`` out of the
+    route."""
+    (tmp_path / "plain").write_text("a file\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "plain" / "tools"))
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    response = lenient.get("/api/tools")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"tools": []}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_says_which_tools_dir_it_cannot_resolve_and_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``TOOLS_DIR`` runs through a directory that cannot be searched, so its path
+    cannot be resolved. The list is a 500 in the error shape the page reads,
+    under its own code, and the message names the configured path, the failure's
+    type and what to do. Red before the fix: a bare 500 with no message."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    configured = locked / "inner" / "tools"
+    _install_settings(monkeypatch, tools_dir=str(configured))
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    locked.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        locked.chmod(0o700)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "tools_dir_unresolved"
+    assert str(configured) in detail["message"]
+    assert "PermissionError" in detail["message"]
+    assert "TOOLS_DIR" in detail["message"]
 
 
 def test_router_patch_toggles_enabled(
@@ -3022,6 +3576,23 @@ def test_router_rejects_invalid_names_as_422(
     _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
     assert client.patch(f"/api/tools/{bad_name}", json={"enabled": True}).status_code == 422
     assert client.delete(f"/api/tools/{bad_name}").status_code == 422
+
+
+@pytest.mark.parametrize("root_is_a_file", [False, True], ids=["not-there", "a-file"])
+def test_router_delete_with_the_tools_directory_not_there_is_not_found_not_busy(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, root_is_a_file: bool
+) -> None:
+    """No tool can be deleted from a tools directory that is not there: 404, as for a
+    missing package, not the retryable 409 of an AI job holding the lock."""
+    root = tmp_path / "not-there"
+    if root_is_a_file:
+        root.write_text("not a directory\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(root))
+
+    response = client.delete("/api/tools/kb")
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Tool not found"}
 
 
 def test_router_delete_tool_response_distinguishes_removed_from_retained(
@@ -3462,6 +4033,16 @@ def test_router_job_status_and_404(client: TestClient) -> None:
         "outcome": "published",
         "kind": "install",
         "verification": None,
+        # A revise's measured session, notes and draft; an install carries none.
+        "stopped_by": None,
+        "failure": None,
+        "rounds_used": None,
+        "max_rounds": None,
+        "handoff": None,
+        "operator_action": None,
+        "draft": None,
+        # What a publish of a draft did with it; an install carries none.
+        "draft_publish": None,
     }
 
     missing = client.get("/api/tools/jobs/ghost")
@@ -3472,6 +4053,109 @@ def test_router_job_status_and_404(client: TestClient) -> None:
     # wheel, so there is no version skew for an alias to protect): it matches no
     # route at all now, hence Starlette's own 404 rather than the handler's.
     assert client.get("/api/tools/install/job-1").status_code == 404
+
+
+def _without_none(hint: Any) -> Any:
+    """``hint`` without its ``| None``."""
+    if typing.get_origin(hint) in (types.UnionType, typing.Union):
+        (inner,) = [arg for arg in typing.get_args(hint) if arg is not type(None)]
+        return inner
+    return hint
+
+
+def _holds_free_text(hint: Any) -> bool:
+    """Whether a value typed ``hint`` can carry text of any content: ``str``, or a
+    container that can hold one. A ``Literal`` is a fixed set of values, not text."""
+    if hint is str:
+        return True
+    if typing.get_origin(hint) is typing.Literal:
+        return False
+    return any(_holds_free_text(arg) for arg in typing.get_args(hint))
+
+
+def _a_vocabulary(annotation: Any) -> bool:
+    """Whether the poll admits only a fixed set of values for a field typed
+    ``annotation``: a ``Literal``, optional or not."""
+    return typing.get_origin(_without_none(annotation)) is typing.Literal
+
+
+def _free_text_fields(job_type: type, poll: dict[str, Any]) -> list[str]:
+    """The fields of the dataclass ``job_type`` that can carry free text through a
+    poll whose fields are ``poll``: text by the dataclass's own types, less those
+    the poll admits only from a fixed vocabulary, and the id a job is addressed
+    by."""
+    hints = typing.get_type_hints(job_type)
+    return [
+        field.name
+        for field in dataclasses.fields(job_type)
+        if field.name != "job_id"
+        and _holds_free_text(hints[field.name])
+        and not _a_vocabulary(poll[field.name].annotation)
+    ]
+
+
+def _with_lone_surrogates(name: str, hint: Any) -> Any:
+    """A value for the field ``name``, of the type ``hint`` names, whose every piece
+    of text, nested ones included, carries a lone surrogate."""
+    inner = _without_none(hint)
+    if typing.get_origin(inner) is tuple:
+        return ("KEY_\udc80",)
+    if name == "draft":
+        return {
+            "saved": False,
+            "draft_id": None,
+            "generation": None,
+            "attempts": None,
+            "reason": "reason \udc80",
+            "retained_path": "/tools/.staging/\udc80/build",
+        }
+    if name == "draft_publish":
+        return {
+            "draft_id": "0" * 32,
+            "generation": 2,
+            "removed": False,
+            "reason": "reason \udc80",
+            "retained_path": "/tools/.staging/\udc80/build",
+        }
+    if typing.get_origin(inner) is dict:  # the other dict a job holds: its verification
+        result = tools.CheckResult(
+            status="ran\udc80",
+            vid="vid-\udc80",
+            results=(tools.ExampleResult("example \udc80", "ok\udc80", None),),
+            total=1,
+            message="message \udc80",
+        )
+        return tool_builder._verification_dict(result, finished=True, secrets=[])
+    return "text \udc80"
+
+
+def test_a_job_poll_answers_whatever_text_install_job_fields_hold(client: TestClient) -> None:
+    """Every ``InstallJob`` field that can carry free text -- as the dataclass
+    declares it, less those the poll admits only from a fixed vocabulary, and the
+    id the job is addressed by -- is given text holding a lone surrogate, nested
+    text in the verification (built the way a check builds it), the draft and the
+    env keys too. A path read from the filesystem arrives like that. The real poll
+    still answers 200, each value with the surrogate replaced, because the job
+    table's one writer makes what it stores encodable."""
+    free_text = _free_text_fields(tool_builder.InstallJob, ToolJobStatus.model_fields)
+    assert free_text
+    # One field of each shape the filter must find, and one it must leave out:
+    # free text in the dataclass, a vocabulary in the poll.
+    assert {"summary", "env_keys", "verification", "draft"} <= set(free_text)
+    assert "kind" not in free_text
+    job = tool_builder._admit_job()
+    assert job is not None
+
+    hints = typing.get_type_hints(tool_builder.InstallJob)
+    tool_builder._update_job(
+        job.job_id, **{name: _with_lone_surrogates(name, hints[name]) for name in free_text}
+    )
+    response = client.get(f"/api/tools/jobs/{job.job_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    for name in free_text:
+        assert "\ufffd" in json.dumps(body[name], ensure_ascii=False), name
 
 
 # --- router: AI summary (D40) --------------------------------------------------
@@ -3639,6 +4323,33 @@ def test_router_get_summary_returns_the_sidecar(
         "llm_log_id": 7,
         "current_vid": _TEST_VID,
     }
+
+
+def test_a_summary_that_spells_a_secret_only_as_decoded_reaches_no_string_the_summary_api_serves(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The summary holds a lone surrogate where the known value has three U+FFFD,
+    so the mask finds nothing, and the scrub then makes the text exactly the value.
+    The file writes the value's quote as ``\\"``, so the field's written form and
+    the whole file both pass it; the summary API decodes the file and hands the
+    text on as it is. The summary is written as the marker, and no string the API
+    serves holds the value."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    assert tools.write_tool_meta(
+        _version_root(pkg), {"summary": text, "updated_at": "2026-07-26T00:00:00+00:00"}
+    )
+
+    response = client.get("/api/tools/kbsearch/summary")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["summary"] == tools._REDACTION_MARKER
+    # Decoded first: the response's own text escapes the quote, as the file does.
+    assert [value for value in body.values() if isinstance(value, str) and secret in value] == []
 
 
 def test_router_get_summary_drops_a_log_link_a_restart_invalidated(
@@ -4162,7 +4873,12 @@ def test_router_revise_202_queues_job(
     seen: dict[str, Any] = {}
 
     async def fake_start(
-        name: str, feedback: str, expected_vid: str, *, runs: tuple[Any, ...] = ()
+        name: str,
+        feedback: str,
+        expected_vid: str,
+        *,
+        runs: tuple[Any, ...] = (),
+        draft: Any = None,
     ) -> tool_builder.ReviseJobStart:
         seen["name"] = name
         seen["feedback"] = feedback
@@ -4448,6 +5164,7 @@ def test_router_job_poll_serves_install_and_revise_jobs(
             _resolution: tools.Resolved | None,
             *,
             runs: tuple[Any, ...] = (),
+            continuation: Any = None,
         ) -> InstallOutcome:
             return InstallOutcome(ok=True, tool_name=name, summary="改好了", llm_log_id=2)
 
@@ -4736,7 +5453,7 @@ def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
     assert outcome.ok is True
     assert env_path.stat().st_ino == env_inode
     assert secret in tools.known_secret_values()
-    monkeypatch.setattr(llm_log, "_secret_provider", tools.known_secret_values)
+    monkeypatch.setattr(llm_log, "_secret_provider", tools.known_secrets_for_log)
     recorder = llm_log.LlmInteractionRecorder(workflow="probe", model="m")
     recorder.begin_attempt([{"role": "user", "content": f"use {secret}"}])
     recorder.record_response(f"used {secret}")
@@ -4747,7 +5464,9 @@ def test_invariant_f_revised_package_immediately_redacts_package_env_from_logs(
     assert record is not None
     stored = json.dumps(record, ensure_ascii=False)
     assert secret not in stored
-    assert llm_log._REDACTION_MARKER in stored
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == f"use {llm_log._REDACTION_MARKER}"
+    assert attempt["response_content"] == f"used {llm_log._REDACTION_MARKER}"
 
 
 def test_run_revise_preserves_a_crlf_env_byte_for_byte(
@@ -5077,6 +5796,76 @@ def test_sweep_collects_marked_backup_without_local_provenance(tmp_path: Path) -
     assert not no_manifest.exists()
 
 
+def _discarded_version(package: Path) -> Path:
+    """``<package>/versions/<vid>.discarded``, as a discard that could not remove the
+    committed version it moved aside leaves it: its ``origin.json`` and a file."""
+    parked = package / tools._VERSIONS_DIRNAME / f"{_TEST_VID}.discarded"
+    (parked / tools._META_DIRNAME).mkdir(parents=True)
+    (parked / tools._META_DIRNAME / tools._ORIGIN_FILENAME).write_text(
+        json.dumps(
+            {
+                "source": "test-fixture",
+                "openapi_url": None,
+                "instructions": None,
+                "feedback": None,
+                "previous": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (parked / "run.py").write_text("print('x')\n", encoding="utf-8")
+    assert tools.read_origin_meta(tools.VersionRoot(parked)) is not None
+    return parked
+
+
+@pytest.mark.parametrize("failing", [1, 100], ids=["first-look", "every-look"])
+def test_the_sweep_does_not_go_into_a_package_alias_whose_look_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failing: int
+) -> None:
+    """``alias`` in the tools directory is a link to a package outside it, whose
+    ``versions/`` holds a discarded committed version, and the look at the link
+    fails. The sweep passes over what it could not see: the version there stays, and
+    the alias is still a link. It goes on to the next package all the same, and
+    collects that one's own discarded version."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    outside = _discarded_version(tmp_path / "elsewhere" / "kbsearch")
+    alias = base / "alias"
+    alias.symlink_to(outside.parents[1], target_is_directory=True)
+    own = _discarded_version(base / "zzreal")
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, failing)
+        tool_builder._sweep_stale_backups(base)
+
+    assert failed
+    assert (outside / "run.py").is_file()
+    assert alias.is_symlink()
+    assert not own.exists()
+
+
+def test_the_sweep_does_not_go_through_a_versions_directory_that_is_a_link(
+    tmp_path: Path,
+) -> None:
+    """A package in the tools directory whose ``versions/`` is a link to the
+    ``versions/`` of a package outside it, which holds a discarded committed
+    version: the sweep does not go through the link, so that version stays. It still
+    collects the next package's own discarded version."""
+    base = tmp_path / "tools"
+    base.mkdir()
+    outside = _discarded_version(tmp_path / "elsewhere" / "kbsearch")
+    linked = base / "kbsearch"
+    linked.mkdir()
+    (linked / tools._VERSIONS_DIRNAME).symlink_to(outside.parent, target_is_directory=True)
+    own = _discarded_version(base / "zzreal")
+
+    tool_builder._sweep_stale_backups(base)
+
+    assert (outside / "run.py").is_file()
+    assert (linked / tools._VERSIONS_DIRNAME).is_symlink()
+    assert not own.exists()
+
+
 def test_fsync_tree_skips_directory_symlinks_outside_the_build(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -5137,6 +5926,86 @@ def test_fsync_tree_does_not_downgrade_a_real_directory_fsync_failure(
     monkeypatch.setattr(tool_builder, "_fsync_directory", fail_child)
 
     assert tool_builder._fsync_tree(root) is False
+
+
+def test_fsync_tree_fails_when_a_directory_of_the_tree_cannot_be_listed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """What is under a directory that cannot be listed was never made durable,
+    though the directory itself opens and fsyncs: the tree is not durable."""
+
+    root = tmp_path / "build"
+    child = root / "real-child"
+    child.mkdir(parents=True)
+    (child / "payload.txt").write_text("content", encoding="utf-8")
+    real_scandir = os.scandir
+    refused: list[str] = []
+
+    def scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == os.fspath(child):
+            refused.append(os.fspath(path))
+            raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    assert tool_builder._fsync_tree(root) is False
+    assert refused == [os.fspath(child)]
+
+
+def test_fsync_tree_fails_when_an_entry_cannot_be_told_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A listing entry whose type check raises is handed over as a file by
+    ``os.walk``, which then never descends into it: a real directory reported
+    that way leaves what is under it unsynced, so the tree is not durable."""
+
+    root = tmp_path / "build"
+    child = root / "real-child"
+    child.mkdir(parents=True)
+    (child / "payload.txt").write_text("content", encoding="utf-8")
+    (root / "plain.txt").write_text("content", encoding="utf-8")
+    real_scandir = os.scandir
+    untold: list[str] = []
+
+    class Entry:
+        def __init__(self, entry: os.DirEntry[str]) -> None:
+            self._entry = entry
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._entry, name)
+
+        def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+            if self._entry.path == os.fspath(child):
+                untold.append(self._entry.path)
+                raise OSError(errno.EIO, os.strerror(errno.EIO), self._entry.path)
+            return self._entry.is_dir(follow_symlinks=follow_symlinks)
+
+    class Listing:
+        def __init__(self, listing: Any) -> None:
+            self._listing = listing
+
+        def __enter__(self) -> Listing:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._listing.close()
+
+        def __iter__(self) -> Any:
+            return (Entry(entry) for entry in self._listing)
+
+    def scandir(path: Any = ".", *args: Any, **kwargs: Any) -> Any:
+        listing = real_scandir(path, *args, **kwargs)
+        if isinstance(path, str | os.PathLike) and os.fspath(path) == os.fspath(root):
+            return Listing(listing)
+        return listing
+
+    monkeypatch.setattr(os, "scandir", scandir)
+
+    assert tool_builder._fsync_tree(root) is False
+    assert untold == [os.fspath(child)]
 
 
 def test_invariant_d_failed_version_rename_leaves_current_on_the_previous_version(
@@ -5336,7 +6205,9 @@ def test_run_revise_reports_the_target_package_being_deleted(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """A delete landing during the build is answered honestly -- the revision is
-    NOT installed as a new tool because its predecessor package vanished."""
+    NOT installed as a new tool because its predecessor package vanished. No draft
+    can hold the work either (its package is gone), so the workspace stays where
+    it is and the job names it: the round's work is not lost with the tool."""
     pkg = _seed_package(monkeypatch, tmp_path)
     root = _package_path(pkg).parent
     _fake_generate(
@@ -5353,7 +6224,12 @@ def test_run_revise_reports_the_target_package_being_deleted(
     assert not _package_path(pkg).exists()
     assert tools.list_tools() == []
     assert _leftovers(root) == []
-    assert not (root / ".staging").exists()
+    assert outcome.draft is not None
+    assert outcome.draft["saved"] is False
+    assert outcome.draft["reason"] == tool_drafts.REASON_PACKAGE_GONE
+    [session] = list((root / ".staging").iterdir())
+    assert outcome.draft["retained_path"] == str(session / "build")
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
 
 
 def test_run_revise_never_publishes_on_a_validation_failure(
@@ -6132,27 +7008,26 @@ def test_run_revise_keeps_a_hard_linked_root_env_case_variant(
     assert (_package_path(pkg) / ".env").read_text(encoding="utf-8") == shared  # ... and restored
 
 
-def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
+def test_withheld_root_names_tells_a_lone_case_alias_by_its_lstat_identity(
     tmp_path: Path,
 ) -> None:
-    """The one shape only a case-INSENSITIVE filesystem produces, tested directly
-    (R6-2).
+    """The one shape only a case-INSENSITIVE filesystem produces, tested directly.
 
     ``run_revise`` cannot reach it on this host: a case-insensitive filesystem
     carries ONE entry for the pair, which is a listing without ``.env`` where
     ``<root>/.env`` still opens the variant -- and no case-sensitive host can
-    produce that combination end to end. Passing ``exact_present=False`` over a
-    hard-linked pair reproduces exactly what the callback would see there, so the
-    branch that keeps live credentials out of staging on macOS is pinned rather
-    than assumed.
+    produce that combination end to end. Handing ``tool_drafts.withheld_root_names``
+    a listing without ``.env`` over a hard-linked pair reproduces exactly what a
+    first round's copy (``_revise_copy_ignore``) is handed there, so the branch that
+    keeps live credentials out of staging on macOS is pinned rather than assumed.
 
     The rest of the matrix goes with it, because the discriminator is the pair of
-    conditions and not either half: the exact name always excluded, the variant
-    NEVER excluded once the listing also carries ``.env`` (however the two are
+    conditions and not either half: the exact name always left out, the variant
+    NEVER left out once the listing also carries ``.env`` (however the two are
     linked), no ``.env`` at all meaning nothing to be the same entry as, and a
     SYMLINK staying ordinary content -- the reason the identity test is ``lstat``
-    and not a following stat, since excluding a distinct entry that is never
-    restored is the deletion bug all over again."""
+    and not a following stat, since leaving out a distinct entry would drop it from
+    the next version."""
     if not _case_sensitive_filesystem(tmp_path):
         # The fixtures below need two entries to exist at once to SIMULATE the one
         # this branch is about; a case-insensitive host cannot hold them.
@@ -6162,27 +7037,119 @@ def test_is_preserved_env_name_excludes_the_variant_a_lone_listing_carries(
     (root / ".env").write_text("MODE=\n", encoding="utf-8")
     os.link(root / ".env", root / ".ENV")
 
+    def withheld(*listed: str) -> dict[str, str]:
+        return dict(tool_drafts.withheld_root_names(root, listed))
+
     # The exact name is the managed file whatever else the listing holds.
-    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=True) is True
-    assert tool_builder._is_preserved_env_name(root, ".env", exact_present=False) is True
+    assert withheld(".env") == {".env": "env_file"}
     # A listing WITHOUT the exact name = the case-insensitive one-entry world.
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is True
+    assert withheld(".ENV") == {".ENV": "env_file"}
     # A listing WITH it = two entries, so the variant is the package's own content.
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=True) is False
+    assert withheld(".env", ".ENV") == {".env": "env_file"}
     # An unrelated name is never in question.
-    assert tool_builder._is_preserved_env_name(root, "env", exact_present=False) is False
+    assert withheld("env") == {}
 
     (root / ".ENV").unlink()
     (root / ".env").unlink()
     # Nothing for the variant to BE the same entry as -> ordinary content.
     (root / ".ENV").write_text("MODE=\n", encoding="utf-8")
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
+    assert withheld(".ENV") == {}
     (root / ".ENV").unlink()
 
     # A SYMLINK is a distinct entry: lstat keeps it one, a following stat would not.
     (root / ".env").write_text("MODE=\n", encoding="utf-8")
     (root / ".ENV").symlink_to(".env")
-    assert tool_builder._is_preserved_env_name(root, ".ENV", exact_present=False) is False
+    assert withheld(".ENV") == {}
+
+
+def _first_round_copy(version: Path, tmp_path: Path) -> Path:
+    """``version`` copied as a first round copies the version it starts from
+    (``_copy_package_into_staging``); the copy, which must have been made."""
+    staging = tmp_path / "staging" / "build"
+    made = tool_builder._copy_package_into_staging(
+        tools.VersionRoot(version), tools.BuildRoot(staging)
+    )
+    assert made is None
+    return staging
+
+
+def _version_with(tmp_path: Path, *top: str) -> Path:
+    """A version-shaped directory holding ``run.py`` and, at its top, a file under
+    each name in ``top``."""
+    version = tmp_path / "version"
+    version.mkdir()
+    (version / "run.py").write_text("print('x')\n", encoding="utf-8")
+    for name in top:
+        (version / name).write_text("placed by hand\n", encoding="utf-8")
+    return version
+
+
+def test_a_first_round_copy_leaves_out_each_root_name_stripped_root_names_lists(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A name added to ``tool_drafts.STRIPPED_ROOT_NAMES`` is left out of a first
+    round's copy of the version at its root, as the names already there are; below
+    the root the same names are the tool's own content and are copied."""
+    added = typing.cast(tool_drafts.OmitReason, "sentinel")
+    monkeypatch.setitem(tool_drafts.STRIPPED_ROOT_NAMES, added, ".sentinel-root-name")
+    stripped = sorted(tool_drafts.STRIPPED_ROOT_NAMES.values())
+    version = _version_with(tmp_path, *stripped)
+    (version / "sub").mkdir()
+    for name in stripped:
+        (version / "sub" / name).write_text("placed below the root\n", encoding="utf-8")
+
+    staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == ["run.py", "sub"]
+    assert sorted(os.listdir(staging / "sub")) == stripped
+
+
+@pytest.mark.parametrize("reason", sorted(tool_drafts.STRIPPED_ROOT_NAMES))
+def test_a_first_round_copy_leaves_out_a_case_alias_whose_identity_cannot_be_told(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: tool_drafts.OmitReason
+) -> None:
+    """At the root of the version, a name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists,
+    spelled in another case and alone, and the look at the name as listed fails:
+    whether the two are one entry cannot be told, so a first round's copy leaves it
+    out -- it is not known not to be that entry. The version keeps it."""
+    listed = tool_drafts.STRIPPED_ROOT_NAMES[reason]
+    alias = listed.title()
+    version = _version_with(tmp_path, alias)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, version / listed, 100)
+        staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == ["run.py"]
+    assert failed  # the look this is about was made, and failed
+    assert (version / alias).read_text(encoding="utf-8") == "placed by hand\n"
+
+
+@pytest.mark.parametrize("same", [True, False], ids=["same-entry", "another-entry"])
+@pytest.mark.parametrize("reason", sorted(tool_drafts.STRIPPED_ROOT_NAMES))
+def test_a_first_round_copy_leaves_out_a_case_alias_only_when_it_is_the_same_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: tool_drafts.OmitReason, same: bool
+) -> None:
+    """At the root of the version, a name ``tool_drafts.STRIPPED_ROOT_NAMES`` lists,
+    spelled in another case and alone. Where it is the same entry -- a filesystem
+    that does not tell case apart, as the look ``tool_drafts._same_entry`` makes
+    answers here -- a first round's copy leaves it out; where it is another entry it
+    is the tool's own content, and is copied."""
+    listed = tool_drafts.STRIPPED_ROOT_NAMES[reason]
+    alias = listed.title()
+    version = _version_with(tmp_path, alias)
+    asked: list[tuple[str, str]] = []
+
+    def same_entry(first: Path, second: Path) -> bool:
+        asked.append((first.name, second.name))
+        return same
+
+    monkeypatch.setattr(tool_drafts, "_same_entry", same_entry)
+
+    staging = _first_round_copy(version, tmp_path)
+
+    assert sorted(os.listdir(staging)) == (["run.py"] if same else [alias, "run.py"])
+    assert asked == [(alias, listed)]  # the one look that answers it was made
 
 
 def test_run_revise_keeps_a_root_env_case_variant_that_is_a_symlink(
@@ -6509,6 +7476,7 @@ def test_run_revise_exposes_the_env_to_run_shell_only(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         by_name = {t.spec["function"]["name"]: t for t in tools or []}
         captured["shell"] = await by_name["run_shell"].handler(
@@ -6649,6 +7617,7 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
             _resolution: tools.Resolved | None,
             *,
             runs: tuple[Any, ...] = (),
+            continuation: Any = None,
         ) -> InstallOutcome:
             return InstallOutcome(
                 ok=True,
@@ -6685,6 +7654,7 @@ def test_revise_job_records_its_outcome_and_backstops_bugs(
             _resolution: tools.Resolved | None,
             *,
             runs: tuple[Any, ...] = (),
+            continuation: Any = None,
         ) -> InstallOutcome:
             raise RuntimeError("bug with secrets in str()")
 
@@ -6737,6 +7707,7 @@ def test_install_and_revise_share_one_single_flight_slot(
             _resolution: tools.Resolved | None,
             *,
             runs: tuple[Any, ...] = (),
+            continuation: Any = None,
         ) -> InstallOutcome:
             await release.wait()
             return InstallOutcome(ok=True, tool_name=name)
@@ -6920,6 +7891,7 @@ def test_run_revise_gives_config_env_to_the_shell_and_the_prompt(
         tools: Any = None,
         max_tool_rounds: int | None = None,
         timeout_seconds: float | None = None,
+        stats: Any = None,
     ) -> BaseModel:
         by_name = {t.spec["function"]["name"]: t for t in tools or []}
         captured["prompt"] = user_prompt
@@ -7001,6 +7973,51 @@ def test_job_outcome_separates_not_published_from_failed(
     assert polled is not None
     assert polled["state"] == expected_state
     assert polled["outcome"] == expected_outcome
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_revise_whose_prompt_meets_a_list_that_is_not_whole_fails_naming_the_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Another tool's directory cannot be looked at while the revise builds its
+    prompt, so the known secrets the prompt is masked with are not whole: no
+    prompt is built and no model is called. The job fails with the message that
+    names that ``.env`` and what to check, not only the failure's type name. Red
+    before the fix: the job said only that the revise met an unexpected
+    ``KnownSecretsIncomplete``."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    built: list[str] = []
+    real_prompt = tool_builder._revise_system_prompt
+
+    def building(name: str, *, attempt: int | None = None) -> str:
+        built.append(name)
+        return real_prompt(name, attempt=attempt)
+
+    monkeypatch.setattr(tool_builder, "_revise_system_prompt", building)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    job = tool_builder._admit_job()
+    assert job is not None
+    other.chmod(0)
+    try:
+        asyncio.run(
+            tool_builder._run_job(
+                job.job_id, lambda: _run_revise("kbsearch", "加上分頁"), tool_builder._ACTION_REVISE
+            )
+        )
+    finally:
+        other.chmod(0o700)
+
+    polled = tool_builder.get_job(job.job_id)
+    assert polled is not None
+    assert (polled["state"], polled["outcome"]) == ("failed", "failed")
+    assert str(other / ".env") in polled["error"]
+    assert "請檢查" in polled["error"]
+    assert "other-secret-abcdef" not in polled["error"]
+    assert built == ["kbsearch"]
+    assert captured == {}
 
 
 def test_job_outcome_of_an_unexpected_exception_is_failed() -> None:
@@ -7157,10 +8174,21 @@ def _capture_start(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
 
     async def fake_start(
-        name: str, feedback: str | None, expected_vid: str, *, runs: tuple[Any, ...] = ()
+        name: str,
+        feedback: str | None,
+        expected_vid: str,
+        *,
+        runs: tuple[Any, ...] = (),
+        draft: Any = None,
     ) -> tool_builder.ReviseJobStart:
         calls.append(
-            {"name": name, "feedback": feedback, "expected_vid": expected_vid, "runs": runs}
+            {
+                "name": name,
+                "feedback": feedback,
+                "expected_vid": expected_vid,
+                "runs": runs,
+                "draft": draft,
+            }
         )
         return tool_builder.ReviseJobStart(job_id="job-fix")
 
@@ -7280,6 +8308,7 @@ def test_router_revise_keeps_its_copy_when_the_records_are_purged(
         resolution: tools.Resolved | None,
         *,
         runs: tuple[AttachedRun, ...] = (),
+        continuation: Any = None,
     ) -> InstallOutcome:
         received.append(runs)
         return InstallOutcome(ok=True, tool_name=name)
@@ -7363,10 +8392,11 @@ def test_revise_prompt_keeps_its_own_no_feedback_words_whole(
 
 
 def test_revise_prompt_keeps_the_end_of_a_long_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """P3-r1 G3: at a small budget stderr loses its START, never the failing line.
+    """At a small budget stderr loses its START, never the failing line.
 
     The stored copy is a tail and the header says stderr keeps its END; the
-    prompt cut agrees with both. stdout keeps its start.
+    prompt cut agrees with both. stdout keeps its start. The whole prompt is
+    held to the budget, its headers and fixed instructions included.
     """
     budget = 4000  # the settings floor for llm_prompt_budget_tokens (cold ratio 1.0)
     _install_settings(monkeypatch, llm_prompt_budget_tokens=budget)
@@ -7381,7 +8411,7 @@ def test_revise_prompt_keeps_the_end_of_a_long_stderr(monkeypatch: pytest.Monkey
     )
 
     stderr_block = prompt.split("stderr:\n", 1)[1].split("\nstdout:\n", 1)[0]
-    assert len(stderr_block) == budget
+    assert len(prompt) <= budget
     assert stderr_block.startswith(tool_builder._TAIL_TRUNCATION_MARKER)
     assert stderr_block.endswith("KeyError: 'hits'")
     assert "  frame 0\n" not in stderr_block
@@ -7402,8 +8432,8 @@ def test_truncate_tail_to_bounds() -> None:
 
 def test_failing_run_text_names_another_version_without_guessing_its_age() -> None:
     """P3-r1 G4: a run of another vid may be newer (discarded) or unrelated."""
-    newer = tool_builder._failing_run_text(
-        _attached(vid="20270101T000000Z-ffffff"), _TEST_VID, 10_000
+    newer = tool_builder._run_text_shown(
+        tool_builder._run_texts(_attached(vid="20270101T000000Z-ffffff"), _TEST_VID), 10_000
     )
 
     assert "It ran a DIFFERENT version (20270101T000000Z-ffffff)" in newer
@@ -7412,8 +8442,9 @@ def test_failing_run_text_names_another_version_without_guessing_its_age() -> No
 
 def test_failing_run_text_explains_a_backend_error() -> None:
     """P3-r1 G4: every outcome §6.1 lists has prose, ``error`` included."""
-    text = tool_builder._failing_run_text(
-        _attached(outcome=tools.RUN_ERROR, exit_code=None), _TEST_VID, 10_000
+    text = tool_builder._run_text_shown(
+        tool_builder._run_texts(_attached(outcome=tools.RUN_ERROR, exit_code=None), _TEST_VID),
+        10_000,
     )
 
     assert "Outcome: the BACKEND failed around this call" in text
@@ -7568,6 +8599,7 @@ def test_the_revise_job_carries_the_verification(
         _resolution: tools.Resolved | None,
         *,
         runs: tuple[Any, ...] = (),
+        continuation: Any = None,
     ) -> InstallOutcome:
         return InstallOutcome(
             ok=True,
@@ -7591,3 +8623,7521 @@ def test_the_revise_job_carries_the_verification(
     job = asyncio.run(scenario())
     assert job["kind"] == "revise"
     assert job["verification"] == {"status": "no_examples", "runs": [], "finished": True}
+
+
+# --- revise: the measured stop, the two notes, the budget in the prompt -------------
+
+
+def test_revise_result_keeps_the_install_fields_and_their_rules() -> None:
+    """The three fields a revise shares with an install come out exactly as
+    ``InstallResult`` makes them -- strict ``ready``, capped summary -- and a ready
+    result still needs a valid name."""
+    raw = {
+        "tool_name": "  kbsearch  ",
+        "summary": "  改好了  " + "z" * (tool_builder._SUMMARY_CAP + 50),
+        "ready": "true",
+        "handoff": "h",
+        "operator_action": "a",
+    }
+    revise = tool_builder.ReviseResult.model_validate(raw)
+    install = InstallResult.model_validate(raw)
+
+    assert revise.model_dump(include={"tool_name", "summary", "ready"}) == install.model_dump()
+    assert (revise.handoff, revise.operator_action) == ("h", "a")
+    ambiguous = tool_builder.ReviseResult.model_validate({"ready": "yes", "tool_name": "t"})
+    assert ambiguous.ready is False
+    with pytest.raises(ValidationError):
+        tool_builder.ReviseResult.model_validate({"tool_name": "Bad Name!", "ready": True})
+
+
+@pytest.mark.parametrize(
+    ("field", "cap"),
+    [
+        ("handoff", tool_builder._HANDOFF_CAP),
+        ("operator_action", tool_builder._OPERATOR_ACTION_CAP),
+    ],
+)
+def test_revise_result_masks_a_note_before_cutting_it(
+    monkeypatch: pytest.MonkeyPatch, field: str, cap: int
+) -> None:
+    """Each note is masked while whole, then cut -- the summary's order. A secret
+    straddling the cap would otherwise leave the part inside the cap behind, an
+    interior fragment no later mask can match."""
+    secret = "kb-live-secret-abcdef123456"
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    note = "x" * (cap - 10) + secret + "y" * 100
+
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "summary": "s", "ready": False, field: note}
+    )
+
+    kept = getattr(result, field)
+    assert secret not in kept
+    assert secret[:10] not in kept  # the fragment a cut-first order would keep
+    assert "•••" in kept  # masked before the cut: the marker's start survives it
+    assert len(kept) <= cap
+
+
+@pytest.mark.parametrize(
+    ("field", "cap"),
+    [
+        ("summary", tool_builder._SUMMARY_CAP),
+        ("handoff", tool_builder._HANDOFF_CAP),
+        ("operator_action", tool_builder._OPERATOR_ACTION_CAP),
+    ],
+)
+def test_revise_result_cuts_each_field_at_its_own_cap(field: str, cap: int) -> None:
+    """The result model's mask-then-cap cuts each field at that field's own cap,
+    never at another field's."""
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "ready": False, field: "z" * (cap + 100)}
+    )
+
+    assert getattr(result, field) == "z" * cap
+
+
+@pytest.mark.parametrize("field", ["handoff", "operator_action"])
+def test_revise_result_masks_a_note_before_stripping_it(
+    monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """A registered value with edge whitespace stops matching once a strip eats
+    that edge, so the mask runs first."""
+    secret = " kb-live-secret-abcdef "
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+
+    result = tool_builder.ReviseResult.model_validate(
+        {"tool_name": "kbsearch", "ready": False, field: secret}
+    )
+
+    assert "kb-live-secret-abcdef" not in getattr(result, field)
+    assert tools._REDACTION_MARKER in getattr(result, field)
+
+
+def test_run_install_still_closes_with_install_result_and_measures_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An install asks for exactly what it always asked for: ``InstallResult``, with
+    no notes in its schema and no stats object passed, so its outcome carries
+    none of a revise's measured fields."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    captured = _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert outcome.ok is True
+    assert captured["model_cls"] is InstallResult
+    assert captured["stats"] is None
+    assert set(InstallResult.model_json_schema()["properties"]) == {"tool_name", "summary", "ready"}
+    measured = (outcome.stopped_by, outcome.failure, outcome.rounds_used, outcome.max_rounds)
+    assert measured == (None, None, None, None)
+    assert (outcome.handoff, outcome.operator_action) == (None, None)
+
+
+def test_install_prompt_changes_only_by_its_shell_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What an install sends is frozen text with ONE backend number in it.
+
+    At a 120-second shell timeout the builder prompt (with and without the secret
+    addendum) and the ``InstallResult`` schema embedded after it are pinned whole,
+    by digest; at any other timeout only that number differs."""
+    _install_settings(monkeypatch, tool_install_shell_timeout_seconds=120)
+    at_120 = tool_builder._builder_system_prompt(None)
+    with_secret = tool_builder._builder_system_prompt("KB_TOKEN")
+    schema = json.dumps(InstallResult.model_json_schema(), ensure_ascii=False)
+
+    def digest(text: str) -> str:
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    changed = "the install's sent text changed; if that is intended, pin the new digest here"
+    assert digest(at_120) == ("f9d5e5849d3699a1aa8b2632defe40010bbd7f4f758bef767de33ad2b5afe376"), (
+        changed
+    )
+    assert digest(with_secret) == (
+        "73a9ee6e9e15fb960bfba10e30157ce0344d5f1b11cc14d39a220c64cdbedd36"
+    ), changed
+    assert digest(schema) == ("0307b2b849ec44e287c32e8981199537891021f3f37fe42e5b3860e2e0ef7229"), (
+        changed
+    )
+    assert "It has a timeout of 120 seconds and capped output" in at_120
+
+    _install_settings(monkeypatch, tool_install_shell_timeout_seconds=45)
+    assert tool_builder._builder_system_prompt(None) == at_120.replace(
+        "a timeout of 120 seconds", "a timeout of 45 seconds"
+    )
+
+
+def test_revise_prompt_states_the_budget_the_session_runs_under(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every number in the revise prompt's budget is the one the session will be held
+    to: the settings ``run_revise`` passes on, and the per-reply cap the loop itself
+    applies -- read from ``llm._MAX_TOOL_CALLS_PER_REPLY``, never a second copy."""
+    _install_settings(
+        monkeypatch,
+        tool_install_max_rounds=17,
+        tool_install_timeout_seconds=780,
+        tool_install_shell_timeout_seconds=45,
+        llm_tool_conversation_budget_tokens=300_000,
+    )
+    monkeypatch.setattr(llm, "_MAX_TOOL_CALLS_PER_REPLY", 7)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+
+    assert "at most 17 tool rounds" in prompt
+    assert "13 minutes of wall-clock time for the whole session" in prompt
+    assert "each run_shell command is killed after 45 seconds" in prompt
+    assert "It has a timeout of 45 seconds" in prompt  # the shared base sentence agrees
+    assert "may grow to about 300,000 tokens" in prompt
+    assert "at most 7 calls of a reply are executed" in prompt
+    assert "calls past the first 7 are rejected without running" in prompt
+    assert "finishes well within 45 seconds" in prompt
+    tokens = ("{rounds}", "{session}", "{shell_timeout}", "{conversation_tokens}", "{max_calls}")
+    for token in tokens:
+        assert token not in prompt
+
+
+def test_revise_prompt_says_how_to_batch_and_hand_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_settings(monkeypatch)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+
+    assert "Combine short tests into ONE run_shell command" in prompt
+    assert "treat the whole batch as failed if any one case fails" in prompt
+    assert "including when you are told that the tool-call budget is exhausted" in prompt
+    assert 'set "ready" to false' in prompt
+    assert (
+        "answer ready=true only if your last test run already proved that the change works"
+        in prompt
+    )
+    assert 'write "handoff" for whoever continues this work' in prompt
+    assert "Do not copy raw tool arguments, command output or personal content" in prompt
+    assert 'write "operator_action": what to do, in the operator\'s language' in prompt
+    assert "exact KEY=value line(s) to paste into the package's config.env" in prompt
+    # The revise schema the model is shown asks for the two notes; the install's
+    # does not (see test_install_prompt_changes_only_by_its_shell_timeout).
+    properties = tool_builder.ReviseResult.model_json_schema()["properties"]
+    assert {"handoff", "operator_action"} <= set(properties)
+
+
+def test_revise_prompt_asks_for_operator_action_whether_or_not_the_revision_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The handoff is only for an unfinished revision, but what the operator must do
+    by hand is asked for either way: a fix verified with a new value in run_shell
+    still needs that value pasted into the package's config.env. The prompt and the
+    schema description the model is shown say the same."""
+    _install_settings(monkeypatch)
+
+    prompt = tool_builder._revise_system_prompt("kbsearch")
+    # The docstring's own line breaks are not part of what it says.
+    description = " ".join(tool_builder.ReviseResult.model_json_schema()["description"].split())
+
+    assert 'When you do finish, leave "handoff" empty.' in prompt
+    assert "Whether you finish or not, if the operator has to act outside your workspace" in prompt
+    assert 'finish with ready=true and put the line to paste in "operator_action"' in prompt
+    assert 'Leave "operator_action" empty when the operator has nothing to do.' in prompt
+    assert '"handoff" is only for an unfinished' in description
+    assert "leave it empty when you finish" in description
+    assert "whether you finish or not" in description
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (900, "15 minutes"),
+        (60, "1 minute"),
+        (3600, "60 minutes"),
+        (90, "90 seconds"),
+        (100.5, "100.5 seconds"),
+    ],
+)
+def test_session_budget_is_stated_without_rounding(seconds: float, text: str) -> None:
+    """Whole minutes only when the budget is a whole number of them; otherwise the
+    exact seconds, never a rounded figure the deadline would not keep."""
+    assert tool_builder._duration_text(seconds) == text
+
+
+def test_failing_runs_caveat_rides_only_with_attached_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rule about masked and cut record texts is in a prompt exactly when there
+    are records to read, right after their header and before the first of them."""
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset())
+    caveat = tool_builder._FAILING_RUNS_CAVEAT
+
+    with_runs = tool_builder._revise_user_prompt(
+        None, None, runs=(_attached(),), workspace_vid=_TEST_VID
+    )
+    without_runs = tool_builder._revise_user_prompt("加上分頁", None)
+
+    assert f"{tools._REDACTION_MARKER} stands for a hidden value" in caveat
+    assert "the run cannot be reproduced exactly, and do not guess the missing part" in caveat
+    header_at = with_runs.index(tool_builder._FAILING_RUNS_HEADER)
+    assert header_at < with_runs.index(caveat) < with_runs.index("Run #7 at")
+    assert caveat not in without_runs
+    assert "stands for a hidden value" not in tool_builder._revise_system_prompt("kbsearch")
+
+
+def test_every_cut_marker_a_run_text_can_carry_says_so() -> None:
+    """The caveat tells the builder a cut text carries a marker containing 已截斷.
+    Every marker that can cut a text the run section quotes -- the record's own
+    head and tail cuts, the tool-output cap in what the assistant was told, and the
+    prompt's head and tail cuts -- does."""
+    for marker in (
+        tool_runs._HEAD_CUT_MARKER,
+        tool_runs._TAIL_CUT_MARKER,
+        tools._OUTPUT_TRUNCATION_MARKER,
+        memory_ai._TRUNCATION_MARKER,
+        tool_builder._TAIL_TRUNCATION_MARKER,
+    ):
+        assert "已截斷" in marker
+
+
+def _fake_revise_session(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    measure: Callable[[StructuredRunStats], None],
+    result: BaseModel | None = None,
+    raises: BaseException | None = None,
+) -> dict[str, Any]:
+    """Stand in for the revise's ``generate_structured``: record what it was handed,
+    write ``measure``'s facts into the stats object the way the real loop does as
+    it runs, then return ``result`` or raise ``raises``. A ``result`` built with
+    ``model_construct`` skips ``ReviseResult``'s own sanitizer, so whatever masking
+    the outcome shows is ``run_revise``'s own."""
+    captured: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str,
+        user_prompt: str,
+        model_cls: type[BaseModel],
+        *,
+        workflow: str = "unknown",
+        tools: Any = None,
+        max_tool_rounds: int | None = None,
+        timeout_seconds: float | None = None,
+        stats: StructuredRunStats | None = None,
+    ) -> BaseModel:
+        captured.update(model_cls=model_cls, stats=stats, max_tool_rounds=max_tool_rounds)
+        assert stats is not None
+        measure(stats)
+        if raises is not None:
+            raise raises
+        assert result is not None
+        return result
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+    return captured
+
+
+_NOTE_SECRET = "live-secret-value-123456"
+
+
+def test_run_revise_reports_the_measured_stop_and_masks_the_notes_again(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session the round budget ended, closing ready=false with both notes: the
+    outcome carries what the loop measured and the budget it was given, and the
+    notes as ``run_revise`` itself masked them -- the model's raw text reaches it
+    here, and the secret it repeats is the package's own key."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NOTE_SECRET}\n", encoding="utf-8")
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_max_rounds=30)
+
+    def measure(stats: StructuredRunStats) -> None:
+        stats.tool_rounds_used = 30
+        stats.completions = 31
+        stats.finalized_by = "rounds"
+
+    captured = _fake_revise_session(
+        monkeypatch,
+        measure=measure,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            summary="分頁還沒修完",
+            ready=False,
+            handoff=f"run.py 的 page 參數已加上，用 {_NOTE_SECRET} 測過第一頁",  # noqa: RUF001
+            operator_action=f"在 config.env 加上 PAGE_SIZE=50（金鑰 {_NOTE_SECRET} 不要改）",  # noqa: RUF001
+        ),
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert captured["model_cls"] is tool_builder.ReviseResult
+    assert isinstance(captured["stats"], StructuredRunStats)
+    assert captured["max_tool_rounds"] == 30
+    assert outcome.not_ready is True
+    measured = (outcome.stopped_by, outcome.failure, outcome.rounds_used, outcome.max_rounds)
+    assert measured == ("rounds", None, 30, 30)
+    for note in (outcome.handoff, outcome.operator_action):
+        assert note is not None
+        assert _NOTE_SECRET not in note
+        assert tools._REDACTION_MARKER in note
+    assert outcome.operator_action is not None and "PAGE_SIZE=50" in outcome.operator_action
+
+
+@pytest.mark.parametrize(
+    ("raises", "facts", "error_part"),
+    [
+        (
+            LLMUpstreamError("EmptyResponse: the LLM returned empty content"),
+            {
+                "tool_rounds_used": 24,
+                "completions": 25,
+                "finalized_by": "rounds",
+                "failure": "empty_response",
+            },
+            "EmptyResponse",
+        ),
+        (
+            LLMUpstreamError("Timeout: the upstream LLM request failed"),
+            {"tool_rounds_used": 9, "completions": 9, "failure": "deadline"},
+            "Timeout",
+        ),
+        (
+            LLMNotConfiguredError("The LLM endpoint is not configured."),
+            {"failure": "not_configured"},
+            "LLM 尚未設定",
+        ),
+    ],
+    ids=["rounds-then-empty", "deadline", "not-configured"],
+)
+def test_run_revise_llm_failure_still_reports_the_measured_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    raises: BaseException,
+    facts: dict[str, Any],
+    error_part: str,
+) -> None:
+    """A session that ends in an exception still reports what the loop had measured
+    by then -- the failure that ended it included -- next to the error it always
+    reported. There is no answer, so there are no notes."""
+    _seed_package(monkeypatch, tmp_path)
+
+    def measure(stats: StructuredRunStats) -> None:
+        for key, value in facts.items():
+            setattr(stats, key, value)
+
+    _fake_revise_session(monkeypatch, measure=measure, raises=raises)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False and outcome.not_ready is False
+    assert outcome.error is not None and error_part in outcome.error
+    assert outcome.stopped_by == facts.get("finalized_by")
+    assert outcome.failure == facts["failure"]
+    assert outcome.rounds_used == facts.get("tool_rounds_used", 0)
+    assert outcome.max_rounds == 24  # the default budget the session was given
+    assert (outcome.handoff, outcome.operator_action) == (None, None)
+
+
+def test_run_revise_masks_the_notes_off_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The notes' second mask is the same tools-directory scan as the summary's, so
+    it runs on a worker like the summary's does."""
+    _seed_package(monkeypatch, tmp_path)
+    loop_thread = threading.current_thread()
+    calls: list[tuple[str, threading.Thread]] = []
+    real_redact = tools.redact_known_secrets
+
+    def redact_spy(text: str) -> str:
+        calls.append((text, threading.current_thread()))
+        return real_redact(text)
+
+    monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    _fake_revise_session(
+        monkeypatch,
+        measure=lambda stats: None,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            summary="s",
+            ready=False,
+            handoff="the handoff note",
+            operator_action="the operator action",
+        ),
+    )
+
+    asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    for note in ("the handoff note", "the operator action"):
+        threads = [thread for text, thread in calls if text == note]
+        assert threads, note
+        assert loop_thread not in threads, note
+
+
+def test_run_revise_env_strip_refusal_still_carries_what_the_model_said_masked_on_a_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The session returned an answer, then the builder ``.env`` could not be
+    stripped: the outcome reports that refusal AND carries the model's summary and
+    both notes, each masked again by ``run_revise`` on a worker -- the model's raw
+    text reaches it here, and the secret it repeats is the package's own key. No
+    draft is made of a workspace that may still hold that ``.env``, although the
+    notes alone would be worth one, and the job says why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NOTE_SECRET}\n", encoding="utf-8")
+    loop_thread = threading.current_thread()
+    masked_on: dict[str, list[threading.Thread]] = {}
+    real_redact = tools.redact_known_secrets
+
+    def redact_spy(text: str) -> str:
+        masked_on.setdefault(text, []).append(threading.current_thread())
+        return real_redact(text)
+
+    monkeypatch.setattr(tools, "redact_known_secrets", redact_spy)
+    monkeypatch.setattr(
+        tool_builder,
+        "_strip_builder_env",
+        lambda build_root, base: ((), tool_builder._ERROR_BUILDER_ENV_STRIP),
+    )
+    said = {
+        "summary": f"分頁改好了，用 {_NOTE_SECRET} 測過",  # noqa: RUF001
+        "handoff": f"run.py 的 page 參數已加上，用 {_NOTE_SECRET} 測過第一頁",  # noqa: RUF001
+        "operator_action": f"在 config.env 加上 PAGE_SIZE=50（金鑰 {_NOTE_SECRET} 不要改）",  # noqa: RUF001
+    }
+    _fake_revise_session(
+        monkeypatch,
+        measure=lambda stats: None,
+        result=tool_builder.ReviseResult.model_construct(
+            tool_name="kbsearch",
+            ready=True,
+            summary=said["summary"],
+            handoff=said["handoff"],
+            operator_action=said["operator_action"],
+        ),
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        False,
+        tool_drafts.REASON_STRIP_ENV,
+        str(session / "build"),
+    )
+    carried = {
+        "summary": outcome.summary,
+        "handoff": outcome.handoff,
+        "operator_action": outcome.operator_action,
+    }
+    for field_name, raw in said.items():
+        assert carried[field_name] == raw.replace(_NOTE_SECRET, tools._REDACTION_MARKER), field_name
+        assert masked_on.get(raw), field_name
+        assert loop_thread not in masked_on[raw], field_name
+
+
+# A secret exactly at the redactor's floor: the shortest value it masks, so the one
+# whose marker lengthens a text the most.
+_SHORT_SECRET = "Zq7xK2"
+
+
+def _filled_with_secret(cap: int) -> str:
+    """Exactly ``cap`` characters of ``_SHORT_SECRET`` over and over, one comma
+    between each two: back-to-back occurrences would be masked as one run, by a
+    single marker, and the text would shrink instead."""
+    unit = _SHORT_SECRET + ","
+    return (unit * (cap // len(unit) + 1))[:cap]
+
+
+def _masked_stripped_cut(text: str, cap: int) -> str:
+    """What a field must read after a mask that knows ``_SHORT_SECRET``: masked,
+    then stripped, then cut to ``cap`` -- spelled out with the masking primitive,
+    not with the function under test."""
+    return tools._mask_known_secrets(text, [_SHORT_SECRET]).strip()[:cap]
+
+
+def _fake_session_that_learns_a_secret(
+    monkeypatch: pytest.MonkeyPatch, raw: dict[str, Any]
+) -> dict[str, Any]:
+    """Stand in for the builder session: the model's reply goes through the result
+    model -- its FIRST mask -- while no secret is known, and only then does
+    ``_SHORT_SECRET`` become known, the way a value written into some tool's
+    ``.env`` during the session would. So whatever the outcome shows is its
+    SECOND mask. Returns the fields as the first mask left them."""
+    known: set[str] = set()
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset(known))
+    first_pass: dict[str, Any] = {}
+
+    async def fake(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        result = model_cls.model_validate(raw)
+        first_pass.update(result.model_dump())
+        known.add(_SHORT_SECRET)
+        return result
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", fake)
+    _fake_summary_generate(monkeypatch)
+    return first_pass
+
+
+def test_run_revise_caps_each_field_again_after_its_second_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A secret that becomes known between the two masks makes the second one
+    lengthen the text. The summary and both notes, each sent at its cap and full of
+    that secret, come out masked, stripped and cut to their OWN caps again -- so
+    each stays within its cap."""
+    _seed_package(monkeypatch, tmp_path)
+    caps = {
+        "summary": tool_builder._SUMMARY_CAP,
+        "handoff": tool_builder._HANDOFF_CAP,
+        "operator_action": tool_builder._OPERATOR_ACTION_CAP,
+    }
+    sent = {field: _filled_with_secret(cap) for field, cap in caps.items()}
+    first_pass = _fake_session_that_learns_a_secret(
+        monkeypatch, {"tool_name": "kbsearch", "ready": False, **sent}
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    # The first mask knew no secret: each field came through it whole, at its cap.
+    assert {field: first_pass[field] for field in caps} == sent
+    assert outcome.not_ready is True
+    carried = {
+        "summary": outcome.summary,
+        "handoff": outcome.handoff,
+        "operator_action": outcome.operator_action,
+    }
+    for field, cap in caps.items():
+        value = carried[field]
+        assert value == _masked_stripped_cut(sent[field], cap), field
+        assert value is not None and len(value) <= cap, field
+        assert tools._REDACTION_MARKER in value, field
+
+
+def test_run_install_caps_the_summary_again_after_its_second_mask(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The install's summary takes the same second mask-then-cap when the outcome
+    is built: sent at its cap and full of a secret that became known after the
+    first mask, it comes out masked, stripped and cut to its cap again."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    sent = _filled_with_secret(tool_builder._SUMMARY_CAP)
+    first_pass = _fake_session_that_learns_a_secret(
+        monkeypatch, {"tool_name": "kbsearch", "summary": sent, "ready": False}
+    )
+    _no_fetch(monkeypatch)
+
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build a search tool"))
+
+    assert first_pass["summary"] == sent  # the first mask knew no secret
+    assert outcome.not_ready is True
+    summary = outcome.summary
+    assert summary == _masked_stripped_cut(sent, tool_builder._SUMMARY_CAP)
+    assert summary is not None and len(summary) <= tool_builder._SUMMARY_CAP
+    assert tools._REDACTION_MARKER in summary
+
+
+def test_the_revise_job_reports_the_measured_stop_and_the_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, client: TestClient
+) -> None:
+    """The six fields travel from the outcome through the job table to the poll."""
+    _seed_package(monkeypatch, tmp_path)
+    reported: dict[str, Any] = {
+        "stopped_by": "rounds",
+        "failure": "empty_response",
+        "rounds_used": 24,
+        "max_rounds": 24,
+        "handoff": "改了 run.py，還沒測第二頁",  # noqa: RUF001
+        "operator_action": "PAGE_SIZE=50",
+    }
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        _resolution: tools.Resolved | None,
+        *,
+        runs: tuple[Any, ...] = (),
+        continuation: Any = None,
+    ) -> InstallOutcome:
+        return InstallOutcome(
+            ok=False,
+            tool_name=name,
+            error="AI 修訂工具失敗（EmptyResponse）。",  # noqa: RUF001
+            **reported,
+        )
+
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+
+    async def scenario() -> dict[str, Any]:
+        started = await tool_builder.start_revise_job("kbsearch", "x", _TEST_VID)
+        assert started.job_id is not None
+        for _ in range(200):
+            job = tool_builder.get_job(started.job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("job did not finish")
+
+    job = asyncio.run(scenario())
+    assert {key: job[key] for key in reported} == reported
+
+    polled = client.get(f"/api/tools/jobs/{job['job_id']}")
+    assert polled.status_code == 200
+    assert {key: polled.json()[key] for key in reported} == reported
+
+
+# --- run_shell commands end with their session ----------------------------------
+#
+# These drive the REAL generate_structured: a scripted endpoint answers the first
+# request with one run_shell call, so the command runs through the real tool loop,
+# the real meta-tool and a real process group, and the session's own deadline (or
+# a cancellation) is what ends it.
+
+
+def _session_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, **overrides: Any
+) -> Settings:
+    """One settings object for the builder and the llm loop: a configured endpoint,
+    a one-second session, and a per-command timeout far longer than the session."""
+    values: dict[str, Any] = {
+        "tools_dir": str(tmp_path / "tools"),
+        "openai_base_url": "http://llm.internal.example/v1",
+        "openai_api_key": "sk-session-test-key",
+        "openai_model": "test-model",
+        "tool_install_timeout_seconds": 1.0,
+        "tool_install_shell_timeout_seconds": 20,
+        **overrides,
+    }
+    settings = _install_settings(monkeypatch, **values)
+    monkeypatch.setattr("afterthread.services.llm.get_settings", lambda: settings)
+    # The loop starts a tool call only while more than this is left of the
+    # session; lowered so a one-second session still starts its command.
+    monkeypatch.setattr(llm, "_TOOL_DEADLINE_FLOOR_SECONDS", 0.05)
+    return settings
+
+
+def _endpoint_asking_for_one_call(
+    monkeypatch: pytest.MonkeyPatch, tool: str, arguments: dict[str, Any]
+) -> None:
+    """The first request is answered with ONE call of the meta-tool ``tool``. No
+    later request ever returns, so the session ends by its deadline or by a
+    cancellation."""
+    call = SimpleNamespace(
+        id="call_0",
+        type="function",
+        function=SimpleNamespace(name=tool, arguments=json.dumps(arguments)),
+    )
+    message = SimpleNamespace(content=None, tool_calls=[call])
+    replies = [SimpleNamespace(choices=[SimpleNamespace(message=message)])]
+
+    async def create(**_kwargs: Any) -> Any:
+        if replies:
+            return replies.pop(0)
+        await asyncio.sleep(3600)
+        raise AssertionError("the session should have ended before this")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+
+
+def _endpoint_asking_for_one_command(monkeypatch: pytest.MonkeyPatch, command: str) -> None:
+    """The first request is answered with ONE run_shell call (``_endpoint_asking_for_one_call``)."""
+    _endpoint_asking_for_one_call(monkeypatch, "run_shell", {"command": command})
+
+
+def _group_exists(pgid: int) -> bool:
+    """Whether the group id is still held. A killed leader not yet reaped holds it
+    too: macOS answers that case with EPERM, not ESRCH."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _pid_in(pid_file: Path) -> int | None:
+    text = pid_file.read_text(encoding="utf-8").strip() if pid_file.exists() else ""
+    return int(text) if text else None
+
+
+def _watch_workspace_steps(
+    monkeypatch: pytest.MonkeyPatch,
+    pgid: Callable[[], int | None],
+    *,
+    worker_lag: float | None = None,
+) -> list[tuple[str, bool]]:
+    """Record, in order, each ``_strip_builder_env`` and ``_cleanup_staging`` call
+    with whether the command's process group still existed at that moment.
+
+    With ``worker_lag``, the run_shell worker's return is recorded as well, that
+    many seconds after its command ended: a run that does not wait for the worker
+    reaches the workspace inside that window, and the order shows it."""
+    seen: list[tuple[str, bool]] = []
+    real_strip = tool_builder._strip_builder_env
+    real_cleanup = tool_builder._cleanup_staging
+
+    def group_alive() -> bool:
+        group = pgid()
+        return group is not None and _group_exists(group)
+
+    def strip(build_root: tools.BuildRoot, base: Path) -> Any:
+        seen.append(("strip", group_alive()))
+        return real_strip(build_root, base)
+
+    def cleanup(staging: Path, base: Path) -> None:
+        seen.append(("cleanup", group_alive()))
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+    if worker_lag is not None:
+        inner = tool_builder._run_shell_subprocess
+
+        def worker(*args: Any) -> str:
+            try:
+                return inner(*args)
+            finally:
+                time.sleep(worker_lag)
+                seen.append(("worker returned", group_alive()))
+
+        monkeypatch.setattr(tool_builder, "_run_shell_subprocess", worker)
+    return seen
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_deadline_mid_command_kills_and_waits_for_it_before_the_workspace_is_touched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The session's deadline fires while a run_shell command runs -- it recorded
+    its process group, then sleeps far past the session. By the time the workspace
+    is stripped and removed, that group is gone -- killed and reaped, not left to
+    run on to its own timeout -- and the worker that ran it has returned. The run
+    ends long before that timeout would."""
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    settings = _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file), worker_lag=0.3)
+    _no_fetch(monkeypatch)
+
+    started = time.monotonic()
+    if kind == "install":
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    else:
+        outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+    elapsed = time.monotonic() - started
+
+    assert _pid_in(pid_file) is not None  # the command was running at the deadline
+    assert seen == [("worker returned", False), ("strip", False), ("cleanup", False)]
+    assert elapsed < settings.tool_install_shell_timeout_seconds / 2
+    assert outcome.ok is False
+    assert outcome.error is not None and "Timeout" in outcome.error
+    if kind == "revise":
+        assert outcome.failure == "deadline"
+
+
+def test_cancelling_the_session_still_kills_and_waits_for_its_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revise itself is cancelled while its command runs: its ``finally``
+    still touches the workspace only after the command's process group is gone
+    and its worker has returned. With its commands stopped, the work in the
+    staging is held by no one, so that touch is the strip of the builder's
+    ``.env`` the cancellation skipped, and the staging stays."""
+    _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file), worker_lag=0.3)
+
+    async def cancel_once_running() -> None:
+        session = asyncio.ensure_future(_run_revise("kbsearch", "fix it"))
+        for _ in range(1000):
+            if _pid_in(pid_file) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the command never started")
+        session.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session
+
+    started = time.monotonic()
+    asyncio.run(cancel_once_running())
+
+    assert seen == [("worker returned", False), ("strip", False)]
+    assert time.monotonic() - started < 10
+    assert len(_session_roots(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("held_until_stop", ["its-check", "its-spawn"])
+def test_a_command_its_worker_reaches_after_the_session_stopped_never_outlives_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, held_until_stop: str
+) -> None:
+    """A command whose worker only gets going after the session has stopped --
+    held here until the stop signal is set. Reaching the start of
+    ``_run_shell_subprocess`` only then, it is never spawned at all; reaching the
+    spawn only then (past the check before it), it is killed at its first poll.
+    Either way nothing waits out the command's own timeout."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+    real_shell_popen = tool_builder._ShellPopen
+    stops: list[threading.Event | None] = []
+    spawned: list[int] = []
+
+    def run_late(
+        staging: Path,
+        command: str,
+        timeout: float,
+        cap: int,
+        extra_env: dict[str, str] | None = None,
+        abort: threading.Event | None = None,
+        evidence: tool_builder._ShellEvidence | None = None,
+    ) -> str:
+        stops.append(abort)
+        if held_until_stop == "its-check":
+            assert abort is not None and abort.wait(15)
+        return real_run(staging, command, timeout, cap, extra_env, abort, evidence)
+
+    def spawn_late(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
+        if held_until_stop == "its-spawn":
+            assert stops[0] is not None and stops[0].wait(15)
+        proc = real_shell_popen(command, cwd=cwd, env=env)
+        assert proc.pid is not None
+        spawned.append(proc.pid)
+        return proc
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", run_late)
+    monkeypatch.setattr(tool_builder, "_ShellPopen", spawn_late)
+    seen = _watch_workspace_steps(
+        monkeypatch, lambda: spawned[0] if spawned else None, worker_lag=0.0
+    )
+
+    started = time.monotonic()
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    elapsed = time.monotonic() - started
+
+    # The command reached its worker, holding the session's stop signal.
+    assert len(stops) == 1 and isinstance(stops[0], threading.Event)
+    assert outcome.ok is False
+    assert seen == [("worker returned", False), ("strip", False), ("cleanup", False)]
+    assert elapsed < 10
+    if held_until_stop == "its-check":
+        assert spawned == []
+        assert not pid_file.exists()
+    else:
+        assert len(spawned) == 1
+
+
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+def test_a_cancelled_command_task_counts_as_stopped_only_once_its_teardown_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loop_kind: str
+) -> None:
+    """The event loop shutting down cancels every task still on it -- the
+    session's and its command's own task alike -- and a cancelled task is done
+    while the worker it waited on still runs. Here that worker lingers after its
+    command's teardown. The session, stopping its commands as it unwinds, counts
+    the command stopped only on the worker's report of that teardown, by which
+    time the command's process group is gone: the shutdown's gather keeps the
+    loop running, so the report reaches it."""
+    if loop_kind == "uvloop":
+        new_loop = pytest.importorskip("uvloop").new_event_loop
+    else:
+        new_loop = asyncio.new_event_loop
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    pid_file = tmp_path / "command.pid"
+    real_run = tool_builder._run_shell_subprocess
+    worker_returned = threading.Event()
+
+    def lingering_worker(*args: Any) -> str:
+        try:
+            return real_run(*args)
+        finally:
+            time.sleep(0.3)
+            worker_returned.set()
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", lingering_worker)
+    seen: dict[str, bool] = {}
+    sessions: list[asyncio.Task[None]] = []
+
+    async def session() -> None:
+        shells = tool_builder._BuilderShells()
+        try:
+            await shells.run(staging, f'echo $$ > "{pid_file}"; sleep 30', 20, 4096, None)
+        finally:
+            seen["stopped"] = await shells.stop_and_wait()
+            seen["worker returned"] = worker_returned.is_set()
+            group = _pid_in(pid_file)
+            seen["group alive"] = group is not None and _group_exists(group)
+
+    async def start_and_leave_running() -> None:
+        sessions.append(asyncio.ensure_future(session()))
+        for _ in range(1000):
+            if _pid_in(pid_file) is not None:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the command never started")
+
+    runner = asyncio.Runner(loop_factory=new_loop)
+    try:
+        runner.run(start_and_leave_running())
+    finally:
+        # What the server's own shutdown does: cancel every task left on the loop,
+        # the command's task among them, and run the loop until they are done.
+        runner.close()
+
+    assert sessions[0].cancelled()
+    assert seen == {"stopped": True, "worker returned": True, "group alive": False}
+
+
+def _session_roots(tmp_path: Path) -> list[Path]:
+    """The builder session workspaces still under the tools directory."""
+    staging = (tmp_path / "tools").resolve() / ".staging"
+    return sorted(staging.iterdir()) if staging.is_dir() else []
+
+
+def _record_spawns(monkeypatch: pytest.MonkeyPatch) -> list[subprocess.Popen[str]]:
+    """Every process started from here on, in order: each run_shell command that
+    started (``tool_builder._ShellPopen``), and anything ``subprocess.Popen``
+    starts directly."""
+    real_popen = subprocess.Popen
+    real_shell_popen = tool_builder._ShellPopen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    def recording_shell(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
+        proc = real_shell_popen(command, cwd=cwd, env=env)
+        if proc.spawn_error is None:
+            spawned.append(proc)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", recording)
+    monkeypatch.setattr(tool_builder, "_ShellPopen", recording_shell)
+    return spawned
+
+
+def _end_untorn(spawned: list[subprocess.Popen[str]]) -> None:
+    """Kill and reap commands whose drain was bypassed: nothing else will. Each
+    leader is still unreaped here, so its pid still names its group."""
+    for proc in spawned:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=10)
+
+
+def _drain_that_raises(_proc: subprocess.Popen[str], **_kwargs: Any) -> Any:
+    """Stands in for the whole of ``_communicate_bounded``: an exception out of the
+    drain before any teardown, its own ``finally`` included, has run."""
+    raise RuntimeError("the drain failed before its teardown")
+
+
+def _fail_reader_starts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every output reader thread ``_communicate_bounded`` starts fail to
+    start, as in a process out of threads; every other thread starts as usual."""
+    real_start = threading.Thread.start
+
+    def start(self: threading.Thread) -> None:
+        target = getattr(self, "_target", None)
+        if isinstance(getattr(target, "__self__", None), tools._CappedReader):
+            raise RuntimeError("can't start new thread")
+        real_start(self)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+
+
+async def _job_when_done(job_id: str | None, *, timeout: float = 30.0) -> dict[str, Any]:
+    assert job_id is not None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        job = tool_builder.get_job(job_id)
+        assert job is not None
+        if job["state"] not in ("queued", "running"):
+            return job
+        await asyncio.sleep(0.01)
+    raise AssertionError("the job did not end in time")
+
+
+def _tree_state(root: Path) -> list[tuple[str, int, int, int, str]]:
+    """Every entry under ``root``, ``root`` included: its path, mode, size and
+    mtime, and for a regular file a digest of its bytes."""
+    state = []
+    for path in sorted([root, *root.rglob("*")]):
+        info = path.lstat()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if stat.S_ISREG(info.st_mode) else ""
+        state.append(
+            (str(path.relative_to(root)), info.st_mode, info.st_size, info.st_mtime_ns, digest)
+        )
+    return state
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_command_not_confirmed_stopped_keeps_its_workspace_and_the_job_still_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """A command spawned, then stuck before its first poll -- so the stop signal
+    never reaches it -- for longer than ``_shell_stop_seconds``. Nothing vouches
+    that its workspace is still, so the job neither strips, publishes nor removes
+    it: the session's workspace stays where it was, the job's error (after the
+    session's own) and the backend log both name it, and the job still ends and
+    gives up the single flight."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    release = threading.Event()
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
+
+    async def run_job() -> dict[str, Any]:
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            started = await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)
+            job_id = started.job_id
+        assert job_id is not None
+        for _ in range(3000):
+            job = tool_builder.get_job(job_id)
+            assert job is not None
+            if job["state"] not in ("queued", "running"):
+                return job
+            await asyncio.sleep(0.01)
+        raise AssertionError("the job did not end")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            job = asyncio.run(run_job())
+        flight_held = tool_builder.any_job_active()
+        kept = _session_roots(tmp_path)
+    finally:
+        release.set()
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
+
+    assert group is not None  # the command was spawned before it got stuck
+    assert job["state"] == "failed"
+    assert flight_held is False
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    error = job["error"] or ""
+    action = "AI 修訂工具失敗" if kind == "revise" else "AI 建置工具失敗"
+    assert error.startswith(f"{action}（Timeout")  # noqa: RUF001
+    assert str(kept[0]) in error
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    if version is not None:
+        assert job["failure"] == "deadline"
+        current = tools.resolve_current(_package_root(version))
+        assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_second_cancellation_cutting_the_wait_short_keeps_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """The session is cancelled while its command is stuck before its first poll,
+    then cancelled again while it waits for that command. The second cancellation
+    ends the wait before the command is confirmed stopped, so the workspace is
+    kept just as when the wait runs out: neither stripped nor removed, and named
+    in the backend log."""
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    release = threading.Event()
+    stops: list[threading.Event] = []
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        stops.append(kwargs["abort"])
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
+
+    async def cancel_twice() -> None:
+        if kind == "install":
+            run = run_install("http://kb.example/openapi.json", "build it")
+        else:
+            run = _run_revise("kbsearch", "fix it")
+        session = asyncio.ensure_future(run)
+        for _ in range(1000):
+            if stops and _pid_in(pid_file) is not None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the command never started")
+        session.cancel()
+        for _ in range(1000):
+            if stops[0].is_set():  # set as the wait begins; nothing in between yields
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the session never began waiting for its command")
+        session.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await session
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            asyncio.run(cancel_twice())
+        kept = _session_roots(tmp_path)
+    finally:
+        release.set()
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
+
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+
+
+def test_an_exception_before_the_teardown_leaves_the_command_unconfirmed_and_the_workspace_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A command spawned, then an exception out of its drain before any teardown
+    -- here the whole of ``_communicate_bounded`` replaced, so not even its own
+    ``finally`` runs. The worker returns, but with no evidence: the group is still
+    alive, so the session counts the command unconfirmed and keeps the workspace,
+    neither stripped nor removed."""
+    version = _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_command(monkeypatch, "sleep 30")
+    spawned = _record_spawns(monkeypatch)
+    monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+    seen = _watch_workspace_steps(monkeypatch, lambda: spawned[0].pid if spawned else None)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+        group_alive = len(spawned) == 1 and _group_exists(spawned[0].pid)
+        kept = _session_roots(tmp_path)
+    finally:
+        _end_untorn(spawned)
+
+    assert group_alive  # nothing tore it down: what a returning worker would hide
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    assert outcome.ok is False
+    assert str(kept[0]) in (outcome.error or "")
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    current = tools.resolve_current(_package_root(version))
+    assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+def test_stop_and_wait_answers_false_at_the_first_unconfirmed_report(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two commands running when the session stops: one stuck before its first
+    poll, which never reports, and one whose drain raises once the stop is set,
+    before any teardown, so its worker reports it unconfirmed. ``stop_and_wait``
+    answers False on that report instead of waiting out ``_shell_stop_seconds``
+    for the other."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    release = threading.Event()
+    draining: list[subprocess.Popen[str]] = []
+    real_communicate = tools._communicate_bounded
+
+    def stuck_or_raising_at_the_stop(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        draining.append(proc)
+        if proc is spawned[0]:
+            release.wait(60)
+            return real_communicate(proc, **kwargs)
+        assert kwargs["abort"].wait(30)
+        return _drain_that_raises(proc)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_or_raising_at_the_stop)
+
+    async def scenario() -> tuple[bool, float]:
+        shells = tool_builder._BuilderShells()
+        stuck = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while len(draining) < 1:
+            await asyncio.sleep(0.01)
+        raising = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while len(draining) < 2:
+            await asyncio.sleep(0.01)
+        started = time.monotonic()
+        answer = await shells.stop_and_wait()
+        elapsed = time.monotonic() - started
+        with pytest.raises(RuntimeError):
+            await raising
+        release.set()
+        assert await stuck == tool_builder._SHELL_STOPPED
+        return answer, elapsed
+
+    try:
+        answer, elapsed = asyncio.run(scenario())
+    finally:
+        release.set()
+        _end_untorn(spawned[1:])
+
+    assert len(spawned) == 2
+    assert answer is False
+    assert elapsed < 5 < tool_builder._shell_stop_seconds()
+
+
+def test_a_builder_reader_that_fails_to_start_leaves_no_live_group_and_the_session_goes_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The output reader's thread cannot start once the command is spawned. The
+    drain's teardown still kills and reaps the group before the error leaves it,
+    and that teardown is the evidence: the session goes on -- its next round hands
+    the model the tool's failure, with the group already gone -- the model
+    answers, and the session ends as any other does, its workspace stripped and
+    removed rather than kept."""
+    _session_settings(monkeypatch, tmp_path, tool_install_timeout_seconds=60)
+    _no_fetch(monkeypatch)
+    spawned = _record_spawns(monkeypatch)
+    rounds: list[dict[str, Any]] = []
+    call = SimpleNamespace(
+        id="call_0",
+        type="function",
+        function=SimpleNamespace(name="run_shell", arguments=json.dumps({"command": "sleep 30"})),
+    )
+    answer = {"tool_name": "kbsearch", "summary": "the shell broke; nothing built", "ready": False}
+    replies = [
+        SimpleNamespace(content=None, tool_calls=[call]),
+        SimpleNamespace(content=json.dumps(answer), tool_calls=None),
+    ]
+
+    async def create(**kwargs: Any) -> Any:
+        # Read here, before anything after the session could reap the command.
+        end = spawned[0].returncode if spawned else None
+        rounds.append({"messages": list(kwargs["messages"]), "command ended": end})
+        return SimpleNamespace(choices=[SimpleNamespace(message=replies.pop(0))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    monkeypatch.setattr("afterthread.services.llm._get_client", lambda: client)
+    _fail_reader_starts(monkeypatch)
+    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+
+    try:
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    finally:
+        _end_untorn(spawned)
+
+    assert len(spawned) == 1
+    assert len(rounds) == 2  # the session went on past the failed command
+    results = [message for message in rounds[1]["messages"] if message.get("role") == "tool"]
+    assert [message["content"] for message in results] == ["tool execution failed: RuntimeError"]
+    assert rounds[1]["command ended"] == -signal.SIGKILL  # killed by the drain, and reaped
+    assert outcome.not_ready is True
+    assert outcome.summary == answer["summary"]
+    assert "原地保留" not in (outcome.error or "")
+    assert seen == [("strip", False), ("cleanup", False)]
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("case", ["install-deadline", "revise-deadline", "revise-answer"])
+def test_the_unconfirmed_exit_takes_no_pool_thread_while_a_stuck_worker_holds_the_only_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """The thread pool has one thread, and a stuck worker holds it. A session
+    whose commands cannot be confirmed stopped still ends its job within the
+    bound: nothing on that exit waits for a pool thread -- not the job's error,
+    and, after a session that answered, not the masking of the model's words."""
+    kind = case.split("-")[0]
+    if kind == "revise":
+        _seed_package(monkeypatch, tmp_path)
+    _session_settings(monkeypatch, tmp_path)
+    _no_fetch(monkeypatch)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    spawned = _record_spawns(monkeypatch)
+    release = threading.Event()
+    holding = threading.Event()
+    stuck_tasks: list[asyncio.Future[None]] = []
+
+    def stuck_worker() -> None:
+        holding.set()
+        release.wait(60)
+
+    if case.endswith("deadline"):
+        # The command's own worker is the stuck one: spawned, then held before its
+        # first poll, on the pool's only thread.
+        real_communicate = tools._communicate_bounded
+
+        def stuck_drain(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+            stuck_worker()
+            return real_communicate(proc, **kwargs)
+
+        monkeypatch.setattr(tools, "_communicate_bounded", stuck_drain)
+        _endpoint_asking_for_one_command(monkeypatch, "sleep 30")
+    else:
+        # The command's drain raises before any teardown, so its worker reports it
+        # unconfirmed and hands the thread back; the model then answers, after a
+        # stuck worker has taken the pool's only thread.
+        monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+
+        async def answering_session(
+            _system_prompt: str, _user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+        ) -> BaseModel:
+            by_name = {tool.spec["function"]["name"]: tool for tool in kwargs["tools"]}
+            with pytest.raises(RuntimeError):
+                await by_name["run_shell"].handler({"command": "sleep 30"})
+            stuck_tasks.append(asyncio.ensure_future(run_on_pool_thread(stuck_worker)))
+            while not holding.is_set():
+                await asyncio.sleep(0.01)
+            return model_cls.model_validate(
+                {
+                    "tool_name": "kbsearch",
+                    "summary": "改好了",
+                    "ready": True,
+                    "handoff": "交接",
+                    "operator_action": "設定",
+                }
+            )
+
+        monkeypatch.setattr(tool_builder, "generate_structured", answering_session)
+
+    async def job_on_one_thread() -> dict[str, Any]:
+        current_default_thread_limiter().total_tokens = 1
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            job_id = (await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)).job_id
+        return await _job_when_done(job_id, timeout=10)
+
+    try:
+        job = asyncio.run(job_on_one_thread())
+    finally:
+        release.set()
+        if case.endswith("deadline"):
+            if spawned:
+                _wait_for(lambda: not _group_exists(spawned[0].pid))
+        else:
+            _end_untorn(spawned)
+
+    assert holding.is_set()
+    assert job["state"] == "failed"
+    kept = _session_roots(tmp_path)
+    assert len(kept) == 1
+    assert str(kept[0]) in (job["error"] or "")
+
+
+def test_a_kept_workspace_is_left_untouched_by_a_later_successful_job(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once a workspace is kept, nothing in the backend touches it again: a later
+    job that runs all the way to a published install -- its cleanup and sweep
+    included -- leaves every entry of that workspace as it was, contents and
+    timestamps alike."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(
+        monkeypatch, f'echo $$ > "{pid_file}"; echo half-done > notes.txt; sleep 30'
+    )
+    _no_fetch(monkeypatch)
+    release = threading.Event()
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        release.wait(60)
+        return real_communicate(proc, **kwargs)
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+
+    def install(instructions: str) -> dict[str, Any]:
+        async def run() -> dict[str, Any]:
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", instructions)
+            return await _job_when_done(job_id)
+
+        return asyncio.run(run())
+
+    try:
+        first = install("build it")
+        kept = _session_roots(tmp_path)
+        assert len(kept) == 1
+        _wait_for(lambda: (kept[0] / "build" / "notes.txt").exists())
+        before = _tree_state(kept[0])
+        monkeypatch.setattr(tools, "_communicate_bounded", real_communicate)
+        _fake_generate(
+            monkeypatch,
+            result={"tool_name": "kbnew", "summary": "built", "ready": True},
+            files={"tool.json": json.dumps(_package_manifest("kbnew")), "run.py": _GOOD_RUN_PY},
+        )
+        second = install("build another")
+        after = _tree_state(kept[0])
+        left = _session_roots(tmp_path)
+    finally:
+        release.set()
+        group = _pid_in(pid_file)
+        if group is not None:
+            _wait_for(lambda: not _group_exists(group))
+
+    assert first["state"] == "failed"
+    assert second["state"] == "succeeded"
+    assert second["outcome"] == "published"
+    assert left == kept
+    assert after == before
+
+
+def test_a_command_whose_worker_never_entered_counts_as_not_started_and_cleanup_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pool never runs a command's worker, as when every pool thread is
+    taken. The session's stop finds the worker not entered: whenever it does
+    run, it finds the stop set before it could spawn, so the command counts as
+    never started. The workspace is stripped and removed as on any other exit,
+    with no wait for the worker."""
+    _session_settings(monkeypatch, tmp_path)
+    pid_file = tmp_path / "command.pid"
+    _endpoint_asking_for_one_command(monkeypatch, f'echo $$ > "{pid_file}"; sleep 30')
+    _no_fetch(monkeypatch)
+    real_pool = tool_builder.run_in_threadpool
+    withheld: list[str] = []
+
+    async def pool_that_never_runs_the_worker(func: Any, *args: Any, **kwargs: Any) -> Any:
+        name = getattr(func, "__qualname__", "")
+        if name.endswith("_BuilderShells.run.<locals>.worker"):
+            withheld.append(name)
+            await asyncio.Event().wait()  # never set: cancelled with the loop
+        return await real_pool(func, *args, **kwargs)
+
+    monkeypatch.setattr(tool_builder, "run_in_threadpool", pool_that_never_runs_the_worker)
+    seen = _watch_workspace_steps(monkeypatch, lambda: _pid_in(pid_file))
+
+    started = time.monotonic()
+    outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    elapsed = time.monotonic() - started
+
+    assert len(withheld) == 1  # the command reached the pool, which never ran it
+    assert not pid_file.exists()
+    assert seen == [("strip", False), ("cleanup", False)]
+    assert elapsed < 10 < tool_builder._shell_stop_seconds()
+    assert outcome.ok is False
+    assert "原地保留" not in (outcome.error or "")
+
+
+def test_a_command_whose_spawn_fails_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The child cannot enter its working directory, so ``Popen`` raises after
+    the fork -- and CPython reaps that child before it raises. That reap, read
+    from the record CPython left on the kept ``Popen``, and the group then gone
+    are the evidence: the command counts as stopped, nothing is left running."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    spawned: list[int] = []
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+
+    def recording_fork_exec(*args: Any) -> int:
+        pid = real_fork_exec(*args)
+        spawned.append(pid)
+        return pid
+
+    monkeypatch.setattr(subprocess, "_fork_exec", recording_fork_exec)
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        result = await shells.run(tmp_path / "missing", "true", 20, 4096, None)
+        return result, await shells.stop_and_wait()
+
+    result, stopped = asyncio.run(scenario())
+
+    assert result == "command failed to start: FileNotFoundError"
+    assert len(spawned) == 1  # a child was forked, and its exec failed
+    with pytest.raises(ChildProcessError):  # already reaped: nothing left to wait for
+        os.waitpid(spawned[0], os.WNOHANG)
+    assert stopped is True
+
+
+def _fail_a_start_step(
+    monkeypatch: pytest.MonkeyPatch, name: str, error: OSError, *, after_the_fork: bool
+) -> list[int]:
+    """Make one ``os`` call that ``subprocess`` makes while starting a child fail
+    with ``error``: the first call of ``name`` after the fork, or the first one at
+    all. Only ``subprocess``'s own view of ``os`` changes (``subprocess.os``). A
+    ``close`` releases its descriptor before failing, as an interrupted close
+    does. Returns the pid of every child forked meanwhile, in order."""
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+    real_call = getattr(os, name)
+    forked: list[int] = []
+    armed = [not after_the_fork]
+
+    def recording_fork_exec(*args: Any) -> int:
+        pid = real_fork_exec(*args)
+        forked.append(pid)
+        if after_the_fork:
+            armed[0] = True
+        return pid
+
+    def failing_once(*args: Any) -> Any:
+        if not armed[0]:
+            return real_call(*args)
+        armed[0] = False
+        if name == "close":
+            real_call(*args)
+        raise error
+
+    class SubprocessOs:
+        def __getattr__(self, attr: str) -> Any:
+            return failing_once if attr == name else getattr(os, attr)
+
+    monkeypatch.setattr(subprocess, "_fork_exec", recording_fork_exec)
+    monkeypatch.setattr(subprocess, "os", SubprocessOs())
+    return forked
+
+
+def _leads_its_own_group(pid: int) -> bool:
+    """Whether ``pid`` comes to lead a process group of its own within a few
+    seconds: a child ``Popen`` forked with ``start_new_session`` calls ``setsid``
+    on its way to exec, which may not have happened yet."""
+    give_up = time.monotonic() + 5
+    while time.monotonic() < give_up:
+        with contextlib.suppress(ProcessLookupError):
+            if os.getpgid(pid) == pid:
+                return True
+        time.sleep(0.01)
+    return False
+
+
+def _kill_and_reap(pid: int) -> None:
+    """End a child that nothing else will reap: kill its group -- its own by now,
+    else the child alone -- and wait for it."""
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(ChildProcessError):
+        os.waitpid(pid, 0)
+
+
+@pytest.mark.parametrize(
+    ("name", "error"),
+    [
+        pytest.param("close", InterruptedError(errno.EINTR, "Interrupted system call"), id="close"),
+        pytest.param("read", OSError(errno.EIO, "Input/output error"), id="exec-report-read"),
+    ],
+)
+def test_a_start_that_fails_after_the_fork_leaves_the_command_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, error: OSError
+) -> None:
+    """``Popen`` raises ``OSError`` after the fork -- closing its own end of a pipe,
+    or reading the child's report of its exec -- while the child goes on to run
+    the command. CPython has not reaped that child, so nothing vouches that it is
+    gone: the command counts as unconfirmed, and its leader is still there, in a
+    group of its own."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    forked = _fail_a_start_step(monkeypatch, name, error, after_the_fork=True)
+    with warnings.catch_warnings():
+        # The kept Popen still names a running child when it is dropped, and
+        # CPython says so.
+        warnings.simplefilter("ignore", ResourceWarning)
+        try:
+            result, stopped = _shells_run_alone(staging, "sleep 30", 20)
+            assert len(forked) == 1
+            leader = forked[0]
+            still_there = os.waitid(os.P_PID, leader, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            own_group = _leads_its_own_group(leader) and _group_exists(leader)
+        finally:
+            for pid in forked:
+                _kill_and_reap(pid)
+
+    assert result == f"command failed to start: {type(error).__name__}"
+    assert still_there is None  # neither exited nor reaped
+    assert own_group
+    assert stopped is False
+
+
+def test_a_start_that_fails_before_the_fork_counts_as_never_started(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``Popen`` fails creating the command's output pipe, before any fork. The
+    kept ``Popen`` has no pid, and the record of every fork stays empty: that
+    nothing was started is read, not inferred. The command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    forked = _fail_a_start_step(
+        monkeypatch, "pipe", OSError(errno.EMFILE, "Too many open files"), after_the_fork=False
+    )
+
+    result, stopped = _shells_run_alone(staging, "sleep 30", 20)
+
+    assert result == "command failed to start: OSError"
+    assert forked == []
+    assert stopped is True
+
+
+def test_a_start_that_fails_with_anything_but_oserror_leaves_the_command_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The fork happens, and then the start fails with something other than
+    ``OSError`` -- here a ``MemoryError`` before ``Popen`` has recorded the pid.
+    Read as a failed start, the missing pid would say nothing was forked; so it
+    is not read at all: the error propagates out of run_shell, and the command,
+    whose child is running, counts as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real_fork_exec = subprocess._fork_exec  # ty: ignore[unresolved-attribute]
+    forked: list[int] = []
+
+    def fork_then_fail(*args: Any) -> int:
+        forked.append(real_fork_exec(*args))
+        raise MemoryError
+
+    monkeypatch.setattr(subprocess, "_fork_exec", fork_then_fail)
+
+    async def scenario() -> bool:
+        shells = tool_builder._BuilderShells()
+        with pytest.raises(MemoryError):
+            await shells.run(staging, "sleep 30", 20, 4096, None)
+        return await shells.stop_and_wait()
+
+    try:
+        stopped = asyncio.run(scenario())
+        assert len(forked) == 1
+        still_there = os.waitid(os.P_PID, forked[0], os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    finally:
+        for pid in forked:
+            _leads_its_own_group(pid)
+            _kill_and_reap(pid)
+
+    assert still_there is None  # the child runs on
+    assert stopped is False
+
+
+def test_a_command_that_finds_the_stop_set_before_spawning_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Its worker entered before the stop and reached the stop check only after
+    it, so it never spawned. That is evidence too: the command counts as
+    stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+    reached: list[threading.Event | None] = []
+
+    def held_until_the_stop(
+        staging: Path,
+        command: str,
+        timeout: float,
+        cap: int,
+        extra_env: dict[str, str] | None = None,
+        abort: threading.Event | None = None,
+        evidence: tool_builder._ShellEvidence | None = None,
+    ) -> str:
+        reached.append(abort)
+        assert abort is not None and abort.wait(15)
+        return real_run(staging, command, timeout, cap, extra_env, abort, evidence)
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", held_until_the_stop)
+
+    async def scenario() -> tuple[bool, str]:
+        shells = tool_builder._BuilderShells()
+        command = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        while not reached:
+            await asyncio.sleep(0.01)
+        stopped = await shells.stop_and_wait()
+        return stopped, await command
+
+    stopped, result = asyncio.run(scenario())
+
+    assert result == tool_builder._SHELL_NOT_STARTED
+    assert spawned == []
+    assert stopped is True
+
+
+def _shells_run_alone(staging: Path, command: str, timeout: float) -> tuple[str, bool]:
+    """Run one command through a fresh ``_BuilderShells``, then stop it: the
+    command's result text and what ``stop_and_wait`` answered."""
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        result = await shells.run(staging, command, timeout, 4096, None)
+        return result, await shells.stop_and_wait()
+
+    return asyncio.run(scenario())
+
+
+def test_a_command_that_exits_on_its_own_counts_as_stopped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A command that ends by itself leaves its group holding only the exited,
+    unreaped leader when the teardown comes -- a group macOS refuses SIGKILL for
+    with EPERM. Once the leader is reaped the group is gone, and that is the
+    evidence: the command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+
+    result, stopped = _shells_run_alone(staging, "echo done", 20)
+
+    assert result == "done\n"
+    assert stopped is True
+
+
+def test_a_teardown_whose_reap_fails_gives_no_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command times out and the drain's teardown signals its group, but
+    ``proc.wait()`` fails, so no return code is left. That is not a teardown that
+    worked: ``on_reaped`` is never called, and although the drain returned, the
+    command counts as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    real_shell_popen = tool_builder._ShellPopen
+    spawned: list[subprocess.Popen[str]] = []
+
+    def popen_whose_wait_fails(command: str, *, cwd: Path, env: dict[str, str]) -> Any:
+        proc = real_shell_popen(command, cwd=cwd, env=env)
+        spawned.append(proc)
+
+        def failing_wait(timeout: float | None = None) -> int:
+            raise ChildProcessError("the leader could not be reaped")
+
+        proc.wait = failing_wait  # ty: ignore[invalid-assignment]
+        return proc
+
+    monkeypatch.setattr(tool_builder, "_ShellPopen", popen_whose_wait_fails)
+    try:
+        result, stopped = _shells_run_alone(staging, "sleep 30", 0.3)
+        ends = [proc.returncode for proc in spawned]
+    finally:
+        for proc in spawned:  # the killed leader the failed wait left unreaped
+            with contextlib.suppress(ChildProcessError):
+                os.waitpid(proc.pid, 0)
+
+    assert result == "command timed out after 0.3 seconds"
+    assert ends == [None]  # the drain returned, but nothing reaped the leader
+    assert stopped is False
+
+
+def test_a_group_the_teardown_could_not_signal_gives_no_evidence_while_a_member_lives(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Every signal to the group is refused, signal 0 included -- what the kernel
+    answers when the live members left are ones this process may not signal, since
+    it checks permission for signal 0 too -- while the leader exits on its own and
+    a member it started lives on. The leader is reaped, but the group is never
+    seen gone, EPERM not being ESRCH, so there is no evidence: the command counts
+    as unconfirmed."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", 0.5)  # the wait for a group that stays
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    real_killpg = os.killpg
+
+    def refusing_every_signal(pgid: int, sig: int) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    def member_lives(pgid: int) -> bool:
+        try:
+            real_killpg(pgid, 0)  # past the stand-in, which refuses every signal
+        except OSError:
+            return False
+        return True
+
+    monkeypatch.setattr(tools.os, "killpg", refusing_every_signal)
+    try:
+        # The member lets go of the output pipe, so the drain is not left reading it.
+        result, stopped = _shells_run_alone(staging, "sleep 30 >/dev/null 2>&1 & sleep 0.3", 20)
+        leftover = len(spawned) == 1 and member_lives(spawned[0].pid)
+    finally:
+        for proc in spawned:  # the leader is reaped; its group lives on in the member
+            with contextlib.suppress(ProcessLookupError):
+                real_killpg(proc.pid, signal.SIGKILL)
+
+    assert result == ""
+    assert leftover  # the member outlived the teardown
+    assert stopped is False
+
+
+def _live_members(pgid: int) -> list[int]:
+    """The members of group ``pgid`` that have not exited, as ``ps`` lists them:
+    zombies -- exited, waiting for their reaper -- are left out."""
+    listing = subprocess.run(
+        ["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True, check=True
+    ).stdout
+    rows = [line.split() for line in listing.splitlines()]
+    return [
+        int(row[0])
+        for row in rows
+        if len(row) >= 3 and row[1] == str(pgid) and not row[2].startswith(("Z", "X"))
+    ]
+
+
+def _group_kill_that_misses_a_member(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Make the first SIGKILL sent to a group reach its leader alone, and report
+    success -- what macOS's group kill does when a member is forked while it is
+    sent -- and every later one the whole group. Signal 0 answers as macOS does,
+    on either platform: ESRCH once the group is gone, EPERM while it holds no
+    member left alive (exited ones waiting for their reaper count as none).
+    Returns the group ids SIGKILL was sent to, in order."""
+    real_killpg = os.killpg
+    kills: list[int] = []
+
+    def killpg(pgid: int, sig: int) -> None:
+        if sig == signal.SIGKILL:
+            kills.append(pgid)
+            if len(kills) == 1:
+                os.kill(pgid, signal.SIGKILL)
+                return
+        real_killpg(pgid, sig)
+        if sig == 0 and not _live_members(pgid):
+            raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(tools.os, "killpg", killpg)
+    return kills
+
+
+def _kill_live_members(kills: list[int]) -> None:
+    """Kill whatever is still alive in the group the first kill was sent to: the
+    member a test left running. Picked by group from ``ps`` at that moment, not by
+    a pid recorded earlier."""
+    for pid in _live_members(kills[0]) if kills else []:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGKILL)
+
+
+def _stop_once_running(
+    staging: Path, command: str, running: Callable[[], bool]
+) -> tuple[str, bool]:
+    """Start one command through a fresh ``_BuilderShells``, stop the session once
+    ``running`` says the command is under way, and return the command's result
+    text and what ``stop_and_wait`` answered."""
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        command_task = asyncio.ensure_future(shells.run(staging, command, 20, 4096, None))
+        give_up = time.monotonic() + 15
+        while not running() and not command_task.done() and time.monotonic() < give_up:
+            await asyncio.sleep(0.01)
+        stopped = await shells.stop_and_wait()
+        return await command_task, stopped
+
+    return asyncio.run(scenario())
+
+
+# A leader that forks a member which lets go of the output pipe, then becomes the
+# second ``sleep`` itself; the member's pid is written to the named file.
+_LEADER_AND_MEMBER = 'sleep 30 >/dev/null 2>&1 & echo $! > "{member_file}"; exec sleep 30'
+
+
+def test_a_group_kill_that_reached_only_the_leader_gives_no_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The session is stopped, and the group kill succeeds but reaches only the
+    leader. Where the kill is not sent again, the member outlives the teardown:
+    the leader is reaped, but the group is never seen gone, so the command counts
+    as unconfirmed. A kill that succeeded is not evidence."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_REAP_TIMEOUT_SECONDS", 0.5)  # the wait for a group that stays
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", False)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _stop_once_running(
+            staging,
+            _LEADER_AND_MEMBER.format(member_file=member_file),
+            lambda: _pid_in(member_file) is not None,
+        )
+        member = _pid_in(member_file)
+        survived = len(kills) == 1 and member in _live_members(kills[0])
+    finally:
+        _kill_live_members(kills)
+
+    assert result == tool_builder._SHELL_STOPPED
+    assert survived  # sent once, and the member it missed lived on
+    assert stopped is False
+
+
+def test_a_group_kill_sent_again_reaches_the_member_the_first_one_missed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The same first kill, where the platform's group kill can miss a fork: the
+    teardown sends it again before the reap until no member is left alive. The
+    member the first one missed is killed, the group is then seen gone, and the
+    command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _stop_once_running(
+            staging,
+            _LEADER_AND_MEMBER.format(member_file=member_file),
+            lambda: _pid_in(member_file) is not None,
+        )
+        member = _pid_in(member_file)
+    finally:
+        _kill_live_members(kills)
+
+    assert result == tool_builder._SHELL_STOPPED
+    assert len(kills) >= 2  # sent again after the first
+    assert member is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(member, 0)  # gone, reaped
+    assert stopped is True
+
+
+def test_a_group_kill_sent_again_reaches_a_member_left_by_a_leader_that_exited(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The command ends on its own and leaves a member running, and the first
+    kill misses that member. A leader already gone is no reason to stop sending:
+    the kill is sent again while a member is alive, so the member is killed, the
+    group is then seen gone, and the command counts as stopped."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    monkeypatch.setattr(tools, "_GROUP_KILL_CAN_MISS_A_FORK", True)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    member_file = tmp_path / "member.pid"
+    kills = _group_kill_that_misses_a_member(monkeypatch)
+    try:
+        result, stopped = _shells_run_alone(
+            staging, f'sleep 30 >/dev/null 2>&1 & echo $! > "{member_file}"', 20
+        )
+        member = _pid_in(member_file)
+    finally:
+        _kill_live_members(kills)
+
+    assert result == ""  # it ended by itself: neither stopped nor timed out
+    assert len(kills) >= 2  # sent again after the first
+    assert member is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(member, 0)  # gone, reaped
+    assert stopped is True
+
+
+# --- write_file writes end with their session ---------------------------------
+#
+# A write runs on a pool thread the session's deadline cannot stop: the session
+# waits for its worker to return before anything touches the workspace, within the
+# same one limit its commands get.
+
+
+def _watch_the_write_and_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, content: str, seen: list[str]
+) -> None:
+    """Record, in order: the write of ``content`` returning, the session's stop
+    answering, and each strip, save and cleanup of the workspace.
+
+    That write goes through the real ``tools._write_regular_file``, held as its
+    open has cut the file short: it goes on only once the session's stop has been
+    asked for, and 0.3 seconds after that. A stop that does not wait for it
+    answers inside that window, and the order shows it."""
+    real_write = tools._write_regular_file
+    real_stop = tool_builder._BuilderShells.stop_and_wait
+    real_strip = tool_builder._strip_builder_env
+    real_save = tool_builder._save_round_draft
+    real_cleanup = tool_builder._cleanup_staging
+    stopping = threading.Event()
+
+    def write(path: Path, text: str) -> bool:
+        if text != content:
+            return real_write(path, text)
+        try:
+            path.write_text("", encoding="utf-8")  # what the truncating open leaves
+            assert stopping.wait(15)
+            time.sleep(0.3)
+            return real_write(path, text)
+        finally:
+            seen.append("write returned")
+
+    async def stop_and_wait(self: tool_builder._BuilderShells) -> bool:
+        stopping.set()
+        answer = await real_stop(self)
+        seen.append(f"stop answered {answer}")
+        return answer
+
+    def strip(build_root: tools.BuildRoot, base: Path) -> Any:
+        seen.append("strip")
+        return real_strip(build_root, base)
+
+    def save(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        seen.append("save")
+        return real_save(context, outcome, error)
+
+    def cleanup(staging: Path, base: Path) -> None:
+        seen.append("cleanup")
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tools, "_write_regular_file", write)
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", stop_and_wait)
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_deadline_mid_write_waits_for_the_write_before_the_workspace_is_touched(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """The session's deadline fires while a write_file write is under way, its
+    file cut short and the rest not yet written. The stop answers only once the
+    write's worker has returned, and only then is the workspace stripped, saved
+    and removed: a revise's draft holds the whole file the write made, never the
+    file cut short."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_call(
+        monkeypatch, "write_file", {"path": "run.py", "content": _REVISED_RUN_PY}
+    )
+    _no_fetch(monkeypatch)
+    seen: list[str] = []
+    _watch_the_write_and_the_workspace(monkeypatch, _REVISED_RUN_PY, seen)
+
+    if kind == "install":
+        outcome = asyncio.run(run_install("http://kb.example/openapi.json", "build it"))
+    else:
+        outcome = asyncio.run(_run_revise("kbsearch", "fix it"))
+
+    assert outcome.ok is False
+    assert outcome.error is not None and "Timeout" in outcome.error
+    touched = ["strip", "cleanup"] if version is None else ["strip", "save", "cleanup"]
+    assert seen == ["write returned", "stop answered True", *touched]
+    if version is not None:
+        assert (_draft_files(version) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _session_roots(tmp_path) == []
+
+
+def _meta_tools_by_name(staging: Path, shells: tool_builder._BuilderShells) -> dict[str, LlmTool]:
+    return {
+        tool.spec["function"]["name"]: tool for tool in _build_meta_tools(staging, shells=shells)
+    }
+
+
+def test_a_write_whose_worker_has_not_entered_at_the_stop_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pool runs a write_file write's worker only after the session has
+    stopped, as when every pool thread is taken. The stop finds the worker not
+    entered and answers at once, with no wait; the worker, run then, finds the
+    stop set and writes nothing, and the model is told the write was not done."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    (staging / "run.py").write_text("print('before')\n", encoding="utf-8")
+    real_pool = tool_builder.run_in_threadpool
+
+    async def scenario() -> tuple[str, bool, float]:
+        reached = asyncio.Event()
+        release = asyncio.Event()
+
+        async def pool_running_the_write_late(func: Any, *args: Any, **kwargs: Any) -> Any:
+            if getattr(func, "__qualname__", "").endswith("_BuilderShells.write.<locals>.worker"):
+                reached.set()
+                await release.wait()
+            return await real_pool(func, *args, **kwargs)
+
+        monkeypatch.setattr(tool_builder, "run_in_threadpool", pool_running_the_write_late)
+        shells = tool_builder._BuilderShells()
+        by_name = _meta_tools_by_name(staging, shells)
+        write = asyncio.ensure_future(
+            by_name["write_file"].handler({"path": "run.py", "content": _REVISED_RUN_PY})
+        )
+        await asyncio.wait_for(reached.wait(), 10)
+        started = time.monotonic()
+        stopped = await shells.stop_and_wait()
+        elapsed = time.monotonic() - started
+        release.set()
+        return await write, stopped, elapsed
+
+    result, stopped, elapsed = asyncio.run(scenario())
+
+    assert stopped is True
+    assert elapsed < 5 < tool_builder._shell_stop_seconds()
+    assert result == tool_builder._WRITE_NOT_DONE
+    assert (staging / "run.py").read_text(encoding="utf-8") == "print('before')\n"
+
+
+class _StopSignalWithAHeldRead(threading.Event):
+    """A session's stop signal whose first read by a worker thread is held: the
+    value is taken at the read and handed back only once ``release`` is set, so the
+    stop can be set, and can look at whether the worker entered, in between. Every
+    later read, and every read on the thread that made it, answers at once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._owner = threading.get_ident()
+        self._held = threading.Lock()
+        self._first = True
+        self.read = threading.Event()
+        self.release = threading.Event()
+
+    def is_set(self) -> bool:
+        value = super().is_set()
+        if threading.get_ident() == self._owner:
+            return value
+        with self._held:
+            first, self._first = self._first, False
+        if first:
+            self.read.set()
+            self.release.wait(15)
+        return value
+
+
+@pytest.mark.parametrize("kind", ["write", "command"])
+def test_a_worker_registers_its_entry_before_it_reads_the_stop_so_the_stop_never_skips_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str
+) -> None:
+    """A write_file write's worker, or a run_shell command's, reads the session's
+    stop signal as not set, and that read is held while the stop is set and looks
+    at whether the worker entered. The worker registered its entry before it read
+    the stop, so the stop waits for it: it answers only once the worker has
+    returned -- the write written, the command killed and reaped -- never while
+    the worker goes on as one that never entered."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    seen: list[str] = []
+    spawned = _record_spawns(monkeypatch)
+    real_run = tool_builder._run_shell_subprocess
+
+    def recorded_run(*args: Any) -> str:
+        try:
+            return real_run(*args)
+        finally:
+            seen.append("worker returned")
+
+    def write() -> str:
+        (staging / "notes.txt").write_text("whole", encoding="utf-8")
+        seen.append("worker returned")
+        return "wrote"
+
+    monkeypatch.setattr(tool_builder, "_run_shell_subprocess", recorded_run)
+
+    async def scenario() -> tuple[bool, bool, str]:
+        shells = tool_builder._BuilderShells()
+        stop = _StopSignalWithAHeldRead()
+        shells._stop = stop
+        if kind == "write":
+            work = asyncio.ensure_future(shells.write(write))
+        else:
+            work = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        assert await asyncio.to_thread(stop.read.wait, 15)
+        stopping = asyncio.ensure_future(shells.stop_and_wait())
+        stopping.add_done_callback(lambda task: seen.append(f"stop answered {task.result()}"))
+        for _ in range(5):
+            await asyncio.sleep(0)  # the stop sets the signal and looks at the worker
+        answered_while_held = stopping.done()
+        stop.release.set()
+        answer = await stopping
+        return answered_while_held, answer, await work
+
+    try:
+        answered_while_held, answer, result = asyncio.run(scenario())
+    finally:
+        _end_untorn(spawned)
+
+    assert answered_while_held is False
+    assert answer is True
+    assert seen == ["worker returned", "stop answered True"]
+    if kind == "write":
+        assert result == "wrote"
+        assert (staging / "notes.txt").read_text(encoding="utf-8") == "whole"
+    else:
+        assert result == tool_builder._SHELL_STOPPED
+        assert len(spawned) == 1 and not _group_exists(spawned[0].pid)
+
+
+@pytest.mark.parametrize("kind", ["install", "revise"])
+def test_a_write_not_confirmed_returned_keeps_its_workspace_and_the_job_still_ends(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """A write_file write stuck in its worker, as on a disk that does not answer,
+    for longer than ``_shell_stop_seconds``. Nothing vouches that the workspace is
+    still, so the job neither strips, saves, publishes nor removes it: the
+    workspace stays where it was, the job's error and the backend log both name
+    it, and the job still ends and gives up the single flight."""
+    version = _seed_package(monkeypatch, tmp_path) if kind == "revise" else None
+    _session_settings(monkeypatch, tmp_path)
+    _endpoint_asking_for_one_call(
+        monkeypatch, "write_file", {"path": "run.py", "content": _REVISED_RUN_PY}
+    )
+    _no_fetch(monkeypatch)
+    held = threading.Event()
+    release = threading.Event()
+    real_write = tools._write_regular_file
+
+    def stuck(path: Path, text: str) -> bool:
+        if text == _REVISED_RUN_PY:
+            held.set()
+            release.wait(60)
+        return real_write(path, text)
+
+    monkeypatch.setattr(tools, "_write_regular_file", stuck)
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: 0.3)
+    seen = _watch_workspace_steps(monkeypatch, lambda: None)
+
+    async def run_job() -> dict[str, Any]:
+        if kind == "install":
+            job_id = tool_builder.start_install_job("http://kb.example/openapi.json", "build it")
+        else:
+            job_id = (await tool_builder.start_revise_job("kbsearch", "fix it", _TEST_VID)).job_id
+        return await _job_when_done(job_id)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+            job = asyncio.run(run_job())
+        flight_held = tool_builder.any_job_active()
+        kept = _session_roots(tmp_path)
+    finally:
+        release.set()
+
+    assert held.is_set()  # the write was under way when the session stopped
+    assert job["state"] == "failed"
+    assert flight_held is False
+    assert seen == []  # never stripped, never removed
+    assert len(kept) == 1
+    assert (kept[0] / "build").is_dir()
+    error = job["error"] or ""
+    assert "write_file" in error
+    assert str(kept[0]) in error
+    assert any(str(kept[0]) in record.getMessage() for record in caplog.records)
+    if version is not None:
+        assert not tool_drafts.has_draft(_package_root(version))
+        current = tools.resolve_current(_package_root(version))
+        assert isinstance(current, tools.Resolved) and current.vid == _TEST_VID
+
+
+def test_a_returned_write_does_not_vouch_for_a_command_left_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A session ran a write_file write, whose worker returned, and a run_shell
+    command whose drain raised before any teardown, whose worker returned as well
+    -- with no evidence that its process group is gone, and the group is indeed
+    still there. Every worker has returned, and the stop still answers False: a
+    worker that returned is a write's evidence, never a command's."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    monkeypatch.setattr(tools, "_communicate_bounded", _drain_that_raises)
+
+    async def scenario() -> tuple[str, bool]:
+        shells = tool_builder._BuilderShells()
+        by_name = _meta_tools_by_name(staging, shells)
+        with pytest.raises(RuntimeError):
+            await shells.run(staging, "sleep 30", 20, 4096, None)
+        wrote = await by_name["write_file"].handler({"path": "notes.txt", "content": "half"})
+        return wrote, await shells.stop_and_wait()
+
+    try:
+        wrote, stopped = asyncio.run(scenario())
+        group_alive = len(spawned) == 1 and _group_exists(spawned[0].pid)
+    finally:
+        _end_untorn(spawned)
+
+    assert wrote.startswith("wrote")
+    assert group_alive  # what counting a returned worker as evidence would hide
+    assert stopped is False
+
+
+@pytest.mark.parametrize("first", ["command", "write"])
+def test_a_command_and_a_write_share_one_limit_whichever_reports_first(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first: str
+) -> None:
+    """A run_shell command stuck before its first poll and a write_file write
+    stuck in its worker, both under way when the session stops. One of them is
+    let go partway through ``_shell_stop_seconds`` and reports; the other never
+    does. The stop answers False once the limit has passed since it began: one
+    limit for the two together, not a fresh one after the first report."""
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    limit = 1.0
+    monkeypatch.setattr(tool_builder, "_shell_stop_seconds", lambda: limit)
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    spawned = _record_spawns(monkeypatch)
+    release = {"command": threading.Event(), "write": threading.Event()}
+    draining = threading.Event()
+    writing = threading.Event()
+    real_communicate = tools._communicate_bounded
+
+    def stuck_before_its_first_poll(proc: subprocess.Popen[str], **kwargs: Any) -> Any:
+        draining.set()
+        release["command"].wait(60)
+        return real_communicate(proc, **kwargs)
+
+    def stuck_write() -> str:
+        writing.set()
+        release["write"].wait(60)
+        return "wrote"
+
+    monkeypatch.setattr(tools, "_communicate_bounded", stuck_before_its_first_poll)
+
+    async def scenario() -> tuple[bool, float, str, str]:
+        shells = tool_builder._BuilderShells()
+        command = asyncio.ensure_future(shells.run(staging, "sleep 30", 20, 4096, None))
+        write = asyncio.ensure_future(shells.write(stuck_write))
+        while not (draining.is_set() and writing.is_set()):
+            await asyncio.sleep(0.01)
+        started = time.monotonic()
+        stopping = asyncio.ensure_future(shells.stop_and_wait())
+        await asyncio.sleep(limit * 0.6)
+        release[first].set()
+        answer = await stopping
+        elapsed = time.monotonic() - started
+        for event in release.values():
+            event.set()
+        return answer, elapsed, await command, await write
+
+    try:
+        answer, elapsed, ran, wrote = asyncio.run(scenario())
+    finally:
+        for event in release.values():
+            event.set()
+        if spawned:
+            _wait_for(lambda: not _group_exists(spawned[0].pid))
+
+    assert answer is False
+    assert limit * 0.9 <= elapsed < limit * 1.4  # the one limit, not a fresh one
+    assert ran == tool_builder._SHELL_STOPPED
+    assert wrote == "wrote"
+
+
+@pytest.mark.parametrize("loop_kind", ["asyncio", "uvloop"])
+def test_a_cancelled_write_task_counts_as_ended_only_once_its_worker_returns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, loop_kind: str
+) -> None:
+    """The event loop shutting down cancels every task still on it -- the
+    session's and its write's own task alike -- and a cancelled task is done
+    while the worker it waited on still writes. The session, stopping as it
+    unwinds, counts the write ended only on its worker's word that it returned,
+    by which time the file holds the whole write: the shutdown's gather keeps the
+    loop running, so the word reaches it."""
+    if loop_kind == "uvloop":
+        new_loop = pytest.importorskip("uvloop").new_event_loop
+    else:
+        new_loop = asyncio.new_event_loop
+    _install_settings(
+        monkeypatch, tools_dir=str(tmp_path / "tools"), tool_install_shell_timeout_seconds=20
+    )
+    target = tmp_path / "notes.txt"
+    entered = threading.Event()
+
+    def slow_write() -> str:
+        entered.set()
+        time.sleep(0.3)  # still writing as the loop shuts down
+        target.write_text("whole", encoding="utf-8")
+        return "wrote"
+
+    seen: dict[str, Any] = {}
+    sessions: list[asyncio.Task[None]] = []
+
+    async def session() -> None:
+        shells = tool_builder._BuilderShells()
+        try:
+            await shells.write(slow_write)
+        finally:
+            seen["stopped"] = await shells.stop_and_wait()
+            seen["written"] = target.read_text(encoding="utf-8") if target.exists() else None
+
+    async def start_and_leave_running() -> None:
+        sessions.append(asyncio.ensure_future(session()))
+        for _ in range(1000):
+            if entered.is_set():
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError("the write never started")
+
+    runner = asyncio.Runner(loop_factory=new_loop)
+    try:
+        runner.run(start_and_leave_running())
+    finally:
+        # What the server's own shutdown does: cancel every task left on the loop,
+        # the write's task among them, and run the loop until they are done.
+        runner.close()
+
+    assert sessions[0].cancelled()
+    assert seen == {"stopped": True, "written": "whole"}
+
+
+def test_an_install_cancelled_while_its_promote_runs_lets_the_promote_finish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The install is cancelled while its promote runs on its worker, held where
+    it is about to assemble the package from the staging. That worker goes on, so
+    the staging it installs from is not removed beside it: nothing cleans it up,
+    the session's root stays, named in the backend log, and once the worker is let
+    go the package is installed from it."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    real_validate = tools.validate_tool_content
+    real_promote = tool_builder._promote_staging
+    real_cleanup = tool_builder._cleanup_staging
+    cleaned: list[Path] = []
+
+    def validate(build_root: tools.BuildRoot, *, expected_name: str) -> str | None:
+        entered.set()
+        release.wait(10)
+        return real_validate(build_root, expected_name=expected_name)
+
+    def promote(*args: Any) -> Any:
+        try:
+            return real_promote(*args)
+        finally:
+            returned.set()
+
+    def cleanup(staging: Path, base: Path) -> None:
+        cleaned.append(staging)
+        real_cleanup(staging, base)
+
+    monkeypatch.setattr(tools, "validate_tool_content", validate)
+    monkeypatch.setattr(tool_builder, "_promote_staging", promote)
+    monkeypatch.setattr(tool_builder, "_cleanup_staging", cleanup)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(run_install("http://kb.example/openapi.json", "build it"))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        asyncio.run(scenario())
+
+    assert cleaned == []
+    [session] = _session_roots(tmp_path)
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    current = tools.resolve_current(tools.PackageRoot(root / "kbsearch"))
+    assert isinstance(current, tools.Resolved)
+    assert (current.version_root.path / "run.py").read_text(encoding="utf-8") == _GOOD_RUN_PY
+
+
+# --- drafts: what a revise round keeps with the tool (tool_drafts) -------------
+#
+# The store on its own is in tests/test_tool_drafts.py; here is the revise job's
+# use of it: which exits save, the publish around its save, the routes.
+
+
+def _draft_dir(version: Path) -> Path:
+    return tool_drafts.draft_path(_package_root(version))
+
+
+def _draft_manifest(version: Path) -> dict[str, Any]:
+    manifest = tool_drafts.read_manifest(_draft_dir(version))
+    assert manifest is not None
+    return manifest
+
+
+def _draft_files(version: Path) -> Path:
+    return _draft_dir(version) / _draft_manifest(version)["files_dir"]
+
+
+# A builder that stops short, with all three of its notes.
+_UNFINISHED: dict[str, Any] = {
+    "tool_name": "kbsearch",
+    "summary": "API 沒有分頁參數",
+    "ready": False,
+    "handoff": "run.py 的查詢已改，分頁還沒試",  # noqa: RUF001
+    "operator_action": "在 config.env 設定 PAGE_SIZE",
+}
+
+_DRAFT_SECRET = "kb-live-secret-0123456789"
+
+
+def _save_an_unfinished_round(monkeypatch: pytest.MonkeyPatch, pkg: Path) -> dict[str, Any]:
+    """Run one revise whose builder stops short; returns its draft's manifest."""
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    return _draft_manifest(pkg)
+
+
+def test_a_revise_whose_workspace_cannot_be_confirmed_in_staging_saves_no_draft_and_keeps_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the session has ended, the ``.staging`` shell cannot be looked at, so
+    whether the workspace is still the one the round was given is not known. It
+    is not stripped, no draft is saved from it, and it stays where it is, though
+    the job names no path for it: what is at that path is not known."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    base = tools.tools_dir()
+    assert base is not None
+    shell = base / tool_builder._STAGING_DIRNAME
+    ended = [False]
+    real_strip = tool_builder._strip_builder_env
+
+    def strip(build_root: tools.BuildRoot, root: Path) -> tuple[tuple[str, ...], str | None]:
+        ended[0] = True
+        return real_strip(build_root, root)
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    refused = _refuse_lstat(monkeypatch, shell, active=ended)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.draft is not None and outcome.draft["saved"] is False
+    assert outcome.draft["retained_path"] is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert outcome.error == tool_builder._ERROR_STAGING_UNVERIFIED
+    assert any(shell.iterdir())
+    assert refused
+
+
+def test_a_revise_that_does_not_publish_keeps_its_work_as_the_tool_s_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder's own ``ready=false``: nothing is published, and the round is
+    kept with the tool -- its files as the session left them, how it ended, the
+    model's notes -- while the staging session is removed as before."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.not_ready is True
+    manifest = _draft_manifest(pkg)
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    assert (manifest["base_vid"], manifest["feedback"]) == (_TEST_VID, "加上分頁")
+    [attempt] = manifest["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("not_published", outcome.error)
+    assert (attempt["summary"], attempt["handoff"], attempt["operator_action"]) == (
+        _UNFINISHED["summary"],
+        _UNFINISHED["handoff"],
+        _UNFINISHED["operator_action"],
+    )
+    files = _draft_files(pkg)
+    assert (files / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (files / "tool.json").read_bytes() == (pkg / "tool.json").read_bytes()
+    assert not (files / tools._META_DIRNAME).exists()
+    assert _resolved_version(_package_path(pkg)) == pkg
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("wrote", [False, True], ids=["nothing-changed", "files-changed"])
+def test_a_revise_whose_session_fails_keeps_a_draft_only_of_work_it_did(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, wrote: bool
+) -> None:
+    """An upstream failure ends the session with no answer, so with no notes. A
+    workspace left as it was received keeps nothing -- no draft, nothing on the
+    job -- and one the session had changed is kept, its round recorded as failed
+    with the error."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    async def failing(
+        system_prompt: str, user_prompt: str, model_cls: type[BaseModel], **kwargs: Any
+    ) -> BaseModel:
+        if wrote:
+            by_name = {t.spec["function"]["name"]: t for t in kwargs["tools"]}
+            await by_name["write_file"].handler({"path": "run.py", "content": _REVISED_RUN_PY})
+        raise LLMUpstreamError("APITimeoutError: the upstream LLM request failed")
+
+    monkeypatch.setattr("afterthread.services.tool_builder.generate_structured", failing)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    if not wrote:
+        assert outcome.draft is None
+        assert not tool_drafts.has_draft(_package_root(pkg))
+        return
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    [attempt] = _draft_manifest(pkg)["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("failed", outcome.error)
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_a_round_whose_commands_are_not_confirmed_stopped_saves_no_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The exit for commands not confirmed stopped comes before every save: a
+    round worth a draft -- files changed, notes handed back -- leaves its
+    workspace where it is and writes nothing into the tool."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    async def not_confirmed(self: tool_builder._BuilderShells) -> bool:
+        return False
+
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", not_confirmed)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    [kept] = _session_roots(tmp_path)
+    assert (kept / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def test_a_published_revise_takes_its_draft_away_and_its_origin_names_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A round about to publish saves its work first and marks the draft as being
+    published from; once the publish went through, the draft is taken away, and
+    the new version's origin names it -- what the list goes by when a draft is
+    left behind."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    marked: list[tuple[str, int]] = []
+    real_mark = tool_drafts.mark_publishing
+
+    def mark(
+        package_root: tools.PackageRoot,
+        identity: tuple[int, int] | None,
+        expected: tuple[str, int],
+        job_id: str | None,
+    ) -> int | None:
+        marked.append(expected)
+        assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+        return real_mark(package_root, identity, expected, job_id)
+
+    monkeypatch.setattr(tool_drafts, "mark_publishing", mark)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert not [
+        entry.name
+        for entry in (_package_path(pkg) / tools._META_DIRNAME).iterdir()
+        if entry.name.startswith(tool_drafts.DRAFT_DIRNAME)
+    ]
+    [(draft_id, _generation)] = marked
+    origin = tools.read_origin_meta(tools.VersionRoot(_current_version(pkg)))
+    assert origin is not None
+    assert origin["feedback"] == f"加上分頁\n\n草稿 {draft_id}，經過 1 輪"  # noqa: RUF001
+
+
+def test_the_origin_feedback_is_masked_then_cut_keeping_its_draft_line_whole(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator's words are masked first and the whole is cut to its cap after,
+    the draft line kept whole at the end: that line is what the list looks for.
+    Cut first, the markers -- longer than the value they hide -- would push the
+    text past the cap."""
+    _seed_package(monkeypatch, tmp_path)
+    tools.register_inflight_secret(_SHORT_SECRET)
+    line = tool_drafts.provenance_line("a" * 32, 2)
+
+    written = tool_builder._provenance_feedback(
+        _filled_with_secret(tool_builder._ORIGIN_FEEDBACK_CAP), (), line
+    )
+
+    assert _SHORT_SECRET not in written
+    assert len(written) == tool_builder._ORIGIN_FEEDBACK_CAP
+    assert written.endswith("\n\n" + line)
+
+
+# (secret, text): the text does not hold the secret, but the JSON the text is
+# written as does -- an escape the encoder writes, or, for a lone surrogate, the
+# three replacement characters the scrub leaves.
+_SPELLED_AS_WRITTEN = {
+    "newline": ("kb-pem-head\\nkb-pem-body", "key kb-pem-head\nkb-pem-body here"),
+    "quote": ('kb-quote-left\\"kb-quote-right', 'say kb-quote-left"kb-quote-right ok'),
+    "backslash": ("kb-back-left\\\\kb-back-right", "at kb-back-left\\kb-back-right ok"),
+    "tab": ("kb-tab-left\\tkb-tab-right", "key kb-tab-left\tkb-tab-right ok"),
+    "control": ("kb-ctl-left\\u0001kb-ctl-right", "key kb-ctl-left\x01kb-ctl-right ok"),
+    "tail": ("abcde\\nxyz123", "it ends with abcde\n"),
+    "replacement": ("kb-���-key", "name kb-\udcff-key here"),
+}
+
+
+@pytest.mark.parametrize("case", list(_SPELLED_AS_WRITTEN))
+def test_origin_feedback_that_spells_a_secret_only_as_written_reaches_no_byte_of_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """The operator's words, as the feedback a revise writes when no draft line
+    follows them, into ``origin.json``: the version is written, its origin reads
+    back with the feedback as the marker and the instructions as they were -- the
+    field check did it, not the whole-file check -- and no byte of the file holds
+    the secret."""
+    secret, text = _SPELLED_AS_WRITTEN[case]
+    assert secret not in text
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    version = tmp_path / "version"
+    (version / tools._META_DIRNAME).mkdir(parents=True)
+    feedback = tool_builder._provenance_feedback(text, ())
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(version),
+        {
+            "source": "builder-revise",
+            "openapi_url": None,
+            "instructions": "查 KB",
+            "feedback": feedback,
+            "previous": _TEST_VID,
+        },
+    )
+
+    assert written is True
+    data = (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    encoded = secret.encode("utf-8", "surrogatepass")
+    assert encoded not in data
+    # Nor a prefix of it as long as the mask's trailing guard covers, ending a string.
+    for end in range(tools._MIN_SECRET_LEN, len(encoded)):
+        assert encoded[:end] + b'"' not in data
+    origin = tools.read_origin_meta(tools.VersionRoot(version))
+    assert origin is not None
+    assert (origin["feedback"], origin["instructions"]) == (tools._REDACTION_MARKER, "查 KB")
+
+
+def test_origin_feedback_that_spells_a_secret_only_as_decoded_reads_back_as_the_marker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator's words hold a lone surrogate where the known value has three
+    U+FFFD: the mask finds nothing, and the scrub then makes the text exactly the
+    value, whose quote ``origin.json`` writes as ``\\"``. The origin reads back with
+    the feedback as the marker and the instructions as they were: the field check
+    caught it, which the whole-file check cannot, since the file holds the quote
+    escaped."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    monkeypatch.setattr(tools, "known_secret_values", lambda: frozenset({secret}))
+    version = tmp_path / "version"
+    (version / tools._META_DIRNAME).mkdir(parents=True)
+
+    written = tools.write_origin_meta(
+        tools.BuildRoot(version),
+        {
+            "source": "builder-revise",
+            "openapi_url": None,
+            "instructions": "查 KB",
+            "feedback": tool_builder._provenance_feedback(text, ()),
+            "previous": _TEST_VID,
+        },
+    )
+
+    assert written is True
+    origin = tools.read_origin_meta(tools.VersionRoot(version))
+    assert origin is not None
+    assert (origin["feedback"], origin["instructions"]) == (tools._REDACTION_MARKER, "查 KB")
+
+
+def test_a_publish_goes_ahead_when_its_draft_cannot_be_marked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The mark only helps the list tell, after a crash, a publish that went
+    through: failing to write it is no reason to hold the publish back."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tool_drafts, "mark_publishing", lambda *args: None)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_draft_a_publish_could_not_take_away_lists_as_published(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The publish went through but its draft stayed: the job says so, naming the
+    draft at the generation the publish marked, which a discard needs; and the
+    list, matching the draft against ``current``'s origin, shows it as published
+    rather than as work still to do."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        tool_drafts, "remove_after_publish", lambda *args: tool_drafts.Removal(False, None)
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    manifest = _draft_manifest(pkg)
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 1,
+        "reason": tool_builder._DRAFT_NOT_REMOVED,
+        "retained_path": None,
+    }
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["current_vid"] != _TEST_VID
+    assert row["draft"]["state"] == "published"
+
+
+def _during_the_publish(monkeypatch: pytest.MonkeyPatch, act: Callable[[], object]) -> None:
+    """Run ``act`` once the round's draft is saved and marked, as its publish begins."""
+    real_publish = tool_builder._publish_revised_version
+
+    def publish(*args: Any) -> Any:
+        act()
+        return real_publish(*args)
+
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+
+
+def test_a_draft_file_edited_while_its_round_publishes_stays_and_the_job_says_it_changed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator edits a file of the copy the round saved, while the publish
+    runs from the staging workspace: the edit is in no version, so the draft is
+    left with it, and the job says the draft changed during the publish -- take
+    out what is needed first, then discard. Red before the fix: the draft was
+    removed with the edit in it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    edited = "print('edited by hand')\n"
+    _during_the_publish(
+        monkeypatch, lambda: (_draft_files(pkg) / "run.py").write_text(edited, encoding="utf-8")
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == edited
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_CHANGED
+    assert outcome.draft["generation"] == _draft_manifest(pkg)["generation"]
+
+
+def test_a_directory_added_to_the_draft_while_its_round_publishes_keeps_the_whole_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The copy itself is untouched, but ``draft/`` gains a directory of the
+    operator's: the removal takes all of ``draft/``, which the copy's fingerprint
+    does not cover, so nothing is removed. Red before the fix: ``draft/`` went,
+    the notes with it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    def add_notes() -> None:
+        notes = _draft_dir(pkg) / "operator-notes"
+        notes.mkdir()
+        (notes / "todo.txt").write_text("分頁參數要再確認\n", encoding="utf-8")
+
+    _during_the_publish(monkeypatch, add_notes)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    notes = _draft_dir(pkg) / "operator-notes" / "todo.txt"
+    assert notes.read_text(encoding="utf-8") == "分頁參數要再確認\n"
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_CHANGED
+
+
+def test_a_draft_whose_copy_left_out_a_link_is_still_removed_when_nobody_changed_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The workspace holds a link to a file outside it, which the save does not
+    keep, so the saved copy differs from the workspace although nobody touched
+    either. The publish carries the link; the removal compares the draft against
+    the copy as saved, not against the workspace, and takes it away. Not red at
+    HEAD, which removed every matching draft; red for a fingerprint taken of the
+    workspace instead of the copy."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("not in the tool\n", encoding="utf-8")
+
+    def link_outside() -> None:
+        [session] = _session_roots(tmp_path)
+        os.symlink(outside, session / "build" / "elsewhere")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY},
+        side_effect=link_outside,
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert os.readlink(_current_version(pkg) / "elsewhere") == str(outside)
+    assert outcome.draft is None
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_draft_whose_files_cannot_be_read_whole_before_the_removal_stays_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the removal comes, the saved copy cannot be listed: whether it is
+    still what was saved is not known, so the draft stays, and the job says that
+    it could not be confirmed -- not that a change was found. Red before the fix:
+    the draft was removed without being looked at."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_remove = tool_drafts.remove_after_publish
+    refused: list[str] = []
+
+    def remove(*args: Any) -> tool_drafts.Removal:
+        files = os.fspath(_draft_files(pkg))
+        real_scandir = os.scandir
+
+        def scandir(path: Any = ".") -> Any:
+            if os.fspath(path) == files:
+                refused.append(files)
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), files)
+            return real_scandir(path)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "scandir", scandir)
+            return real_remove(*args)
+
+    monkeypatch.setattr(tool_drafts, "remove_after_publish", remove)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is True
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert refused
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_UNCONFIRMED
+
+
+_PUBLISH_FAULTS = [
+    "validation",
+    "embedded-secret",
+    "base-replaced-before-the-move",
+    "base-replaced-after-the-move",
+    "origin-write",
+    "version-fsync",
+    "current-write",
+]
+
+
+@pytest.mark.parametrize("fault", _PUBLISH_FAULTS)
+def test_a_publish_that_fails_leaves_the_round_s_work_in_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str
+) -> None:
+    """At every point a publish can fail, the save before it is what holds the
+    work: the draft stays, no longer marked as being published from, the failure
+    recorded on its round, and the job names the draft at the generation it is
+    now at. ``current`` is left as the fault left it, and the staging session is
+    removed: the draft has the work."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    package = _package_path(pkg)
+    (package / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    files = {"run.py": _REVISED_RUN_PY}
+    side_effect: Callable[[], None] | None = None
+    expected_current = _TEST_VID
+    expected_error: str
+    if fault == "validation":
+        files = {"tool.json": "{ not json at all"}
+        expected_error = "工具包驗證失敗"
+    elif fault == "embedded-secret":
+        files = {"run.py": f"KEY = '{_DRAFT_SECRET}'\n"}
+        expected_error = "工具包驗證失敗：run.py 不得包含秘密值"  # noqa: RUF001
+    elif fault == "base-replaced-before-the-move":
+
+        def reinstall() -> None:
+            shutil.rmtree(pkg)
+            pkg.mkdir()
+            (pkg / "tool.json").write_text(json.dumps(_package_manifest("kbsearch")))
+            (pkg / "run.py").write_text("print('reinstalled')\n", encoding="utf-8")
+
+        side_effect = reinstall
+        expected_error = tool_builder._ERROR_REVISE_TARGET_REPLACED
+    elif fault == "base-replaced-after-the-move":
+        other_vid = "20260728T020304Z-fedcba"
+        _copy_committed_version(pkg, other_vid)
+        versions = package / tools._VERSIONS_DIRNAME
+        real_fsync_directory = tool_builder._fsync_directory
+
+        def move_current_after_the_move(path: Path) -> bool:
+            durable = real_fsync_directory(path)
+            if path == versions:
+                assert tools.publish_current(tools.PackageRoot(package), other_vid)
+            return durable
+
+        monkeypatch.setattr(tool_builder, "_fsync_directory", move_current_after_the_move)
+        expected_current = other_vid
+        expected_error = tool_builder._ERROR_REVISE_TARGET_REPLACED
+    elif fault == "origin-write":
+        monkeypatch.setattr(tools, "write_origin_meta", lambda root, origin: False)
+        expected_error = tool_builder._ERROR_ORIGIN_WRITE
+    elif fault == "version-fsync":
+        real_fsync_tree = tool_builder._fsync_tree
+        monkeypatch.setattr(
+            tool_builder,
+            "_fsync_tree",
+            lambda path: path.name != "shell" and real_fsync_tree(path),
+        )
+        expected_error = tool_builder._ERROR_DURABILITY
+    else:
+        monkeypatch.setattr(tools, "publish_current", lambda package_root, vid: False)
+        expected_error = tool_builder._ERROR_CURRENT_WRITE
+    _fake_generate(monkeypatch, result=_revise_result(), files=files, side_effect=side_effect)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert (outcome.error or "").startswith(expected_error)
+    manifest = _draft_manifest(pkg)
+    assert manifest["publishing"] is None
+    [attempt] = manifest["attempts"]
+    assert (attempt["outcome"], attempt["error"]) == ("failed", outcome.error)
+    # Saved, marked as being published from, then the mark cleared.
+    assert manifest["generation"] == 3
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 3,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    kept = _draft_files(pkg)
+    if fault == "validation":
+        assert (kept / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+    elif fault == "embedded-secret":
+        # This round's run.py holds the secret: the draft keeps the base's instead.
+        assert (kept / "run.py").read_text(encoding="utf-8") == "print('x')\n"
+        assert attempt["omitted"] == [{"path": "run.py", "reason": "secret_content"}]
+    else:
+        assert (kept / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    for dirpath, _dirnames, filenames in os.walk(_draft_dir(pkg)):
+        for filename in filenames:
+            assert _DRAFT_SECRET.encode() not in (Path(dirpath) / filename).read_bytes()
+    current = package / tools._META_DIRNAME / tools._CURRENT_FILENAME
+    assert current.read_text(encoding="ascii") == f"{expected_current}\n"
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize("where", ["staging", "version"])
+def test_a_publish_that_fails_after_its_save_failed_keeps_the_work_where_it_is(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    where: str,
+) -> None:
+    """Nothing holds the work but the place the failed publish left it, and the
+    job names that place: the staging workspace, which then stays where it is,
+    or, once moved, the version directory ``current`` does not name."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+    if where == "staging":
+        files = {"tool.json": "{ not json at all"}
+    else:
+        files = {"run.py": _REVISED_RUN_PY}
+        monkeypatch.setattr(tools, "publish_current", lambda package_root, vid: False)
+    _fake_generate(monkeypatch, result=_revise_result(), files=files)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"]) == (
+        False,
+        tool_drafts.REASON_TOO_MANY_FILES,
+    )
+    retained = Path(outcome.draft["retained_path"])
+    if where == "staging":
+        [session] = _session_roots(tmp_path)
+        assert retained == session / "build"
+        assert (retained / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+        assert any(str(session) in record.getMessage() for record in caplog.records)
+    else:
+        assert retained.parent == _package_path(pkg) / tools._VERSIONS_DIRNAME
+        assert retained.name != _TEST_VID
+        assert (retained / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+        assert _session_roots(tmp_path) == []
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+def test_a_publish_whose_origin_text_cannot_be_masked_fails_and_names_the_kept_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The known secrets cannot be read from the save before the publish on: the
+    save keeps nothing, and the text the new version's origin would carry cannot
+    be masked. That is a publish that failed like any other -- nothing published,
+    the staging workspace left where it is, and the job naming it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_save = tool_builder._save_round_draft
+
+    def unreadable() -> frozenset[str]:
+        raise OSError("the tools directory cannot be read")
+
+    def save_then_lose_the_secrets(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None:  # the save a publish follows
+            monkeypatch.setattr(tools, "known_secret_values", unreadable)
+        return real_save(context, outcome, error)
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save_then_lose_the_secrets)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.not_ready is False
+    assert outcome.error == tool_builder._ERROR_ORIGIN_MASK.format(kind="OSError")
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": tool_drafts.REASON_SCAN_FAILED.format(reason="OSError"),
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_publish_while_a_tools_env_cannot_be_read_saves_nothing_publishes_nothing_and_says_which(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """From the save before the publish on, another tool's directory cannot be
+    looked at, so the known list is not whole. The save keeps nothing and says
+    which ``.env`` and what to check; the publish does not go ahead, its error
+    saying the same; the version stays where it was. Red before the fix: the list
+    was taken as whole without that ``.env``, and the round was saved and
+    published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    real_save = tool_builder._save_round_draft
+
+    def save_then_lose_the_env(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None:  # the save a publish follows
+            other.chmod(0)
+        return real_save(context, outcome, error)
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save_then_lose_the_env)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    try:
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    finally:
+        other.chmod(0o700)
+
+    assert outcome.ok is False
+    assert _resolved_version(_package_path(pkg)) == pkg
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    env = os.fspath(other / ".env")
+    assert outcome.error is not None
+    assert outcome.error.startswith(tool_builder._ERROR_ORIGIN_MASK_INCOMPLETE.format(detail=""))
+    assert "「other」" in outcome.error and env in outcome.error
+    assert outcome.draft is not None
+    reason = outcome.draft["reason"]
+    assert reason.startswith(tool_drafts.REASON_SECRETS_INCOMPLETE.format(detail=""))
+    assert "「other」" in reason and env in reason and "權限" in reason
+    # Nothing holds the work but the staging: it stays, and the job names it.
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft["retained_path"] == str(session / "build")
+
+
+def _publish_raises(*args: Any) -> Any:
+    raise RuntimeError("an unforeseen failure inside the publish")
+
+
+def test_an_exception_in_the_publish_keeps_the_workspace_no_draft_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The save before the publish kept nothing, and the publish ends in an
+    exception no outcome describes: the staging workspace is then the only copy of
+    the work, so it stays where it is and the backend log names it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_an_exception_in_the_publish_after_its_draft_was_saved_removes_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish kept the work, so an exception in the publish
+    loses nothing by the cleanup: the draft holds the round's files, and the
+    staging workspace is removed as after any other end of a revise."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _session_roots(tmp_path) == []
+
+
+def _revise_cancelled_while_held(monkeypatch: pytest.MonkeyPatch, step: str) -> None:
+    """Run one revise and cancel it while ``step`` -- ``"save"``, the save before
+    its publish, or ``"publish"`` -- is held on its worker, then let that worker
+    return. The held step changes nothing on disk and hands back a failure."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    def held(result: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        returned.set()
+        return result
+
+    real_save = tool_builder._save_round_draft
+
+    def save(
+        context: Any, outcome: tool_drafts.RoundOutcome | None, error: str | None
+    ) -> tool_drafts.SaveResult:
+        if outcome is None and step == "save":
+            return held(tool_drafts.SaveResult(worth_saving=True, reason="held"))
+        return real_save(context, outcome, error)
+
+    def publish(build_root: tools.BuildRoot, *args: Any) -> Any:
+        return held((None, "held", build_root.path))
+
+    monkeypatch.setattr(tool_builder, "_save_round_draft", save)
+    if step == "publish":
+        monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+
+    async def scenario() -> None:
+        task = asyncio.create_task(_run_revise("kbsearch", "加上分頁"))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("during", ["save", "publish"])
+def test_a_revise_cancelled_before_its_publish_is_handled_keeps_the_workspace_no_draft_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, during: str
+) -> None:
+    """Cancelled while the save before the publish, or the publish itself, runs
+    on its worker: the worker goes on, and no draft is known to hold the work, so
+    the staging workspace stays where it is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _install_settings(monkeypatch, tools_dir=str(_package_path(pkg).parent), tool_draft_max_files=1)
+
+    _revise_cancelled_while_held(monkeypatch, during)
+
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_publish_still_running_when_its_revise_is_cancelled_keeps_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft holds the work, and the revise is cancelled while its publish
+    runs on a worker. That worker goes on -- it may be moving the staging into
+    ``versions/`` -- so the staging is not removed beside it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    _revise_cancelled_while_held(monkeypatch, "publish")
+
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+def _revise_cancelled_while_copying(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pkg: Path, *, continuing: bool
+) -> list[Path]:
+    """Run one revise -- a round continuing ``pkg``'s draft when ``continuing``, a
+    first round otherwise -- and cancel it while its copy into the staging runs on
+    its worker; then let that worker go on to its end. Returns the session
+    workspaces there are once the cancellation has gone through, before the worker
+    goes on.
+
+    The worker held is the real one: a continuation's where it is about to write
+    the copy of the draft (``tool_drafts._carry_out``), a first round's once its
+    copy of the version is made, before it returns."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        release.wait(10)
+
+    if continuing:
+        real_carry_out = tool_drafts._carry_out
+        real_copy_in = tool_drafts.copy_into_workspace
+
+        def carry_out(plan: Any, incoming: Path, known: list[str]) -> Any:
+            hold()
+            return real_carry_out(plan, incoming, known)
+
+        def copy_in(**kwargs: Any) -> Any:
+            try:
+                return real_copy_in(**kwargs)
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tool_drafts, "_carry_out", carry_out)
+        monkeypatch.setattr(tool_drafts, "copy_into_workspace", copy_in)
+    else:
+        real_copy = tool_builder._copy_package_into_staging
+
+        def copy(source: tools.VersionRoot, staging: tools.BuildRoot) -> str | None:
+            try:
+                answer = real_copy(source, staging)
+                hold()
+                return answer
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tool_builder, "_copy_package_into_staging", copy)
+    during: list[Path] = []
+
+    async def scenario() -> None:
+        revise = (
+            _continue_revise(pkg, "分頁從 1 開始")
+            if continuing
+            else _run_revise("kbsearch", "加上分頁")
+        )
+        task = asyncio.create_task(revise)
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        during.extend(_session_roots(tmp_path))
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    return during
+
+
+def _names_kept_for_the_copy(caplog: pytest.LogCaptureFixture, session: Path) -> bool:
+    """Whether the backend log, where it names ``session``, says a copy into it may
+    still be writing it."""
+    return any(
+        str(session) in record.getMessage() and "copy" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_continuation_cancelled_while_its_copy_runs_leaves_the_staging_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while the copy of the draft into its staging runs on its worker:
+    the worker goes on, so the staging is not removed beside it -- it is there once
+    the cancellation has gone through, holds the whole copy once the worker is done,
+    and the backend log names it. The draft, which the copy only read, keeps its
+    files, and its manifest keeps the round's ``running`` mark for the next round to
+    record."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files_before = _file_bytes(_draft_files(pkg))
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        during = _revise_cancelled_while_copying(monkeypatch, tmp_path, pkg, continuing=True)
+
+    [session] = _session_roots(tmp_path)
+    assert during == [session]
+    assert _file_bytes(session / "build") == files_before
+    assert _file_bytes(_draft_files(pkg)) == files_before
+    assert _draft_manifest(pkg)["running"] is not None
+    assert _names_kept_for_the_copy(caplog, session)
+
+
+def test_a_first_round_cancelled_while_its_copy_runs_leaves_the_staging_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Cancelled while the copy of the version into its staging runs on its worker
+    -- made, not yet returned: the staging is not removed beside it -- it is there
+    once the cancellation has gone through, holds the copy once the worker is done,
+    and the backend log names it. The round never began, so no draft is made."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        during = _revise_cancelled_while_copying(monkeypatch, tmp_path, pkg, continuing=False)
+
+    [session] = _session_roots(tmp_path)
+    assert during == [session]
+    assert _file_bytes(session / "build") == {
+        "run.py": (pkg / "run.py").read_bytes(),
+        "tool.json": (pkg / "tool.json").read_bytes(),
+    }
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert _names_kept_for_the_copy(caplog, session)
+
+
+# --- the secret holds of a job the process's end stops ------------------------------
+#
+# ``run_install`` and ``run_revise`` hold the secret values they were given
+# (``tools.register_inflight_secret``) and release them as they end -- unless a
+# cancellation, an interrupt or an exit ends them: a worker they handed on then goes
+# on without them and may still take the known secrets, so the holds stay until the
+# process ends.
+
+# The install form's secret: in no package's .env until the promote writes it there.
+_FORM_SECRET = "form-secret-value-4821"
+# A revise's .env value, and the one the operator changes it to while the round runs:
+# the old one is from then on known only through the round's hold.
+_OLD_KEY = "old-kb-key-value-5309"
+_NEW_KEY = "new-kb-key-value-77140"
+
+
+def _install_cancelled_while_its_promote_is_held(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    at: str,
+    files: dict[str, str],
+    instructions: str,
+    cleanup_raises: bool = False,
+) -> tuple[tools.Resolved | None, str | None]:
+    """Run one install given the form's secret, and cancel it while its promote's
+    worker is held at ``at`` -- ``"validate_tool_content"``, about to scan the build,
+    or ``"write_origin_meta"``, about to write origin.json, each taking the known
+    secrets first; then let that worker go on. Returns what the promote handed back.
+
+    ``cleanup_raises`` makes the sweep the finally runs beside the staging it keeps
+    raise an ordinary exception: the job then ends in that, not in the cancellation."""
+    root = tmp_path / "tools"
+    _install_settings(monkeypatch, tools_dir=str(root))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), **files},
+    )
+    _no_fetch(monkeypatch)
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    answers: list[tuple[tools.Resolved | None, str | None]] = []
+    real_step = getattr(tools, at)
+    real_promote = tool_builder._promote_staging
+
+    def step(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        return real_step(*args, **kwargs)
+
+    def promote(*args: Any) -> tuple[tools.Resolved | None, str | None]:
+        try:
+            answer = real_promote(*args)
+            answers.append(answer)
+            return answer
+        finally:
+            returned.set()
+
+    def sweep_raising(base: Path) -> None:
+        raise RuntimeError("a cleanup step failing")
+
+    monkeypatch.setattr(tools, at, step)
+    monkeypatch.setattr(tool_builder, "_promote_staging", promote)
+    if cleanup_raises:
+        monkeypatch.setattr(tool_builder, "_sweep_logged", sweep_raising)
+    ended_in: type[BaseException] = RuntimeError if cleanup_raises else asyncio.CancelledError
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            run_install(
+                "http://kb.example/openapi.json",
+                instructions,
+                secret_name="KB_API_KEY",
+                secret_value=_FORM_SECRET,
+            )
+        )
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(ended_in):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    [answer] = answers
+    return answer
+
+
+def test_a_cancelled_install_s_promote_still_refuses_a_build_holding_the_form_secret(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to scan the build: the worker
+    goes on without the job, and the form's secret is in no package's .env yet --
+    the promote writes it there last -- so only the job's hold makes it a known
+    secret. The hold stays, so the scan still finds the value the builder baked into
+    its code: the build is refused, and nothing is installed."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="validate_tool_content",
+        files={"run.py": f"KEY = {_FORM_SECRET!r}\n{_GOOD_RUN_PY}"},
+        instructions="build a search tool",
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert not (tmp_path / "tools" / "kbsearch").exists()
+
+
+def test_a_cleanup_raising_after_a_cancelled_install_does_not_release_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to scan the build, and then a
+    step of its finally raises an ordinary exception, which the job ends in. It was
+    cancelled all the same: the hold stays, and the scan still refuses the build that
+    bakes the form's secret into its code."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="validate_tool_content",
+        files={"run.py": f"KEY = {_FORM_SECRET!r}\n{_GOOD_RUN_PY}"},
+        instructions="build a search tool",
+        cleanup_raises=True,
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert not (tmp_path / "tools" / "kbsearch").exists()
+
+
+def test_a_cancelled_install_s_promote_masks_the_form_secret_in_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while its promote's worker is about to write origin.json, which
+    records the install's instructions -- here naming the form's secret: the worker
+    goes on and installs the tool, and the hold that stays keeps the value masked in
+    the file as written."""
+    published, error = _install_cancelled_while_its_promote_is_held(
+        monkeypatch,
+        tmp_path,
+        at="write_origin_meta",
+        files={"run.py": _GOOD_RUN_PY},
+        instructions=f"build a search tool; its key is {_FORM_SECRET}",
+    )
+
+    assert error is None and published is not None
+    origin = published.version_root.path / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    written = origin.read_bytes()
+    assert _FORM_SECRET.encode() not in written
+    assert tools._REDACTION_MARKER in json.loads(written)["instructions"]
+
+
+def _seed_package_with_old_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """An installed package whose .env holds the old key."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_OLD_KEY}\n", encoding="utf-8")
+    return pkg
+
+
+def _key_changed(pkg: Path) -> Callable[[], None]:
+    """The operator changing the package's .env to the new key."""
+
+    def change() -> None:
+        (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_NEW_KEY}\n", encoding="utf-8")
+
+    return change
+
+
+def _revise_cancelled_while_held_at(
+    monkeypatch: pytest.MonkeyPatch,
+    pkg: Path,
+    *,
+    held: tuple[types.ModuleType, str],
+    answered: str,
+    feedback: str,
+    files: dict[str, str],
+) -> Any:
+    """Run one revise of ``pkg`` whose builder makes ``files`` and is ready to publish,
+    the package's .env changed to the new key as its session begins -- the old key
+    from then on known only through the round's hold -- and cancel it while the
+    worker that calls ``held`` (a module, and a function's name in it) is held there,
+    about to take the known secrets; then let it go on. Returns what that worker's
+    own function -- ``answered``, in tool_builder -- handed back."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+    answers: list[Any] = []
+    module, name = held
+    real_held = getattr(module, name)
+
+    def hold(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        release.wait(10)
+        return real_held(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, hold)
+    real_answered = getattr(tool_builder, answered)
+
+    def answer(*args: Any, **kwargs: Any) -> Any:
+        try:
+            result = real_answered(*args, **kwargs)
+            answers.append(result)
+            return result
+        finally:
+            returned.set()
+
+    monkeypatch.setattr(tool_builder, answered, answer)
+    _fake_generate(monkeypatch, result=_revise_result(), files=files, side_effect=_key_changed(pkg))
+
+    async def scenario() -> None:
+        task = asyncio.create_task(_run_revise("kbsearch", feedback))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+    [result] = answers
+    return result
+
+
+def test_a_cancelled_revise_s_save_masks_a_changed_env_value_in_the_draft_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator changed the package's .env while the round ran, so the old key is
+    known only through the round's hold; the round is cancelled while the save before
+    its publish is about to take the known secrets -- no publish is running yet. The
+    save goes on without the round, and the hold that stays keeps the old key masked
+    in the request the draft's manifest records."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+
+    saved = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tool_builder, "_save_round_draft"),
+        answered="_save_round_draft",
+        feedback=f"加上分頁 金鑰是 {_OLD_KEY}",
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    assert saved.saved is True
+    written = (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).read_bytes()
+    assert _OLD_KEY.encode() not in written
+    assert tools._REDACTION_MARKER in _draft_manifest(pkg)["feedback"]
+
+
+def test_a_cancelled_revise_s_publish_still_refuses_a_build_holding_a_changed_env_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder baked the package's key into its code, and the operator changed
+    the .env while the round ran: the old key is known only through the round's
+    hold. Cancelled while its publish's worker is about to scan the build, the worker
+    goes on; the hold stays, so the scan still refuses the build, and ``current``
+    does not move."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+
+    published, error, _content = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tools, "validate_tool_content"),
+        answered="_publish_revised_version",
+        feedback="加上分頁",
+        files={"run.py": f"KEY = {_OLD_KEY!r}\n{_REVISED_RUN_PY}"},
+    )
+
+    assert published is None
+    assert error is not None and "不得包含秘密值" in error
+    assert _resolved_version(_package_path(pkg)) == pkg
+
+
+def test_a_cancelled_revise_s_publish_masks_a_changed_env_value_in_origin_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The version the round revises records instructions that named the package's
+    key, and the operator changed the .env while the round ran: the old key is known
+    only through the round's hold. Cancelled while its publish's worker is about to
+    write the new version's origin.json, which carries those instructions over, the
+    worker goes on and publishes; the hold that stays keeps the old key masked in the
+    file as written."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+    origin = pkg / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    recorded = json.loads(origin.read_text(encoding="utf-8"))
+    origin.write_text(
+        json.dumps({**recorded, "instructions": f"its key is {_OLD_KEY}"}), encoding="utf-8"
+    )
+
+    published, error, _content = _revise_cancelled_while_held_at(
+        monkeypatch,
+        pkg,
+        held=(tools, "write_origin_meta"),
+        answered="_publish_revised_version",
+        feedback="加上分頁",
+        files={"run.py": _REVISED_RUN_PY},
+    )
+
+    assert error is None and published is not None
+    version = published.resolution.version_root.path
+    written = (version / tools._META_DIRNAME / tools._ORIGIN_FILENAME).read_bytes()
+    assert _OLD_KEY.encode() not in written
+    assert tools._REDACTION_MARKER in json.loads(written)["instructions"]
+
+
+@pytest.mark.parametrize("ending", ["returns", "its-promote-raises"])
+def test_an_install_that_returns_or_whose_worker_raises_releases_only_its_own_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
+) -> None:
+    """An install that returns, or whose promote's worker raises, leaves no worker
+    taking the known secrets for it: it releases its hold on the form's secret -- its
+    own, one count -- and the hold another holder took on the same value stays."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        files={"tool.json": json.dumps(_package_manifest("kbsearch")), "run.py": _GOOD_RUN_PY},
+    )
+    _no_fetch(monkeypatch)
+
+    def promote_raising(*args: Any) -> Any:
+        raise RuntimeError("the promote's own failure")
+
+    if ending == "its-promote-raises":
+        monkeypatch.setattr(tool_builder, "_promote_staging", promote_raising)
+    tools.register_inflight_secret(_FORM_SECRET)  # another holder of the same value
+    install = run_install(
+        "http://kb.example/openapi.json",
+        "build a search tool",
+        secret_name="KB_API_KEY",
+        secret_value=_FORM_SECRET,
+    )
+
+    if ending == "returns":
+        assert asyncio.run(install).ok is True
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(install)
+
+    with tools._INFLIGHT_LOCK:
+        assert tools._INFLIGHT_SECRETS == {_FORM_SECRET: 1}
+
+
+@pytest.mark.parametrize("ending", ["returns", "its-publish-raises"])
+def test_a_revise_that_returns_or_whose_worker_raises_releases_only_its_own_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
+) -> None:
+    """A revise that returns, or whose publish's worker raises, leaves no worker
+    taking the known secrets for it: it releases its holds on the .env values -- its
+    own, one count each -- and the hold another holder took on the same value stays."""
+    _seed_package_with_old_key(monkeypatch, tmp_path)
+    if ending == "its-publish-raises":
+        monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    tools.register_inflight_secret(_OLD_KEY)  # another holder of the same value
+    revise = _run_revise("kbsearch", "加上分頁")
+
+    if ending == "returns":
+        assert asyncio.run(revise).ok is True
+    else:
+        with pytest.raises(RuntimeError):
+            asyncio.run(revise)
+
+    with tools._INFLIGHT_LOCK:
+        assert tools._INFLIGHT_SECRETS == {_OLD_KEY: 1}
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_an_install_ended_by_an_interrupt_or_an_exit_keeps_its_hold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
+) -> None:
+    """An interrupt or an exit raised while an install runs means the process is
+    ending, as the event loop's shutdown cancelling the job does: the hold on the
+    form's secret stays until the process ends, so the value -- in no package's .env
+    -- is still a known secret after the job."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+
+    def interrupted() -> None:
+        raise raised()
+
+    _fake_generate(
+        monkeypatch,
+        result={"tool_name": "kbsearch", "summary": "built", "ready": True},
+        side_effect=interrupted,
+    )
+    _no_fetch(monkeypatch)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            run_install(
+                "http://kb.example/openapi.json",
+                "build a search tool",
+                secret_name="KB_API_KEY",
+                secret_value=_FORM_SECRET,
+            )
+        )
+
+    assert _FORM_SECRET in tools.known_secret_values()
+
+
+@pytest.mark.parametrize("raised", [KeyboardInterrupt, SystemExit])
+def test_a_revise_ended_by_an_interrupt_or_an_exit_keeps_its_holds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raised: type[BaseException]
+) -> None:
+    """An interrupt or an exit raised while a revise runs means the process is
+    ending: the holds on the .env values stay until the process ends, so the old
+    key -- which the operator changed the .env away from while the round ran -- is
+    still a known secret after the job."""
+    pkg = _seed_package_with_old_key(monkeypatch, tmp_path)
+    change = _key_changed(pkg)
+
+    def interrupted() -> None:
+        change()
+        raise raised()
+
+    _fake_generate(monkeypatch, result=_revise_result(), side_effect=interrupted)
+
+    with pytest.raises(raised):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert _OLD_KEY in tools.known_secret_values()
+
+
+def test_deleting_the_tool_while_its_draft_is_saved_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save holds the shared tools lock from the copy to the manifest, so a
+    delete in that window is the retryable 409 and the package -- with the draft
+    just written into it -- is still there afterwards."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    answers: list[Any] = []
+    real_carry_out = tool_drafts._carry_out
+
+    def carry_out_then_delete(plan: Any, incoming: Path, known: list[str]) -> Any:
+        omitted = real_carry_out(plan, incoming, known)
+        answers.append(client.delete("/api/tools/kbsearch"))
+        return omitted
+
+    monkeypatch.setattr(tool_drafts, "_carry_out", carry_out_then_delete)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [answer] = answers
+    assert answer.status_code == 409
+    assert answer.json()["detail"]["code"] == "ai_job_in_progress"
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+@pytest.mark.parametrize(
+    ("draft", "message"),
+    [
+        ("saved", tool_builder._DRAFT_PENDING_OPEN),
+        ("bare-directory", tool_builder._DRAFT_PENDING_BLOCKED),
+    ],
+)
+def test_router_revise_refuses_a_tool_with_a_draft_and_says_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, draft: str, message: str
+) -> None:
+    """A tool with a draft, in whatever state, takes no revise that does not name
+    it: 409 ``draft_pending`` with the message naming the ways out the draft's
+    state leaves -- continue or discard for one that can be continued, take the
+    files out and discard for an unusable one -- and no job. A stale
+    ``expected_vid`` is answered first, as the version check precedes it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    if draft == "saved":
+        _save_an_unfinished_round(monkeypatch, pkg)
+    else:
+        _draft_dir(pkg).mkdir()
+
+    refused = client.post(
+        "/api/tools/kbsearch/revise", json={"feedback": "再試一次", "expected_vid": _TEST_VID}
+    )
+    stale = client.post(
+        "/api/tools/kbsearch/revise",
+        json={"feedback": "再試一次", "expected_vid": "20260728T020304Z-fedcba"},
+    )
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == {"code": "draft_pending", "message": message}
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "version_mismatch"
+    assert tool_builder._JOBS == {}
+    assert tool_builder.any_job_active() is False
+
+
+def test_a_revise_sees_a_draft_made_before_it_took_the_slot(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft is judged after the slot is taken: a draft that appears up to
+    that moment -- a job that held the slot made it -- refuses the revise. Judged
+    any earlier, it would slip through."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    real_reserve = tool_builder.reserve_sync_operation
+
+    def reserve_once_a_draft_exists() -> str | None:
+        _draft_dir(pkg).mkdir()
+        return real_reserve()
+
+    monkeypatch.setattr(tool_builder, "reserve_sync_operation", reserve_once_a_draft_exists)
+
+    started = asyncio.run(tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID))
+
+    assert (started.refusal, started.message) == (
+        "draft_pending",
+        tool_builder._DRAFT_PENDING_BLOCKED,
+    )
+    assert tool_builder._JOBS == {}
+    assert tool_builder.any_job_active() is False
+
+
+def test_the_job_poll_names_the_draft_its_round_saved(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The card's round count comes from the job's ``draft``: which draft, at
+    which generation, after how many rounds. The round recorded in the draft
+    knows the job it ran in."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    async def scenario() -> str:
+        started = await tool_builder.start_revise_job("kbsearch", "加上分頁", _TEST_VID)
+        await _job_when_done(started.job_id)
+        assert started.job_id is not None
+        return started.job_id
+
+    job_id = asyncio.run(scenario())
+    polled = client.get(f"/api/tools/jobs/{job_id}")
+
+    assert polled.status_code == 200
+    manifest = _draft_manifest(pkg)
+    assert polled.json()["outcome"] == "not_published"
+    assert polled.json()["draft"] == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": None,
+    }
+    assert manifest["attempts"][0]["job_id"] == job_id
+
+
+def test_router_list_shows_the_draft_masked_with_the_secrets_known_now(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The list row carries the draft as the operator needs it -- its state, where
+    its files are, the last round -- and the model's notes masked with the
+    secrets known at this read: a value registered after the save is not
+    served back."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    late = "registered-after-the-save"
+    _fake_generate(
+        monkeypatch,
+        result={**_UNFINISHED, "summary": f"用 {late} 測過", "operator_action": f"把 {late} 換掉"},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+    asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    tools.register_inflight_secret(late)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    assert late not in response.text
+    manifest = _draft_manifest(pkg)
+    [row] = response.json()["tools"]
+    assert row["draft"] == {
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "state": "open",
+        "interrupted": False,
+        "base_vid": _TEST_VID,
+        "path": str(_draft_files(pkg)),
+        "draft_dir": str(_draft_dir(pkg)),
+        "kept": [],
+        "discard_token": tool_drafts.discard_token(_draft_dir(pkg)),
+        "last": {
+            "stopped_by": None,
+            "failure": None,
+            "outcome": "not_published",
+            "finished_at": manifest["attempts"][0]["finished_at"],
+            "operator_action": f"把 {tools._REDACTION_MARKER} 換掉",
+            "summary": f"用 {tools._REDACTION_MARKER} 測過",
+            "omitted": 0,
+        },
+    }
+
+
+def test_router_list_serves_a_draft_path_that_is_not_utf8_made_encodable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On Linux a tools directory whose name is not UTF-8 reaches the draft's path
+    as lone surrogates. This filesystem cannot make such a name, so the draft
+    view's answer is given one here. The listing is served, with the path made
+    encodable and the rest of the draft as it was."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    tools_root = str(tmp_path / "tools")
+    real_view = tool_drafts.draft_view
+
+    def view_under_a_name_that_is_not_utf8(*args: Any, **kwargs: Any) -> dict[str, Any] | None:
+        row = real_view(*args, **kwargs)
+        assert row is not None
+        return {**row, "path": row["path"].replace(tools_root, f"{tools_root}-\udcff", 1)}
+
+    monkeypatch.setattr(tool_drafts, "draft_view", view_under_a_name_that_is_not_utf8)
+
+    response = client.get("/api/tools")
+
+    assert response.status_code == 200
+    [row] = response.json()["tools"]
+    assert row["draft"]["path"] == str(_draft_files(pkg)).replace(
+        tools_root, f"{tools_root}-���", 1
+    )
+    assert (row["draft"]["state"], row["draft"]["attempts"]) == ("open", 1)
+
+
+def test_router_reports_an_unusable_lock_whose_path_is_not_utf8_made_encodable(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The lock error names the lock file, under the tools directory, whose name on
+    Linux can carry lone surrogates. The 500 is served with that path made
+    encodable and the operator's instructions as they were."""
+    _seed_package(monkeypatch, tmp_path, "locked")
+    error = tools.ToolsLockUnavailableError(
+        Path("/srv/tools-\udcff") / tools._TOOLS_LOCK_FILENAME, "cannot open it: Permission denied"
+    )
+
+    def unusable(name: str) -> None:
+        raise error
+
+    monkeypatch.setattr(tools, "delete_tool", unusable)
+
+    response = client.delete("/api/tools/locked")
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == {
+        "code": "tools_lock_unavailable",
+        "message": str(error).replace("\udcff", "���"),
+    }
+
+
+def test_router_list_fails_rather_than_serve_draft_text_it_could_not_mask(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The secrets a draft's text is masked with cannot be scanned: the listing is
+    a 500, not a page of text no one checked. Without a draft nothing needs that
+    scan, and the same listing is served."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+
+    def unscannable() -> list[str]:
+        raise OSError("the tools directory cannot be read")
+
+    monkeypatch.setattr(tools, "_redaction_secrets", unscannable)
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+
+    assert lenient.get("/api/tools").status_code == 500
+    shutil.rmtree(_draft_dir(pkg))
+    assert lenient.get("/api/tools").status_code == 200
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_sends_no_draft_text_while_a_tools_env_cannot_be_read(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft's summary holds a value that became another tool's secret after
+    the save, and that tool's directory cannot be looked at, so the value is not
+    in the known list. The listing is a 500 with none of the draft's text in it;
+    once the directory can be read again, the text is served masked. Red before
+    the fix: the list was taken as whole without that ``.env``, and the value was
+    served unmasked."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    late = "late-secret-abcdef"
+    _fake_generate(
+        monkeypatch,
+        result={**_UNFINISHED, "summary": f"API 沒有分頁參數 {late}"},
+        files={"run.py": _REVISED_RUN_PY},
+    )
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text(f"OTHER_KEY={late}\n", encoding="utf-8")
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    other.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        other.chmod(0o700)
+
+    assert late not in response.text
+    assert response.status_code == 500
+    served = client.get("/api/tools")
+    assert served.status_code == 200
+    assert late not in served.text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_router_list_with_a_draft_says_which_env_it_cannot_read_and_what_to_do(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tool has a draft, and another tool's directory cannot be looked at, so the
+    known secrets the draft's text is masked with are not whole. The list is a 500
+    in the error shape the page reads, under its own code; the message names that
+    ``.env`` and what to check, and holds none of the draft's text. Red before the
+    fix: a bare 500 with no message."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    lenient = TestClient(client.app, raise_server_exceptions=False)
+    other.chmod(0)
+    try:
+        response = lenient.get("/api/tools")
+    finally:
+        other.chmod(0o700)
+
+    assert response.status_code == 500
+    assert response.headers["content-type"].startswith("application/json"), response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "known_secrets_incomplete"
+    assert str(other / ".env") in detail["message"]
+    assert "PermissionError" in detail["message"]
+    assert _UNFINISHED["summary"] not in response.text
+    assert "other-secret-abcdef" not in response.text
+
+
+def test_router_discards_only_the_draft_the_caller_names(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``DELETE /api/tools/{name}/draft`` names the draft by its id and generation
+    (or a token, never both); takes the slot first; refuses a draft other than the
+    one named; and once it is gone answers that there is none."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    [row] = client.get("/api/tools").json()["tools"]
+    draft = row["draft"]
+    named = {"draft_id": draft["draft_id"], "generation": draft["generation"]}
+    url = "/api/tools/kbsearch/draft"
+
+    for params in (
+        {},
+        {"draft_id": draft["draft_id"]},
+        {"generation": draft["generation"]},
+        {**named, "discard_token": draft["discard_token"]},
+        {"draft_id": "not-a-draft-id", "generation": 1},
+        {"discard_token": "abc"},
+    ):
+        assert client.delete(url, params=params).status_code == 422, params
+    missing = client.delete("/api/tools/ghost/draft", params=named)
+    assert (missing.status_code, missing.json()) == (404, {"detail": "Tool not found"})
+    changed = client.delete(url, params={**named, "generation": draft["generation"] + 1})
+    assert changed.status_code == 409
+    assert changed.json()["detail"]["code"] == "draft_changed"
+    with tool_builder._JOBS_LOCK:
+        tool_builder._JOBS["active"] = tool_builder.InstallJob(
+            job_id="active", state="running", created_at="2026-07-16T00:00:00+00:00"
+        )
+    busy = client.delete(url, params=named)
+    assert busy.status_code == 409
+    assert busy.json()["detail"]["code"] == "job_busy"
+    tool_builder._reset_jobs_for_tests()
+    assert tool_drafts.has_draft(_package_root(pkg))
+
+    done = client.delete(url, params=named)
+
+    assert (done.status_code, done.json()) == (200, {"residual_path": None})
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    again = client.delete(url, params=named)
+    assert again.status_code == 404
+    assert again.json()["detail"]["code"] == "draft_not_found"
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"] is None
+
+
+def test_router_shows_and_discards_no_draft_through_another_tool_s_metadata_directory(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One tool's ``.afterthread.meta`` is a link to another tool's, which has a
+    draft. The linked tool has no draft of its own: its row shows none, and a
+    discard addressed to it with the token the other tool's row gives is 404
+    ``draft_not_found``, the other tool's draft left exactly as it was."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    other = _package_path(_seed_package(monkeypatch, tmp_path, name="kbother"))
+    shutil.rmtree(other / tools._META_DIRNAME)
+    os.symlink(_package_path(pkg) / tools._META_DIRNAME, other / tools._META_DIRNAME)
+    before = tool_drafts.tree_digest(_draft_dir(pkg))
+
+    rows = {row["name"]: row for row in client.get("/api/tools").json()["tools"]}
+    refused = client.delete(
+        "/api/tools/kbother/draft",
+        params={"discard_token": rows["kbsearch"]["draft"]["discard_token"]},
+    )
+
+    assert rows["kbother"]["draft"] is None
+    assert rows["kbsearch"]["draft"]["state"] == "open"
+    assert refused.status_code == 404
+    assert refused.json()["detail"]["code"] == "draft_not_found"
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(_draft_dir(pkg)))
+
+
+def _first_looks_fail(patch: pytest.MonkeyPatch, target: Path, times: int) -> list[str]:
+    """The first ``times`` ``os.lstat`` calls on exactly ``target`` fail with EIO;
+    every other one works. Returns the paths it failed."""
+    real_lstat = os.lstat
+    spelled_target = os.fspath(target)
+    failed: list[str] = []
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+        if spelled == spelled_target and len(failed) < times:
+            failed.append(spelled_target)
+            raise OSError(errno.EIO, "Input/output error", spelled_target)
+        return real_lstat(path, *args, **kwargs)
+
+    patch.setattr(os, "lstat", lstat)
+    return failed
+
+
+def _alias_to(name: str = "kbsearch") -> Path:
+    """``<tools_dir>/alias``, made a link to the package ``name``, as ``tools_dir``
+    spells it."""
+    base = tools.tools_dir()
+    assert base is not None
+    alias = base / "alias"
+    alias.symlink_to(base / name, target_is_directory=True)
+    return alias
+
+
+def test_router_discards_no_draft_through_an_alias_whose_first_look_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``alias`` is a link to ``kbsearch``, which has a draft, and the first look
+    at the link fails. A discard addressed to the alias with the token of
+    ``kbsearch``'s draft is 404, as it is with no fault, and that draft is left
+    exactly as it was. Red before the fix: the name was handed ``kbsearch`` and
+    its draft was removed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    alias = _alias_to()
+    draft = _draft_dir(pkg)
+    token = tool_drafts.discard_token(draft)
+    before = tool_drafts.tree_digest(draft)
+    assert (
+        client.delete("/api/tools/alias/draft", params={"discard_token": token}).status_code == 404
+    )
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 1)
+        refused = client.delete("/api/tools/alias/draft", params={"discard_token": token})
+
+    assert failed == [str(alias)]
+    assert refused.status_code == 404
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(draft))
+
+
+def test_router_discards_nothing_through_an_alias_handed_out_as_itself(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both looks at ``alias`` the name's resolve takes fail, so the alias path
+    itself is handed out, not ``kbsearch``. The discard looks at the package
+    directory without following the link and finds no draft of its own there:
+    404 ``draft_not_found``, and ``kbsearch``'s draft is left exactly as it was.
+    Not red before the fix: it pins what refuses an alias the check on the
+    resolve's result cannot see."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    alias = _alias_to()
+    draft = _draft_dir(pkg)
+    token = tool_drafts.discard_token(draft)
+    before = tool_drafts.tree_digest(draft)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 2)
+        refused = client.delete("/api/tools/alias/draft", params={"discard_token": token})
+
+    assert failed == [str(alias)] * 2
+    assert refused.status_code == 404
+    assert refused.json()["detail"]["code"] == "draft_not_found"
+    assert tool_drafts.has_draft(_package_root(pkg))
+    assert tool_drafts.same_tree(before, tool_drafts.tree_digest(draft))
+
+
+def test_a_revise_through_an_alias_handed_out_as_itself_starts_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The revise's name is resolved twice, before its slot and in it, and each
+    time both looks at ``alias`` fail, so the alias path itself is handed out.
+    The version check looks at the package directory without following the link
+    and refuses it: the revise is refused as not found, no job starts, no model
+    is called and no draft is made. Not red before the fix: it pins what refuses
+    an alias the check on the resolve's result cannot see."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    alias = _alias_to()
+    looked: list[Path] = []
+    real_resolve_current = tools.resolve_current
+
+    def resolve_current(package_root: tools.PackageRoot) -> tools.Resolution:
+        looked.append(package_root.path)
+        return real_resolve_current(package_root)
+
+    monkeypatch.setattr(tools, "resolve_current", resolve_current)
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 4)
+        start = asyncio.run(tool_builder.start_revise_job("alias", "加上分頁", _TEST_VID))
+
+    assert failed == [str(alias)] * 4
+    assert (start.job_id, start.refusal) == (None, "not_found")
+    assert looked == [alias]
+    assert captured == {}
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_router_discards_no_version_through_an_alias_whose_first_look_fails(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``alias`` is a link to ``kbsearch``, whose current version has one before
+    it, and the first look at the link fails. Discarding that version by the
+    alias's name is 404, as with no fault, and ``kbsearch`` keeps it current. Red
+    before the fix: the name was handed ``kbsearch`` and its current version was
+    discarded."""
+    first = _seed_package(monkeypatch, tmp_path)
+    second_vid = "20260728T020304Z-fedcba"
+    _copy_committed_version(first, second_vid)
+    assert tools.publish_current(_package_root(first), second_vid)
+    alias = _alias_to()
+
+    with monkeypatch.context() as patch:
+        failed = _first_looks_fail(patch, alias, 1)
+        refused = client.delete(f"/api/tools/alias/versions/{second_vid}")
+
+    assert failed == [str(alias)]
+    assert refused.status_code == 404
+    current = tools.resolve_current(_package_root(first))
+    assert isinstance(current, tools.Resolved) and current.vid == second_vid
+
+
+def test_router_answers_a_discard_that_cannot_see_the_draft_gone_as_not_done(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``draft/`` cannot be looked at or renamed: the list shows it unusable, and
+    a discard by the token it gives cannot see the draft gone. The answer is not a
+    discard that went through -- 500 ``draft_not_removed``, naming ``draft/`` --
+    and the draft is still there."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    draft = _draft_dir(pkg)
+    real_lstat, real_rename = os.lstat, os.rename
+
+    def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == os.fspath(draft):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    def rename(source: Any, destination: Any, *args: Any, **kwargs: Any) -> None:
+        if os.fspath(source) == os.fspath(draft):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(source))
+        real_rename(source, destination, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "lstat", lstat)
+        patch.setattr(os, "rename", rename)
+        [row] = client.get("/api/tools").json()["tools"]
+        refused = client.delete(
+            "/api/tools/kbsearch/draft", params={"discard_token": row["draft"]["discard_token"]}
+        )
+
+    assert row["draft"]["state"] == "unusable"
+    assert refused.status_code == 500
+    assert refused.json()["detail"]["code"] == "draft_not_removed"
+    assert str(draft) in refused.json()["detail"]["message"]
+    assert tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_router_discards_an_unusable_draft_by_the_token_the_list_gave(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A draft whose manifest cannot be read has no id or generation to name, so
+    the list hands out a token for it. The token stands for the draft as listed:
+    once the manifest is rewritten it is refused, and a fresh one is honoured."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    manifest = _draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME
+    _draft_dir(pkg).mkdir()
+    manifest.write_text("{broken", encoding="utf-8")
+    url = "/api/tools/kbsearch/draft"
+    [row] = client.get("/api/tools").json()["tools"]
+    assert (row["draft"]["state"], row["draft"]["draft_id"]) == ("unusable", None)
+    seen = row["draft"]["discard_token"]
+
+    manifest.write_text("{broken again", encoding="utf-8")
+    stale = client.delete(url, params={"discard_token": seen})
+    [row] = client.get("/api/tools").json()["tools"]
+    done = client.delete(url, params={"discard_token": row["draft"]["discard_token"]})
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "draft_changed"
+    assert (done.status_code, done.json()) == (200, {"residual_path": None})
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_no_route_declared_before_the_draft_discard_takes_its_requests() -> None:
+    """A tool may be named ``jobs``, so ``DELETE /api/tools/jobs/draft`` must reach
+    the draft discard. Starlette serves the first route that matches path AND
+    method, so no route declared before the discard may match both; one that
+    matches the path alone (the job poll, a GET) is passed over."""
+    routes = tools_router.router.routes
+    [index] = [
+        position
+        for position, route in enumerate(routes)
+        if getattr(route, "endpoint", None) is tools_router.discard_tool_draft
+    ]
+    scope = {"type": "http", "path": "/tools/jobs/draft", "root_path": "", "method": "DELETE"}
+
+    assert routes[index].matches(scope)[0] is Match.FULL
+    for route in routes[:index]:
+        assert route.matches(scope)[0] is not Match.FULL, getattr(route, "path", route)
+
+
+def test_the_stale_backup_sweep_collects_what_a_discard_left_and_keeps_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``_sweep_stale_backups``, which installs and revises end with, collects what
+    a discard could not remove -- and only that: the draft itself stays as it is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _save_an_unfinished_round(monkeypatch, pkg)
+    leftover = _package_path(pkg) / tools._META_DIRNAME / ("draft.discarded-" + "1" * 32)
+    leftover.mkdir()
+    (leftover / "run.py").write_text("print('left')\n", encoding="utf-8")
+
+    tool_builder._sweep_stale_backups(_package_path(pkg).parent)
+
+    assert not leftover.exists()
+    assert (_draft_files(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+# --- continuing a draft: the job's round, what it keeps, the route, the prompt -----
+
+
+def _draft_identity(pkg: Path) -> tuple[str, int]:
+    manifest = _draft_manifest(pkg)
+    return manifest["draft_id"], manifest["generation"]
+
+
+def _rewrite_draft(pkg: Path, **changes: Any) -> None:
+    """Write the draft's manifest with ``changes`` on top, as a hand edit would."""
+    data = tool_drafts.manifest_bytes({**_draft_manifest(pkg), **changes}, [])
+    assert data is not None
+    (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).write_bytes(data)
+
+
+def _first_round(
+    monkeypatch: pytest.MonkeyPatch, pkg: Path, *, runs: tuple[AttachedRun, ...] = ()
+) -> dict[str, Any]:
+    """One revise whose builder stops short, ``runs`` attached; its draft's manifest."""
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    resolution = tools.resolve_current(_package_root(pkg))
+    assert isinstance(resolution, tools.Resolved)
+    outcome = asyncio.run(tool_builder.run_revise("kbsearch", "加上分頁", resolution, runs=runs))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    return _draft_manifest(pkg)
+
+
+async def _continue_revise(
+    pkg: Path,
+    note: str | None,
+    *,
+    runs: tuple[AttachedRun, ...] = (),
+    attached: tuple[AttachedRun, ...] = (),
+) -> InstallOutcome:
+    """One round continuing the package's draft as it is now, run as the job runs it."""
+    resolution = tools.resolve_current(_package_root(pkg))
+    assert isinstance(resolution, tools.Resolved)
+    return await tool_builder.run_revise(
+        "kbsearch",
+        note,
+        resolution,
+        runs=runs,
+        continuation=tool_drafts.Continuation(expected=_draft_identity(pkg), attached=attached),
+    )
+
+
+def _manifest_writes_not_durable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every draft manifest is replaced, but its directory's fsync is not confirmed."""
+    real_write = tools._write_package_file_atomic
+
+    def write(directory: Path, filename: str, data: bytes, expected: Any, **kwargs: Any) -> bool:
+        out = kwargs.get("durability_out")
+        published = real_write(directory, filename, data, expected, **kwargs)
+        if out is not None and filename == tool_drafts.MANIFEST_FILENAME:
+            out[:] = [False]
+        return published
+
+    monkeypatch.setattr(tools, "_write_package_file_atomic", write)
+
+
+def test_a_continuation_works_on_the_draft_tells_the_model_where_it_is_and_records_it_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round's workspace is the draft's files, not the base; the model is told
+    which attempt this is, the original request, this round's note and how the
+    last round ended; the round is recorded once -- its note, its files, the run
+    it newly attached ahead of the one the draft kept -- and the staging goes."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    kept_run = _attached(id=11)
+    first = _first_round(monkeypatch, pkg, runs=(kept_run,))
+    manifest_by_hand = _draft_files(pkg) / "tool.json"
+    tool_json = json.loads(manifest_by_hand.read_text(encoding="utf-8"))
+    manifest_by_hand.write_text(
+        json.dumps({**tool_json, "description": "edited in the draft by hand"}), encoding="utf-8"
+    )
+    received: dict[str, str] = {}
+
+    def look() -> None:
+        received["run.py"] = (_staging_dir(tmp_path / "tools") / "run.py").read_text(
+            encoding="utf-8"
+        )
+
+    captured = _fake_generate(
+        monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"}, side_effect=look
+    )
+    new_run = _attached(id=12, stderr="KeyError: 'page'")
+    purged_run = _attached(id=13, message=None, args=None, stdout=None, stderr=None, purged=True)
+
+    outcome = asyncio.run(
+        _continue_revise(
+            pkg, "分頁從 1 開始", runs=(new_run, kept_run, purged_run), attached=(new_run,)
+        )
+    )
+
+    assert received["run.py"] == _REVISED_RUN_PY
+    manifest = _draft_manifest(pkg)
+    latest = manifest["attempts"][-1]
+    assert (manifest["attempt_count"], len(manifest["attempts"])) == (2, 2)
+    assert (latest["number"], latest["note"], latest["outcome"], latest["saved"]) == (
+        2,
+        "分頁從 1 開始",
+        "not_published",
+        True,
+    )
+    assert [run["id"] for run in manifest["runs"]] == [12, 11]
+    assert manifest["running"] is None
+    assert (_draft_files(pkg) / "page.py").read_text(encoding="utf-8") == "PAGE = 1\n"
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": None,
+        "retained_path": None,
+    }
+    assert _session_roots(tmp_path) == []
+    assert "CONTINUATION. This is attempt 2 at this revision." in captured["system_prompt"]
+    user = captured["user_prompt"]
+    assert "The operator's original request:\n\n加上分頁" in user
+    assert "The operator's note for this attempt:\n\n分頁從 1 開始" in user
+    assert f"Its handoff: {_UNFINISHED['handoff']}" in user
+    assert f"installed version {_TEST_VID} this draft started from:\n\n- run.py" in user
+    assert "The workspace's current tool.json:" in user
+    assert "edited in the draft by hand" in user
+    assert tool_builder._RAN_THE_BASE in user
+    purged_text = user.split("Run #13 ", 1)[1].split("\n\n", 1)[0]
+    assert tool_builder._RUN_PURGED in purged_text and "stderr:" not in purged_text
+
+
+@pytest.mark.parametrize(
+    "meanwhile",
+    ["untouched", "untouched-its-env-not-brought-in", "edited", "moved", "unreadable"],
+)
+def test_an_unchanged_continuation_is_saved_only_while_its_files_are_as_it_copied_them_out(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, meanwhile: str
+) -> None:
+    """A continuing round that changes nothing in its workspace -- the builder stops
+    short -- keeps the draft's files directory as the draft's. It is recorded as
+    saved, and its staging goes, only while that directory is seen to be what the
+    round copied out of it, a root ``.env`` the round was not given included.
+    Edited during the round, moved away, or not to be read: the round is recorded
+    as not saved and says why, the directory is left as it is -- an edit stays the
+    draft's files, not moved to ``kept`` -- and the staging, holding what the round
+    began with, stays and is named."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    if meanwhile == "untouched-its-env-not-brought-in":
+        (files / ".env").write_text("DRAFT_KEY=put-there-by-hand\n", encoding="utf-8")
+    before = _draft_manifest(pkg)
+    as_copied = tool_drafts.tree_digest(files)
+    unseen = [False]
+    _refuse_lstat(monkeypatch, files, active=unseen)
+    moved_to = tmp_path / "moved-aside"
+
+    def meddle() -> None:
+        if meanwhile == "edited":
+            (files / "run.py").write_text("print('edited by hand')\n", encoding="utf-8")
+        elif meanwhile == "moved":
+            files.rename(moved_to)
+        elif meanwhile == "unreadable":
+            unseen[0] = True
+
+    _fake_generate(monkeypatch, result=_UNFINISHED, side_effect=meddle)
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+    unseen[0] = False
+
+    after = _draft_manifest(pkg)
+    latest = after["attempts"][-1]
+    assert (after["files_dir"], after["kept"], after["running"]) == (before["files_dir"], [], None)
+    assert outcome.draft is not None
+    report = (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"])
+    if meanwhile.startswith("untouched"):
+        assert report == (True, None, None)
+        assert (latest["number"], latest["saved"], latest["reason"]) == (2, True, None)
+        assert _session_roots(tmp_path) == []
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(files))
+        return
+    [session] = _session_roots(tmp_path)
+    assert report == (False, tool_drafts.REASON_FILES_CHANGED, str(session / "build"))
+    assert (latest["number"], latest["saved"], latest["reason"]) == (
+        2,
+        False,
+        tool_drafts.REASON_FILES_CHANGED,
+    )
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    if meanwhile == "edited":
+        assert (files / "run.py").read_text(encoding="utf-8") == "print('edited by hand')\n"
+    elif meanwhile == "moved":
+        assert not os.path.lexists(files)
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(moved_to))
+    else:
+        assert tool_drafts.same_tree(as_copied, tool_drafts.tree_digest(files))
+
+
+def test_a_continuation_keeps_a_metadata_alias_the_operator_added_to_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator added ``.AFTERTHREAD.META/notes.txt`` to the draft's files, on a
+    filesystem that does not tell case apart: the same entry as
+    ``.afterthread.meta/``, which the strip before the save removes. The round
+    changes another file and saves a new files directory. The alias was not
+    brought in, so the previous files directory, holding the notes, stays in
+    ``kept``, and the job says why."""
+    if _case_sensitive_filesystem(tmp_path):
+        pytest.skip(
+            "this filesystem tells .afterthread.meta and .AFTERTHREAD.META apart: the "
+            "alias is another entry, which the strip does not reach"
+        )
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / ".AFTERTHREAD.META").mkdir()
+    (previous / ".AFTERTHREAD.META" / "notes.txt").write_text("mine\n", encoding="utf-8")
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    manifest = _draft_manifest(pkg)
+    assert manifest["files_dir"] != first["files_dir"]
+    assert manifest["kept"] == [first["files_dir"]]
+    assert (previous / ".AFTERTHREAD.META" / "notes.txt").read_text(encoding="utf-8") == "mine\n"
+    assert manifest["attempts"][-1]["not_brought_in"] == [
+        {"path": ".AFTERTHREAD.META", "reason": "backend_meta"}
+    ]
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_drafts.NOTE_PREVIOUS_KEPT.format(
+        path=previous, why=tool_drafts.KEPT_NOT_ALL_BROUGHT_IN
+    )
+
+
+def _top_of(path: Any, name: str, tree: str) -> bool:
+    """Whether ``path`` is ``name`` at the top of the round's ``workspace`` (its
+    ``build`` directory), of the ``copy`` a save is making (``.incoming-<hex>``), or
+    of the ``previous`` files directory (``files-<hex>``)."""
+    candidate = Path(os.fspath(path))
+    parent = candidate.parent.name
+    return (
+        candidate.name == name
+        and {
+            "workspace": parent == "build",
+            "copy": parent.startswith(".incoming-"),
+            "previous": parent.startswith("files-"),
+        }[tree]
+    )
+
+
+def _eio(path: Any) -> OSError:
+    return OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(path))
+
+
+def _fail_a_look_at_the_save(monkeypatch: pytest.MonkeyPatch, case: str, armed: list[bool]) -> None:
+    """Make the look ``case`` names fail while ``armed`` -- set once the round has
+    its workspace, so the copy of the draft into it is untouched."""
+    if case in ("workspace-scan-file", "copy-scan", "copy-scan-put-back"):
+        tree = "workspace" if case == "workspace-scan-file" else "copy"
+        real_search = tools._search_file
+
+        def search(path: str, secrets: list[str], overlap: int) -> Any:
+            if armed[0] and _top_of(path, "user-only.txt", tree):
+                return "unreadable"
+            return real_search(path, secrets, overlap)
+
+        monkeypatch.setattr(tools, "_search_file", search)
+    elif case == "workspace-scan-link":
+        scanning = [False]
+        real_scan = tools._scan_tree
+        real_readlink = os.readlink
+
+        def scan_tree(root: Path, secrets: list[str]) -> Any:
+            scanning[0] = True
+            try:
+                return real_scan(root, secrets)
+            finally:
+                scanning[0] = False
+
+        def readlink(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if armed[0] and scanning[0] and _top_of(path, "user-link", "workspace"):
+                raise _eio(path)
+            return real_readlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(tools, "_scan_tree", scan_tree)
+        monkeypatch.setattr(os, "readlink", readlink)
+    elif case in ("workspace-link-rule", "put-back-link-rule", "copy-link-rule"):
+        tree = "copy" if case == "copy-link-rule" else "workspace"
+        real_is_link = tool_drafts._is_link
+
+        def is_link(path: Path) -> bool:
+            if armed[0] and _top_of(path, "sub", tree):
+                raise _eio(path)
+            return real_is_link(path)
+
+        monkeypatch.setattr(tool_drafts, "_is_link", is_link)
+    elif case == "put-back-unreachable":
+        real_previous = tool_drafts.previous_files
+
+        def previous_files(package_root: Any, manifest: dict[str, Any]) -> Path | None:
+            return None if armed[0] else real_previous(package_root, manifest)
+
+        monkeypatch.setattr(tool_drafts, "previous_files", previous_files)
+    elif case in ("put-back-directory", "put-back-entry"):
+        real_lstat = os.lstat
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            candidate = Path(os.fspath(path))
+            if case == "put-back-directory":
+                hit = (
+                    candidate.name.startswith("files-")
+                    and candidate.parent.name == tool_drafts.DRAFT_DIRNAME
+                )
+            else:
+                hit = _top_of(path, "user-only.txt", "previous")
+            if armed[0] and hit:
+                raise _eio(path)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    elif case == "put-back-link-read":
+        real_readlink = os.readlink
+
+        def readlink(path: Any, *args: Any, **kwargs: Any) -> Any:
+            if armed[0] and _top_of(path, "user-link", "previous"):
+                raise _eio(path)
+            return real_readlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "readlink", readlink)
+    else:
+        assert case in ("copy-resolution", "copy-resolution-root"), case
+        real_realpath = os.path.realpath
+
+        def realpath(path: Any, *, strict: Any = False) -> Any:
+            if case == "copy-resolution":
+                hit = _top_of(path, "user-link", "copy")
+            else:
+                hit = Path(os.fspath(path)).name.startswith(".incoming-")
+            if armed[0] and strict and hit:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+            return real_realpath(path, strict=strict)
+
+        monkeypatch.setattr(os.path, "realpath", realpath)
+
+
+def _entry_at(root: Path, name: str) -> str:
+    """A link's target, or a file's text."""
+    return (
+        os.readlink(root / name)
+        if (root / name).is_symlink()
+        else (root / name).read_text(encoding="utf-8")
+    )
+
+
+# Every place a save leaves an entry out because a look failed rather than by a
+# decision about it: (case, the entry left out, whether the round wrote the secret
+# into it -- the draft's own version of it then being what a save puts back).
+_UNLOOKED_AT_SAVE = [
+    ("workspace-scan-file", "user-only.txt", False),
+    ("workspace-scan-link", "user-link", False),
+    ("workspace-link-rule", "user-link", False),
+    ("put-back-unreachable", "user-only.txt", True),
+    ("put-back-directory", "user-only.txt", True),
+    ("put-back-entry", "user-only.txt", True),
+    ("put-back-link-read", "user-link", True),
+    ("put-back-link-rule", "user-link", True),
+    ("copy-link-rule", "user-link", False),
+    ("copy-resolution", "user-link", False),
+    ("copy-resolution-root", "user-link", False),
+    ("copy-scan", "user-only.txt", False),
+    ("copy-scan-put-back", "user-only.txt", True),
+]
+
+
+@pytest.mark.parametrize(("case", "entry", "put_back"), _UNLOOKED_AT_SAVE)
+def test_a_continuation_that_cannot_look_at_an_entry_saves_no_files_and_keeps_both_copies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, entry: str, put_back: bool
+) -> None:
+    """The draft holds the operator's ``user-only.txt``, ``sub/`` and
+    ``user-link -> sub/../user-only.txt``, all brought in; the round changes
+    ``run.py``, and a look the save makes at ``entry`` fails. No files are saved:
+    the round is recorded as not saved, saying which entry; the draft's files
+    directory is the one it had, no copy added to ``kept``, and it still holds the
+    entry; the staging stays, named, holding the entry as the round left it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / "user-only.txt").write_text("the operator's own\n", encoding="utf-8")
+    (previous / "sub").mkdir()
+    os.symlink("sub/../user-only.txt", previous / "user-link")
+    in_the_draft = _entry_at(previous, entry)
+    armed = [False]
+    _fail_a_look_at_the_save(monkeypatch, case, armed)
+    files = {"run.py": _REVISED_RUN_PY + "# second\n"}
+    in_the_round = in_the_draft
+    if put_back:
+        in_the_round = (
+            f"gone-{_DRAFT_SECRET}" if entry == "user-link" else f"KEY = '{_DRAFT_SECRET}'\n"
+        )
+    if put_back and entry == "user-only.txt":
+        files["user-only.txt"] = in_the_round
+
+    def begin() -> None:
+        workspace = _staging_dir(tmp_path / "tools")
+        if put_back and entry == "user-link":
+            os.unlink(workspace / "user-link")
+            os.symlink(in_the_round, workspace / "user-link")
+        armed[0] = True
+
+    _fake_generate(monkeypatch, result=_UNFINISHED, files=files, side_effect=begin)
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+    armed[0] = False
+
+    reason = tool_drafts.REASON_UNLOOKED.format(paths=entry)
+    manifest = _draft_manifest(pkg)
+    assert (manifest["files_dir"], manifest["kept"]) == (first["files_dir"], first["kept"])
+    assert _entry_at(previous, entry) == in_the_draft
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["saved"], latest["reason"]) == (2, False, reason)
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": reason,
+        "retained_path": str(session / "build"),
+    }
+    assert _entry_at(session / "build", entry) == in_the_round
+
+
+def test_a_continuation_whose_copy_fails_one_open_keeps_the_entry_it_could_not_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator added ``user-only.txt`` to the draft; it is brought in whole and
+    nobody changes it. The round changes only ``run.py``, and while the copy is
+    scanned again one ``open`` of its ``user-only.txt`` fails (EIO). Nothing is
+    saved: the previous files directory still holds ``user-only.txt``, the staging
+    stays, and the job says the round was not saved, and why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    first = _first_round(monkeypatch, pkg)
+    previous = _draft_files(pkg)
+    (previous / "user-only.txt").write_text("the operator's own\n", encoding="utf-8")
+    failed: list[str] = []
+    real_open = os.open
+
+    def open_once_failing(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if not failed and _top_of(path, "user-only.txt", "copy"):
+            failed.append(os.fspath(path))
+            raise _eio(path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_once_failing)
+    _fake_generate(
+        monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY + "# second\n"}
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    assert len(failed) == 1
+    assert _draft_manifest(pkg)["files_dir"] == first["files_dir"]
+    assert (previous / "user-only.txt").read_text(encoding="utf-8") == "the operator's own\n"
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        False,
+        tool_drafts.REASON_UNLOOKED.format(paths="user-only.txt"),
+        str(session / "build"),
+    )
+    assert (session / "build" / "user-only.txt").read_text(encoding="utf-8") == (
+        "the operator's own\n"
+    )
+
+
+_HELPER_PY = "def page(items, size):\n    return items[:size]\n"
+
+
+@pytest.mark.parametrize("scanned", ["workspace", "copy"])
+def test_a_first_round_that_cannot_search_a_file_it_wrote_makes_no_draft_and_keeps_the_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scanned: str
+) -> None:
+    """The round writes ``helper.py``, a file the base version does not have, and
+    the scan of the ``scanned`` tree -- the workspace, while the copy is planned,
+    or the copy -- cannot search it. No files directory is committed, no draft at
+    all, and the reason names the file; the staging stays, named, holding it --
+    the only place the file is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    real_search = tools._search_file
+
+    def search(path: str, secrets: list[str], overlap: int) -> Any:
+        if _top_of(path, "helper.py", scanned):
+            return "unreadable"
+        return real_search(path, secrets, overlap)
+
+    monkeypatch.setattr(tools, "_search_file", search)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, "helper.py": _HELPER_PY},
+    )
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": tool_drafts.REASON_UNLOOKED.format(paths="helper.py"),
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "helper.py").read_text(encoding="utf-8") == _HELPER_PY
+
+
+def test_a_continuation_whose_draft_keeps_as_many_copies_as_it_may_calls_no_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``kept`` is full: the round does not begin -- no model call, the manifest as
+    it was -- and the job says why."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    names = [f"files-{index:032x}" for index in range(1, tool_drafts._KEPT_MAX + 1)]
+    for name in names:
+        (_draft_dir(pkg) / name).mkdir()
+    _rewrite_draft(pkg, kept=names)
+    before = _draft_manifest(pkg)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    assert outcome.ok is False
+    assert outcome.error == tool_builder._ERROR_CONTINUE_NOT_STARTED.format(
+        reason=tool_drafts.START_KEPT_FULL.format(max=tool_drafts._KEPT_MAX)
+    )
+    assert captured == {}
+    assert _draft_manifest(pkg) == before
+    assert _session_roots(tmp_path) == []
+
+
+def test_a_continuation_that_cannot_copy_its_draft_takes_its_mark_back_and_counts_no_round(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Marked running, then the draft's files are over the limit for the copy into
+    a workspace: no model call, the mark taken back, no round counted, ``runs``
+    left as it was -- the newly attached run not joined -- and no staging left."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg, runs=(_attached(id=11),))
+    before = _draft_manifest(pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=1)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次", attached=(_attached(id=12),)))
+
+    assert outcome.error == tool_builder._ERROR_CONTINUE_NOT_COPIED.format(
+        reason=tool_drafts.REASON_TOO_MANY_FILES
+    )
+    assert captured == {}
+    assert _draft_manifest(pkg) == {**before, "generation": before["generation"] + 2}
+    assert _session_roots(tmp_path) == []
+
+
+def test_a_continuation_whose_commands_are_not_confirmed_stopped_leaves_its_mark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The round ran, and its commands were not confirmed stopped: the manifest is
+    left as the round's start wrote it -- marked running, no round recorded, the
+    files as they were -- and the workspace stays where it is."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    before = _draft_manifest(pkg)
+
+    async def not_confirmed(self: tool_builder._BuilderShells) -> bool:
+        return False
+
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", not_confirmed)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    assert outcome.draft is None
+    after = _draft_manifest(pkg)
+    assert after["running"] is not None
+    assert (after["generation"], after["attempts"], after["files_dir"]) == (
+        before["generation"] + 1,
+        before["attempts"],
+        before["files_dir"],
+    )
+    [kept] = _session_roots(tmp_path)
+    assert (kept / "build" / "page.py").is_file()
+
+
+def test_a_continuation_ended_by_an_exception_leaves_its_mark_for_the_next_round(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An exception after the commands stopped: the manifest is not touched, the
+    mark stays for the next round to record, and the workspace -- held by no
+    one -- stays."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    before = _draft_manifest(pkg)
+
+    async def broken(result: Any) -> Any:
+        raise RuntimeError("a bug after the session")
+
+    monkeypatch.setattr(tool_builder, "_masked_notes", broken)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    after = _draft_manifest(pkg)
+    assert after["running"] is not None
+    assert (after["generation"], after["attempts"]) == (
+        before["generation"] + 1,
+        before["attempts"],
+    )
+    assert len(_session_roots(tmp_path)) == 1
+
+
+def test_a_round_saved_without_its_manifest_confirmed_on_disk_keeps_its_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft was written, but its manifest is not known to be on disk: the job
+    says the round was saved, and names the workspace, which stays."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _manifest_writes_not_durable(monkeypatch)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [session] = _session_roots(tmp_path)
+    manifest = _draft_manifest(pkg)
+    assert outcome.draft == {
+        "saved": True,
+        "draft_id": manifest["draft_id"],
+        "generation": 1,
+        "attempts": 1,
+        "reason": None,
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+@pytest.mark.parametrize("where", ["staging", "version"])
+def test_a_publish_failing_after_a_save_not_confirmed_on_disk_names_where_the_work_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, where: str
+) -> None:
+    """Saved and marked, the manifest not known to be on disk, then the publish
+    fails: the job names where the work is now -- the staging workspace, which
+    stays, or the version directory the publish had moved it to."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _manifest_writes_not_durable(monkeypatch)
+    if where == "staging":
+        files = {"tool.json": "{ not json at all"}
+    else:
+        files = {"run.py": _REVISED_RUN_PY}
+        monkeypatch.setattr(tools, "publish_current", lambda package_root, vid: False)
+    _fake_generate(monkeypatch, result=_revise_result(), files=files)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.ok is False
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    retained = Path(outcome.draft["retained_path"])
+    if where == "staging":
+        [session] = _session_roots(tmp_path)
+        assert retained == session / "build"
+        assert (retained / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+    else:
+        assert retained.parent == _package_path(pkg) / tools._VERSIONS_DIRNAME
+        assert retained.name != _TEST_VID
+        assert (retained / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+        assert _session_roots(tmp_path) == []
+    assert _draft_manifest(pkg)["publishing"] is None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_round_whose_notes_cannot_be_masked_strips_the_env_keeps_its_workspace_and_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the commands stopped, another tool's directory cannot be looked at, so
+    the model's notes cannot be masked. The builder's ``.env`` was stripped first
+    -- its key is reported -- the workspace stays and is named, and the draft's
+    manifest is left as the round's start wrote it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    before = _draft_manifest(pkg)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    real_stop = tool_builder._BuilderShells.stop_and_wait
+
+    async def stop_then_lose_the_list(self: tool_builder._BuilderShells) -> bool:
+        stopped = await real_stop(self)
+        other.chmod(0)
+        return stopped
+
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", stop_then_lose_the_list)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": "print('third')\n", ".env": "BUILDER_KEY=written-by-the-model\n"},
+    )
+
+    try:
+        outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+    finally:
+        other.chmod(0o700)
+
+    [session] = _session_roots(tmp_path)
+    assert outcome.error is not None and str(other / ".env") in outcome.error
+    assert outcome.env_keys == ("BUILDER_KEY",)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": before["draft_id"],
+        "generation": before["generation"] + 1,
+        "attempts": 1,
+        "reason": tool_drafts.REASON_NOTES_UNMASKED,
+        "retained_path": str(session / "build"),
+    }
+    assert not os.path.lexists(session / "build" / ".env")
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == "print('third')\n"
+    after = _draft_manifest(pkg)
+    assert (after["generation"], after["attempts"]) == (
+        before["generation"] + 1,
+        before["attempts"],
+    )
+    assert after["running"] is not None
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can look into a mode-000 directory")
+def test_a_round_whose_notes_cannot_be_masked_names_no_workspace_it_cannot_confirm(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The notes cannot be masked, and once the builder's ``.env`` is stripped the
+    staging shell cannot be looked at either: the workspace is kept, but the job
+    names no path for it, since what is at that path is not known."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    other = _package_path(pkg).parent / "other"
+    other.mkdir()
+    (other / ".env").write_text("OTHER_KEY=other-secret-abcdef\n", encoding="utf-8")
+    real_stop = tool_builder._BuilderShells.stop_and_wait
+
+    async def stop_then_lose_the_list(self: tool_builder._BuilderShells) -> bool:
+        stopped = await real_stop(self)
+        other.chmod(0)
+        return stopped
+
+    monkeypatch.setattr(tool_builder._BuilderShells, "stop_and_wait", stop_then_lose_the_list)
+    base = tools.tools_dir()
+    assert base is not None
+    stripped = [False]
+    real_strip = tool_builder._strip_builder_env
+
+    def strip(build_root: tools.BuildRoot, root: Path) -> tuple[tuple[str, ...], str | None]:
+        try:
+            return real_strip(build_root, root)
+        finally:
+            stripped[0] = True
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    refused = _refuse_lstat(monkeypatch, base / tool_builder._STAGING_DIRNAME, active=stripped)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+
+    try:
+        outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+    finally:
+        other.chmod(0o700)
+
+    assert outcome.draft is not None
+    assert (outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        tool_drafts.REASON_NOTES_UNMASKED,
+        None,
+    )
+    assert refused
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_an_exception_before_the_env_strip_strips_it_before_keeping_the_workspace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The commands stopped, then an exception before anything stripped the
+    builder's ``.env``: the work is held by no one, so the staging stays -- but
+    only once that ``.env`` is stripped, and the backend log, naming it, does not
+    say a ``.env`` may remain."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    def broken(workflow: str) -> int | None:
+        raise RuntimeError("a bug before the strip")
+
+    monkeypatch.setattr(llm_log, "last_record_id_for_workflow", broken)
+    stripping: list[bool] = []
+    real_strip = tool_builder._strip_builder_env
+
+    def strip(build_root: tools.BuildRoot, base: Path) -> tuple[tuple[str, ...], str | None]:
+        stripping.append(os.path.lexists(build_root.path / ".env"))
+        return real_strip(build_root, base)
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, ".env": "BUILDER_KEY=written-by-the-model\n"},
+    )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    [session] = _session_roots(tmp_path)
+    assert stripping == [True]
+    assert not os.path.lexists(session / "build" / ".env")
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert any(str(session) in record.getMessage() for record in caplog.records)
+    assert not _says_the_env_may_remain(caplog, session)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+_BUILDER_ENV = "BUILDER_KEY=written-by-the-model\n"
+
+
+def _refuse_env_removal(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """The strip's removal of the builder's ``.env`` fails, as a workspace the builder
+    made read-only fails it; ``_strip_builder_env`` itself runs as it is, and every
+    other removal goes through. Returns the paths refused."""
+    real_remove = tool_builder._remove_reserved_sidecar_path
+    refused: list[Path] = []
+
+    def remove(path: Path) -> None:
+        if path.name == ".env":
+            refused.append(path)
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), os.fspath(path))
+        real_remove(path)
+
+    monkeypatch.setattr(tool_builder, "_remove_reserved_sidecar_path", remove)
+    return refused
+
+
+def _says_the_env_may_remain(caplog: pytest.LogCaptureFixture, session: Path) -> bool:
+    """Whether the backend log, where it names ``session``, says a .env may be there."""
+    return any(
+        str(session) in record.getMessage() and ".env" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("kind", ["first-round", "continuation"])
+def test_a_builder_env_that_cannot_be_stripped_keeps_the_staging_with_the_work_in_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, kind: str
+) -> None:
+    """The builder's ``.env`` cannot be removed. No files are saved, and the staging
+    stays whole -- the ``.env`` with the work, a file in a subdirectory too: a
+    removal would most likely fail on that file the same way and take the rest.
+    The job names the workspace and why no files were saved, the backend log says
+    the ``.env`` may still be there, and a continuing round is recorded as
+    failed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    if kind == "continuation":
+        _first_round(monkeypatch, pkg)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, "lib/helper.py": "X = 1\n", ".env": _BUILDER_ENV},
+    )
+    refused = _refuse_env_removal(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"):
+        if kind == "continuation":
+            outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+        else:
+            outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert refused
+    [session] = _session_roots(tmp_path)
+    build = session / "build"
+    assert (build / ".env").read_text(encoding="utf-8") == _BUILDER_ENV
+    assert (build / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (build / "lib" / "helper.py").read_text(encoding="utf-8") == "X = 1\n"
+    assert outcome.error == tool_builder._ERROR_BUILDER_ENV_STRIP
+    assert outcome.draft is not None
+    assert (outcome.draft["saved"], outcome.draft["reason"], outcome.draft["retained_path"]) == (
+        False,
+        tool_drafts.REASON_STRIP_ENV,
+        str(build),
+    )
+    assert _says_the_env_may_remain(caplog, session)
+    if kind == "continuation":
+        manifest = _draft_manifest(pkg)
+        latest = manifest["attempts"][-1]
+        assert (latest["number"], latest["outcome"], latest["saved"], latest["reason"]) == (
+            2,
+            "failed",
+            False,
+            tool_drafts.REASON_STRIP_ENV,
+        )
+        assert manifest["running"] is None
+    else:
+        assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_an_exception_before_the_env_strip_keeps_the_staging_even_when_the_late_strip_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The commands stopped, then an exception before anything stripped the
+    builder's ``.env``, and the strip made on the way out fails too: the work is
+    held by no one, so the staging stays, the ``.env`` still in it, and the
+    backend log says so."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+
+    def broken(workflow: str) -> int | None:
+        raise RuntimeError("a bug before the strip")
+
+    monkeypatch.setattr(llm_log, "last_record_id_for_workflow", broken)
+    _fake_generate(
+        monkeypatch,
+        result=_UNFINISHED,
+        files={"run.py": _REVISED_RUN_PY, ".env": _BUILDER_ENV},
+    )
+    refused = _refuse_env_removal(monkeypatch)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="afterthread.tool_builder"),
+        pytest.raises(RuntimeError),
+    ):
+        asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert len(refused) == 1
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / ".env").read_text(encoding="utf-8") == _BUILDER_ENV
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _says_the_env_may_remain(caplog, session)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_a_round_whose_workspace_cannot_be_confirmed_at_its_save_names_no_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The builder's ``.env`` was stripped; then the staging shell cannot be looked
+    at, so the save cannot confirm the workspace is the one it was given. Nothing is
+    saved, the workspace is kept, and the job names no path for it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"run.py": _REVISED_RUN_PY})
+    base = tools.tools_dir()
+    assert base is not None
+    stripped = [False]
+    real_strip = tool_builder._strip_builder_env
+
+    def strip(build_root: tools.BuildRoot, root: Path) -> tuple[tuple[str, ...], str | None]:
+        try:
+            return real_strip(build_root, root)
+        finally:
+            stripped[0] = True
+
+    monkeypatch.setattr(tool_builder, "_strip_builder_env", strip)
+    refused = _refuse_lstat(monkeypatch, base / tool_builder._STAGING_DIRNAME, active=stripped)
+
+    outcome = asyncio.run(_run_revise("kbsearch", "加上分頁"))
+
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": None,
+        "generation": None,
+        "attempts": None,
+        "reason": tool_drafts.REASON_WORKSPACE,
+        "retained_path": None,
+    }
+    assert not tool_drafts.has_draft(_package_root(pkg))
+    assert refused
+
+
+def test_a_continuation_published_without_its_round_saved_marks_nothing_and_records_it_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish goes through. Nothing marks the draft as published from,
+    its files stay as they were, and the round is recorded once, as published,
+    its files not saved and the save's reason why. The job names the draft as that
+    write left it, saying the round is not in it."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
+    marked: list[Any] = []
+    real_mark = tool_drafts.mark_publishing
+
+    def mark(*args: Any) -> int | None:
+        marked.append(args)
+        return real_mark(*args)
+
+    monkeypatch.setattr(tool_drafts, "mark_publishing", mark)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, "a.py": "A = 1\n", "b.py": "B = 1\n"},
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    assert outcome.ok is True
+    assert _resolved_version(_package_path(pkg)) != pkg
+    manifest = _draft_manifest(pkg)
+    assert marked == []
+    assert (manifest["publishing"], manifest["running"]) == (None, None)
+    assert manifest["files_dir"] == first["files_dir"]
+    assert manifest["attempts"][:-1] == first["attempts"]
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["outcome"], latest["error"]) == (2, "published", None)
+    assert (latest["saved"], latest["reason"]) == (False, tool_drafts.REASON_TOO_MANY_FILES)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": tool_builder._DRAFT_ROUND_NOT_SAVED,
+        "retained_path": None,
+    }
+
+
+def test_a_publish_failing_after_a_continuation_save_failed_records_the_round_with_its_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish then fails on the round's ``tool.json``. The round is
+    recorded once, when that is known: failed, with the publish's error, its files
+    not saved and the save's reason why, no longer marked running. The draft's
+    files stay as they were, and the staging, holding the work, stays and is
+    named."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"tool.json": "{ not json at all", "a.py": "A = 1\n", "b.py": "B = 1\n"},
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    assert outcome.ok is False
+    assert (outcome.error or "").startswith("工具包驗證失敗")
+    assert _resolved_version(_package_path(pkg)) == pkg
+    manifest = _draft_manifest(pkg)
+    assert (manifest["publishing"], manifest["running"]) == (None, None)
+    assert manifest["files_dir"] == first["files_dir"]
+    assert manifest["attempts"][:-1] == first["attempts"]
+    latest = manifest["attempts"][-1]
+    assert (latest["number"], latest["outcome"], latest["error"]) == (2, "failed", outcome.error)
+    assert (latest["saved"], latest["reason"]) == (False, tool_drafts.REASON_TOO_MANY_FILES)
+    [session] = _session_roots(tmp_path)
+    assert outcome.draft == {
+        "saved": False,
+        "draft_id": first["draft_id"],
+        "generation": manifest["generation"],
+        "attempts": 2,
+        "reason": tool_drafts.REASON_TOO_MANY_FILES,
+        "retained_path": str(session / "build"),
+    }
+    assert (session / "build" / "tool.json").read_text(encoding="utf-8") == "{ not json at all"
+
+
+def test_a_continuation_whose_publish_raises_after_its_save_failed_leaves_its_mark(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The save before the publish keeps no files -- over the limit -- and writes
+    nothing; the publish then ends in an exception no outcome describes. The
+    manifest is left as the round's start wrote it -- marked running, no round
+    added, the files as they were -- and the next round records the round as
+    interrupted."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    first = _first_round(monkeypatch, pkg)
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"), tool_draft_max_files=3)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", _publish_raises)
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY, "a.py": "A = 1\n", "b.py": "B = 1\n"},
+    )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    after = _draft_manifest(pkg)
+    assert after["running"] is not None
+    assert (after["generation"], after["attempt_count"], after["attempts"]) == (
+        first["generation"] + 1,
+        first["attempt_count"],
+        first["attempts"],
+    )
+    assert after["files_dir"] == first["files_dir"]
+    _fake_generate(monkeypatch, result=_UNFINISHED)
+
+    asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    outcomes = [attempt["outcome"] for attempt in _draft_manifest(pkg)["attempts"]]
+    assert outcomes == ["not_published", "interrupted", "not_published"]
+
+
+def test_a_continuation_that_publishes_beside_a_kept_copy_leaves_the_draft_and_says_why(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator edited the draft's files while the round ran, so that copy stays
+    in ``kept``. The publish goes through, and the draft -- holding that copy as
+    well -- stays, the job saying it holds more than what was published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+
+    def edit_by_hand() -> None:
+        (files / "by_hand.txt").write_text("mine\n", encoding="utf-8")
+
+    _fake_generate(
+        monkeypatch,
+        result=_revise_result(),
+        files={"run.py": _REVISED_RUN_PY + "# second\n"},
+        side_effect=edit_by_hand,
+    )
+
+    outcome = asyncio.run(_continue_revise(pkg, "發布吧"))
+
+    assert outcome.ok is True
+    assert outcome.draft is not None
+    assert outcome.draft["reason"] == tool_builder._DRAFT_KEPT_CHANGED
+    assert (files / "by_hand.txt").read_text(encoding="utf-8") == "mine\n"
+    manifest = _draft_manifest(pkg)
+    assert manifest["kept"] == [files.name]
+    assert manifest["publishing"] is not None
+
+
+def _hold_revise_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[Callable[[], Awaitable[InstallOutcome]]], list[dict[str, Any]]]:
+    """Admitted revise jobs are held rather than launched; each one's ``run_revise``
+    call, once run, records what it was handed."""
+    launched: list[Callable[[], Awaitable[InstallOutcome]]] = []
+    calls: list[dict[str, Any]] = []
+
+    def hold(job: Any, run: Callable[[], Awaitable[InstallOutcome]], action: str) -> str:
+        launched.append(run)
+        return job.job_id
+
+    async def fake_run_revise(
+        name: str,
+        feedback: str | None,
+        resolution: tools.Resolved | None,
+        *,
+        runs: tuple[AttachedRun, ...] = (),
+        continuation: tool_drafts.Continuation | None = None,
+    ) -> InstallOutcome:
+        calls.append({"feedback": feedback, "runs": runs, "continuation": continuation})
+        return InstallOutcome(ok=True, tool_name=name)
+
+    monkeypatch.setattr(tool_builder, "_launch_job", hold)
+    monkeypatch.setattr(tool_builder, "run_revise", fake_run_revise)
+    return launched, calls
+
+
+def _continue_body(pkg: Path, **overrides: Any) -> dict[str, Any]:
+    draft_id, generation = _draft_identity(pkg)
+    return {
+        "feedback": "再試一次",
+        "expected_vid": _TEST_VID,
+        "draft_id": draft_id,
+        "draft_generation": generation,
+        **overrides,
+    }
+
+
+def test_router_revise_naming_no_draft_of_a_tool_without_one_starts_a_first_round(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+    launched, calls = _hold_revise_jobs(monkeypatch)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise", json={"feedback": "加上分頁", "expected_vid": _TEST_VID}
+    )
+
+    assert response.status_code == 202
+    [run] = launched
+    asyncio.run(run())
+    [call] = calls
+    assert (call["feedback"], call["continuation"]) == ("加上分頁", None)
+
+
+def test_router_revise_continues_the_draft_it_names_with_its_records_read_again(
+    client: TestClient, session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Neither a note nor a run is needed to continue. The records the draft keeps
+    are read again from the database -- one since purged is its summary alone --
+    and the newly attached one goes first; the job continues the draft as judged."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    still_there = _seed_run(session)
+    purged = _seed_run(session, stderr="gone soon")
+    _first_round(
+        monkeypatch,
+        pkg,
+        runs=(
+            _attached(id=still_there),
+            _attached(id=purged, started_at=datetime(2026, 10, 26, tzinfo=UTC)),
+        ),
+    )
+    assert client.delete(f"/api/tool-runs/{purged}").status_code == 204
+    newly = _seed_run(session, stderr="new failure")
+    launched, calls = _hold_revise_jobs(monkeypatch)
+
+    bare = client.post(
+        "/api/tools/kbsearch/revise", json=_continue_body(pkg, feedback=None, run_ids=[newly])
+    )
+
+    assert bare.status_code == 202
+    [run] = launched
+    asyncio.run(run())
+    [call] = calls
+    assert call["feedback"] is None
+    assert [(run.id, run.purged) for run in call["runs"]] == [
+        (newly, False),
+        (still_there, False),
+        (purged, True),
+    ]
+    assert call["runs"][0].stderr == "new failure"
+    assert call["runs"][2].stderr is None
+    continuation = call["continuation"]
+    assert continuation.expected == _draft_identity(pkg)
+    assert [run.id for run in continuation.attached] == [newly]
+
+
+def test_records_a_draft_keeps_are_read_again_even_past_what_sqlite_holds(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A draft's ``runs`` hand-edited to an id no SQLite row can have: reading the
+    records again answers it by its summary, as one purged, instead of failing the
+    lookup."""
+    _seed_package(monkeypatch, tmp_path)
+    summary = {
+        "id": SQLITE_MAX_INT + 1,
+        "started_at": _RUN_TIME.isoformat(),
+        "workflow": "capture",
+        "vid": _TEST_VID,
+        "outcome": tools.RUN_FAILED,
+        "exit_code": 1,
+    }
+
+    [reread] = tool_runs.reread_for_revise(session, "kbsearch", (summary,))
+
+    assert (reread.id, reread.purged, reread.stderr) == (SQLITE_MAX_INT + 1, True, None)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"draft_id": "a" * 32},
+        {"draft_generation": 1},
+        {"draft_id": "A" * 32, "draft_generation": 1},
+        {"draft_id": "a" * 31, "draft_generation": 1},
+        {"draft_id": "a" * 32 + "\n", "draft_generation": 1},
+        {"draft_id": "a" * 32, "draft_generation": 0},
+    ],
+    ids=["id-alone", "generation-alone", "uppercase", "short", "newline", "generation-zero"],
+)
+def test_router_revise_refuses_a_draft_identity_that_is_half_given_or_out_of_shape(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict[str, Any]
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+    calls = _capture_start(monkeypatch)
+
+    response = client.post(
+        "/api/tools/kbsearch/revise", json={"feedback": "x", "expected_vid": _TEST_VID, **body}
+    )
+
+    assert response.status_code == 422
+    assert calls == []
+
+
+def _draft_published_but_kept(monkeypatch: pytest.MonkeyPatch, pkg: Path) -> str:
+    """A publish from the draft went through and the draft stayed, ``publishing``
+    set; returns the vid now current, whose origin names the draft."""
+    monkeypatch.setattr(
+        tool_drafts, "remove_after_publish", lambda *args: tool_drafts.Removal(False, None)
+    )
+    _fake_generate(monkeypatch, result=_revise_result(), files={"run.py": _REVISED_RUN_PY})
+    assert asyncio.run(_run_revise("kbsearch", "加上分頁")).ok is True
+    return _resolved_version(_package_path(pkg)).name
+
+
+@pytest.mark.parametrize(
+    ("case", "code"),
+    [
+        ("seen-gone", "draft_gone"),
+        ("cannot-be-looked-at", "draft_unusable"),
+        ("manifest-unreadable", "draft_unusable"),
+        ("another-draft", "draft_gone"),
+        ("another-generation", "draft_changed"),
+        ("files-missing", "draft_unusable"),
+        ("publishing-unknown", "draft_publishing"),
+        ("published", "draft_publishing"),
+        ("base-moved", "version_mismatch"),
+        ("read-before-the-slot-saw-nothing", "draft_changed"),
+    ],
+)
+def test_router_continuation_is_refused_by_the_first_case_that_holds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str, code: str
+) -> None:
+    """Each case of the judgment after the slot answers with its own 409 and makes
+    no job. A draft whose base is not ``current`` is refused even when the request
+    names ``current`` as its expected version; a draft the route's read before
+    the slot did not see is refused although the request names it rightly."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    expected_vid = _TEST_VID
+    if case == "published":
+        expected_vid = _draft_published_but_kept(monkeypatch, pkg)
+    else:
+        _first_round(monkeypatch, pkg)
+    body = _continue_body(pkg, expected_vid=expected_vid)
+    draft = _draft_dir(pkg)
+    if case == "seen-gone":
+        shutil.rmtree(draft)
+    elif case == "cannot-be-looked-at":
+        _refuse_lstat(monkeypatch, draft)
+    elif case == "manifest-unreadable":
+        (draft / tool_drafts.MANIFEST_FILENAME).write_text("{broken", encoding="utf-8")
+    elif case == "another-draft":
+        body["draft_id"] = "f" * 32
+    elif case == "another-generation":
+        body["draft_generation"] += 1
+    elif case == "files-missing":
+        shutil.rmtree(_draft_files(pkg))
+    elif case == "publishing-unknown":
+        marked = tool_drafts.mark_publishing(
+            _package_root(pkg),
+            tool_drafts.directory_identity(_package_path(pkg)),
+            _draft_identity(pkg),
+            None,
+        )
+        body["draft_generation"] = marked
+    elif case == "base-moved":
+        other_vid = "20260728T020304Z-fedcba"
+        _copy_committed_version(pkg, other_vid)
+        assert tools.publish_current(_package_root(pkg), other_vid)
+        body["expected_vid"] = other_vid
+    elif case == "read-before-the-slot-saw-nothing":
+        unseen = [True]
+        _refuse_lstat(monkeypatch, draft, active=unseen)
+        real_reserve = tool_builder.reserve_sync_operation
+
+        def reserve_once_seen() -> str | None:
+            unseen[0] = False
+            return real_reserve()
+
+        monkeypatch.setattr(tool_builder, "reserve_sync_operation", reserve_once_seen)
+    launched, calls = _hold_revise_jobs(monkeypatch)
+
+    response = client.post("/api/tools/kbsearch/revise", json=body)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == code
+    assert launched == [] and calls == []
+    assert tool_builder.any_job_active() is False
+
+
+def test_router_continuation_naming_a_draft_discarded_and_made_again_is_answered_gone(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A tab still holds a draft that was continued once, then discarded, and a new
+    one made in its place by a first round: the draft there now differs from the
+    one the request names in its id and in its generation both. The answer is
+    that the draft named is gone, not that it changed: rereading would show the
+    other draft, not the one the tab was working on."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    asyncio.run(_continue_revise(pkg, "分頁從 1 開始"))
+    stale = _continue_body(pkg)
+    discarded = client.delete(
+        "/api/tools/kbsearch/draft",
+        params={"draft_id": stale["draft_id"], "generation": stale["draft_generation"]},
+    )
+    assert discarded.status_code == 200
+    _first_round(monkeypatch, pkg)
+    remade_id, remade_generation = _draft_identity(pkg)
+    assert remade_id != stale["draft_id"]
+    assert remade_generation == 1
+    assert stale["draft_generation"] != remade_generation
+    launched, calls = _hold_revise_jobs(monkeypatch)
+
+    response = client.post("/api/tools/kbsearch/revise", json=stale)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "draft_gone"
+    assert launched == [] and calls == []
+
+
+def test_a_continuation_is_judged_on_the_draft_as_it_is_once_the_slot_is_taken(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft changes -- marked as being published from -- while the request
+    waits for the slot: the judgment, made after the slot, sees the change and
+    refuses. Made before the slot, it would let the request through."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    body = _continue_body(pkg)
+    real_reserve = tool_builder.reserve_sync_operation
+
+    def reserve_while_marked() -> str | None:
+        tool_drafts.mark_publishing(
+            _package_root(pkg),
+            tool_drafts.directory_identity(_package_path(pkg)),
+            _draft_identity(pkg),
+            None,
+        )
+        return real_reserve()
+
+    monkeypatch.setattr(tool_builder, "reserve_sync_operation", reserve_while_marked)
+    launched, _calls = _hold_revise_jobs(monkeypatch)
+
+    response = client.post("/api/tools/kbsearch/revise", json=body)
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "draft_changed"
+    assert launched == []
+
+
+def test_every_revise_refusal_is_answered_by_the_route(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Whatever ``start_revise_job`` refuses with -- every member of
+    ``ReviseRefusal`` -- the route answers it: 404 for a tool not found, 409 with
+    the refusal as its code otherwise, never a 500."""
+    _seed_package(monkeypatch, tmp_path)
+    refusals: tuple[tool_builder.ReviseRefusal, ...] = typing.get_args(tool_builder.ReviseRefusal)
+    assert refusals
+    answered: dict[str, tuple[int, Any]] = {}
+    for refusal in refusals:
+
+        async def refusing(
+            name: str,
+            feedback: str | None,
+            expected_vid: str,
+            *,
+            runs: tuple[Any, ...] = (),
+            draft: Any = None,
+            refusal: tool_builder.ReviseRefusal = refusal,
+        ) -> tool_builder.ReviseJobStart:
+            return tool_builder.ReviseJobStart(job_id=None, refusal=refusal, message="說明")
+
+        monkeypatch.setattr(tool_builder, "start_revise_job", refusing)
+        response = client.post(
+            "/api/tools/kbsearch/revise", json={"feedback": "x", "expected_vid": _TEST_VID}
+        )
+        answered[refusal] = (response.status_code, response.json()["detail"])
+
+    assert set(answered) == set(refusals)
+    for refusal, (status, detail) in answered.items():
+        if refusal == "not_found":
+            assert (status, detail) == (404, tools_router._TOOL_NOT_FOUND)
+        else:
+            assert (status, detail["code"]) == (409, refusal)
+
+
+def _recorded_round(number: int, text: str) -> dict[str, Any]:
+    """A round as a draft's manifest keeps it, each of its texts ``text`` at its cap."""
+    return {
+        "number": number,
+        "job_id": None,
+        "started_at": None,
+        "finished_at": "2026-10-29T01:02:03+00:00",
+        "outcome": "not_published",
+        "stopped_by": "rounds",
+        "failure": None,
+        "rounds_used": 24,
+        "max_rounds": 24,
+        "error": text[: tool_drafts.ERROR_CAP],
+        "summary": text[: tool_drafts.SUMMARY_CAP],
+        "handoff": text[: tool_drafts.HANDOFF_CAP],
+        "operator_action": text[: tool_drafts.OPERATOR_ACTION_CAP],
+        "note": text[: tool_drafts.NOTE_CAP],
+        "saved": True,
+        "reason": None,
+        "omitted": [],
+        "omitted_count": 0,
+        "not_brought_in": [],
+        "not_brought_in_count": 0,
+    }
+
+
+_THIS_NOTE = "THIS-ATTEMPT-NOTE "
+
+
+def _largest_revise_prompt(system_chars: int, *, continuing: bool) -> str:
+    """A revise's user turn with every field at its cap, five rounds behind it when
+    ``continuing``, each text full of a short registered secret, so its mask makes
+    it longer."""
+    text = _filled_with_secret(tool_drafts.NOTE_CAP)
+    history = tool_builder._History(
+        original=_filled_with_secret(tool_drafts.FEEDBACK_CAP),
+        attempts=tuple(_recorded_round(number, text) for number in range(1, 6)),
+        not_brought_in=tuple(
+            tool_drafts.Omitted(f"{'d' * 290}/{index}", "secret_content") for index in range(80)
+        ),
+        changed=tuple(f"{'c' * 290}/{index}" for index in range(80)),
+        base_vid=_TEST_VID,
+        workspace_config=True,
+    )
+    runs = tuple(
+        _attached(
+            id=index,
+            message=_filled_with_secret(tool_runs.MESSAGE_MAX_CHARS),
+            args=_filled_with_secret(tool_runs.ARGS_MAX_CHARS),
+            stderr=_filled_with_secret(tool_runs.STDERR_TAIL_MAX_CHARS),
+            stdout=_filled_with_secret(tool_runs.STDOUT_HEAD_MAX_CHARS),
+        )
+        for index in (1, 2, 3)
+    )
+    return tool_builder._revise_user_prompt(
+        _THIS_NOTE + _filled_with_secret(tool_drafts.NOTE_CAP),
+        _filled_with_secret(30_000),
+        _filled_with_secret(20_000),
+        tuple(f"KEY_{index}" for index in range(200)),
+        tuple(f"KEY_{index}" for index in range(50)),
+        runs=runs,
+        workspace_vid=_TEST_VID,
+        system_chars=system_chars,
+        history=history if continuing else None,
+    )
+
+
+def test_a_continuation_prompt_at_the_smallest_budgets_is_held_to_its_cap_its_note_cut_last(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Both budgets at their floors, every field at its cap, five rounds behind it,
+    every text lengthened by its mask: the user turn is within the prompt budget,
+    and with the system prompt within half the conversation budget. The fixed
+    instructions are all there, everything else was shrunk to nothing before this
+    round's note was cut, and no secret is left."""
+    _install_settings(
+        monkeypatch,
+        tools_dir=str(tmp_path / "tools"),
+        llm_prompt_budget_tokens=4000,
+        llm_tool_conversation_budget_tokens=50_000,
+    )
+    tools.register_inflight_secret(_SHORT_SECRET)
+    system = tool_builder._revise_system_prompt("kbsearch", attempt=6)
+
+    prompt = _largest_revise_prompt(len(system), continuing=True)
+
+    half = token_budget.char_allowance(50_000) // 2
+    assert len(prompt) <= min(token_budget.char_allowance(4000), half - len(system))
+    assert len(system) + len(prompt) <= half
+    assert prompt.startswith("Revise the existing tool package as described below.")
+    for fixed in (
+        tool_builder._FAILING_RUNS_HEADER,
+        tool_builder._FAILING_RUNS_CAVEAT,
+        tool_builder._DEBUG_PROCEDURE,
+        tool_builder._WORKSPACE_CONFIG_NOTE,
+    ):
+        assert fixed in prompt
+    marker = tool_builder._TRUNCATION_MARKER
+    assert f"The operator's original request:\n\n{marker}" in prompt
+    assert f"The previous attempt (#5):\n\n{marker}" in prompt
+    note = prompt.split("The operator's note for this attempt:\n\n", 1)[1].split("\n\n", 1)[0]
+    assert note.startswith(_THIS_NOTE) and note.endswith(marker)
+    assert len(note) > len(_THIS_NOTE) + len(marker)
+    assert _SHORT_SECRET not in prompt
+
+
+def test_a_revise_prompt_leaves_half_the_conversation_beside_its_system_prompt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The prompt budget at its ceiling, the conversation budget at its floor: what
+    holds the user turn is the conversation's half, less the system prompt."""
+    _install_settings(
+        monkeypatch,
+        tools_dir=str(tmp_path / "tools"),
+        llm_prompt_budget_tokens=1_000_000,
+        llm_tool_conversation_budget_tokens=50_000,
+    )
+    tools.register_inflight_secret(_SHORT_SECRET)
+    system = tool_builder._revise_system_prompt("kbsearch", attempt=6)
+
+    prompt = _largest_revise_prompt(len(system), continuing=True)
+
+    half = token_budget.char_allowance(50_000) // 2
+    assert half - len(system) - 50 <= len(prompt) <= half - len(system)
+
+
+def test_a_first_round_prompt_is_held_to_the_same_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A first round goes through the same function: at the smallest budgets, with
+    every field at its cap, it is within the cap and keeps its fixed instructions."""
+    _install_settings(
+        monkeypatch,
+        tools_dir=str(tmp_path / "tools"),
+        llm_prompt_budget_tokens=4000,
+        llm_tool_conversation_budget_tokens=50_000,
+    )
+    tools.register_inflight_secret(_SHORT_SECRET)
+    system = tool_builder._revise_system_prompt("kbsearch")
+
+    prompt = _largest_revise_prompt(len(system), continuing=False)
+
+    assert len(prompt) <= token_budget.char_allowance(4000)
+    assert prompt.startswith("Revise the existing tool package as described below.")
+    assert tool_builder._DEBUG_PROCEDURE in prompt
+    assert "User feedback:\n\n" + _THIS_NOTE in prompt
+
+
+def test_a_continuation_prompt_tells_of_the_previous_round_and_four_before_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Five rounds kept: the latest is told in full, the four before it a line each,
+    oldest first."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    history = tool_builder._History(
+        original="加上分頁",
+        attempts=tuple(_recorded_round(number, f"round {number} text") for number in range(1, 6)),
+        not_brought_in=(),
+        changed=(),
+        base_vid=_TEST_VID,
+        workspace_config=False,
+    )
+
+    prompt = tool_builder._revise_user_prompt(
+        "這一輪", None, workspace_vid=_TEST_VID, history=history
+    )
+
+    previous = prompt.split("The previous attempt (#5):\n\n", 1)[1].split("\n\n", 1)[0]
+    assert "Its handoff: round 5 text" in previous
+    earlier = prompt.split("Earlier attempts, one line each:\n\n", 1)[1].split("\n\n", 1)[0]
+    assert [line.split(":", 1)[0] for line in earlier.splitlines()] == ["#1", "#2", "#3", "#4"]
+    assert "summary: round 4 text" in earlier
+    assert "started from:\n\nNone." in prompt
+    untold = tool_builder._revise_user_prompt(
+        "這一輪",
+        None,
+        workspace_vid=_TEST_VID,
+        history=dataclasses.replace(history, changed=None),
+    )
+    assert "started from:\n\nThey cannot be listed" in untold
+    assert "None." not in untold
+
+
+@pytest.mark.parametrize("listed", ["not_brought_in", "changed"])
+def test_a_continuation_prompt_listing_a_path_that_is_not_utf8_goes_out_with_it_encodable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, listed: str
+) -> None:
+    """A path of the draft not brought in, or a path changed since the base, read
+    back from disk the way Linux reads a name that is not UTF-8: with a lone
+    surrogate. The round's request still goes out -- one request, its body JSON --
+    and names the path with replacement characters."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    history = tool_builder._History(
+        original="加上分頁",
+        attempts=(),
+        not_brought_in=(
+            (tool_drafts.Omitted(_NOT_UTF8_NAME, "unreadable"),)
+            if listed == "not_brought_in"
+            else ()
+        ),
+        changed=(_NOT_UTF8_NAME,) if listed == "changed" else (),
+        base_vid=_TEST_VID,
+        workspace_config=False,
+    )
+    system = tool_builder._revise_system_prompt("kbsearch", attempt=2)
+    prompt = tool_builder._revise_user_prompt(
+        "這一輪", None, workspace_vid=_TEST_VID, system_chars=len(system), history=history
+    )
+
+    sent = _sent_by_the_sdk(
+        [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+    )
+
+    assert len(sent) == 1
+    user_turn = json.loads(sent[0])["messages"][1]["content"]
+    assert f"\n- {_NOT_UTF8_SHOWN}" in user_turn
+
+
+def test_a_continuation_path_whose_replacement_characters_complete_a_known_value_is_masked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A known value holds three U+FFFD -- what a ``.env`` read with replacement
+    keeps for three bytes that are not UTF-8 -- and a listed path holds the value's
+    other characters around one lone surrogate. Made encodable, the path gets three
+    U+FFFD for the surrogate and spells the value whole, so it is shown as the
+    redaction marker in both lists: the check comes after the last conversion."""
+    _install_settings(monkeypatch, tools_dir=str(tmp_path / "tools"))
+    tools.register_inflight_secret(_SPELLED_SECRET)
+    assert tools._utf8_safe(_SPELLS_IT_ENCODED) == _SPELLED_SECRET
+    history = tool_builder._History(
+        original="加上分頁",
+        attempts=(),
+        not_brought_in=(tool_drafts.Omitted(_SPELLS_IT_ENCODED, "unreadable"),),
+        changed=(_SPELLS_IT_ENCODED,),
+        base_vid=_TEST_VID,
+        workspace_config=False,
+    )
+
+    prompt = tool_builder._revise_user_prompt(
+        "這一輪", None, workspace_vid=_TEST_VID, history=history
+    )
+
+    marker = tools._REDACTION_MARKER
+    assert _SPELLED_SECRET not in prompt
+    assert f"\n- {marker}: {tool_builder._NOT_BROUGHT_IN_PROSE['unreadable']}" in prompt
+    assert f"started from:\n\n- {marker}" in prompt
+
+
+def test_a_continuation_prompt_masks_or_leaves_out_each_listed_manifest_text_registered_later(
+    session: Session, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each free-text field of the manifest listed here, which a continuing round's
+    prompt is built from, holds a secret of its own, registered only after the
+    manifest was written: the draft's request; the latest round's summary,
+    handoff, request to the operator, note and error; an earlier round's summary;
+    and the workflow, vid and outcome of three purged run records, one field each.
+    The user turn built for the round holds none of them: the texts are there
+    masked, and a run summary not of the backend's shapes is left out."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    fields = (
+        "request",
+        "summary",
+        "handoff",
+        "operator_action",
+        "note",
+        "error",
+        "earlier_summary",
+        "workflow",
+        "vid",
+        "outcome",
+    )
+    secret = {field: f"Later{index:02d}Secret-{field}" for index, field in enumerate(fields)}
+    labelled = {field: f"{field.upper()} {secret[field]}" for field in fields[:7]}
+    earlier = {
+        **_recorded_round(1, ""),
+        "summary": labelled["earlier_summary"],
+        "error": None,
+        "handoff": None,
+        "operator_action": None,
+        "note": None,
+    }
+    latest = {
+        **_recorded_round(2, ""),
+        **{field: labelled[field] for field in ("summary", "handoff", "operator_action")},
+        "note": labelled["note"],
+        "error": labelled["error"],
+    }
+    summary = {
+        "started_at": "2026-10-29T01:02:03+00:00",
+        "workflow": "verify",
+        "vid": _TEST_VID,
+        "outcome": tools.RUN_FAILED,
+        "exit_code": 1,
+    }
+    _rewrite_draft(
+        pkg,
+        feedback=labelled["request"],
+        attempts=[earlier, latest],
+        attempt_count=2,
+        runs=[
+            {**summary, "id": 101, "workflow": secret["workflow"]},
+            {**summary, "id": 102, "vid": secret["vid"]},
+            {**summary, "id": 103, "outcome": secret["outcome"]},
+        ],
+    )
+    for value in secret.values():
+        tools.register_inflight_secret(value)
+    first = tool_drafts.first_read(_package_root(pkg))
+    assert first is not None and len(first.runs) == 3
+    runs = tool_runs.reread_for_revise(session, "kbsearch", first.runs)
+    captured = _fake_generate(monkeypatch, result=_UNFINISHED)
+
+    asyncio.run(_continue_revise(pkg, "這一輪的說明", runs=runs))
+
+    prompt = captured["user_prompt"]
+    for field, value in secret.items():
+        assert value not in prompt, field
+    marker = tools._REDACTION_MARKER
+    for field in fields[:7]:
+        assert f"{field.upper()} {marker}" in prompt, field
+
+
+def test_deleting_the_tool_while_its_draft_is_copied_into_a_workspace_is_refused(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The copy of the draft into a continuing round's workspace holds the shared
+    tools lock: a delete in that window is the retryable 409, and the tool -- its
+    draft with it -- is still there."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    answers: list[Any] = []
+    real_carry_out = tool_drafts._carry_out
+
+    def carry_out_then_delete(plan: Any, incoming: Path, known: list[str]) -> Any:
+        omitted = real_carry_out(plan, incoming, known)
+        if not answers:
+            answers.append(client.delete("/api/tools/kbsearch"))
+        return omitted
+
+    monkeypatch.setattr(tool_drafts, "_carry_out", carry_out_then_delete)
+    _fake_generate(monkeypatch, result=_UNFINISHED, files={"page.py": "PAGE = 1\n"})
+
+    outcome = asyncio.run(_continue_revise(pkg, "再試一次"))
+
+    [answer] = answers
+    assert answer.status_code == 409
+    assert answer.json()["detail"]["code"] == "ai_job_in_progress"
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+    assert (_draft_files(pkg) / "page.py").is_file()
+
+
+# --- publishing a draft as it is: the job, what it leaves, the route --------------
+
+
+def _first_round_of(monkeypatch: pytest.MonkeyPatch, pkg: Path, name: str) -> None:
+    """One revise of the tool ``name`` whose builder stops short: its draft saved."""
+    _fake_generate(
+        monkeypatch, result={**_UNFINISHED, "tool_name": name}, files={"run.py": _REVISED_RUN_PY}
+    )
+    resolution = tools.resolve_current(_package_root(pkg))
+    assert isinstance(resolution, tools.Resolved)
+    outcome = asyncio.run(tool_builder.run_revise(name, "加上分頁", resolution))
+    assert outcome.draft is not None and outcome.draft["saved"] is True
+
+
+def _publish_judged(pkg: Path) -> dict[str, Any]:
+    """The draft as ``start_publish_draft_job`` judges it once the slot is taken."""
+    judged = tool_drafts.judge_draft(
+        _package_root(pkg), _current_resolution(), _draft_identity(pkg)
+    )
+    assert isinstance(judged, dict), judged
+    return judged
+
+
+def _publish_draft_job(
+    pkg: Path,
+    *,
+    judged: dict[str, Any] | None = None,
+    resolution: tools.Resolved | None = None,
+) -> dict[str, Any]:
+    """One publish of the draft as it is, run the way its job runs: admitted, then
+    its body to the end, on the draft and the version as the submit would see them
+    now unless given. Returns the job as a poll answers it."""
+    resolution = _current_resolution() if resolution is None else resolution
+    judged = _publish_judged(pkg) if judged is None else judged
+    job = tool_builder._admit_job(kind="publish_draft", tool_name="kbsearch")
+    assert job is not None
+    asyncio.run(
+        tool_builder._run_job(
+            job.job_id,
+            lambda: tool_builder.run_publish_draft("kbsearch", resolution, judged),
+            tool_builder._ACTION_PUBLISH_DRAFT,
+        )
+    )
+    polled = tool_builder.get_job(job.job_id)
+    assert polled is not None
+    return polled
+
+
+def _draft_as_it_is(pkg: Path) -> tuple[bytes, dict[str, Any]]:
+    """The draft's manifest, byte for byte, and the digest of its files."""
+    digest = tool_drafts.tree_digest(_draft_files(pkg))
+    assert digest is not None
+    return (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).read_bytes(), digest
+
+
+def _versions(pkg: Path) -> list[str]:
+    return sorted(entry.name for entry in (_package_path(pkg) / tools._VERSIONS_DIRNAME).iterdir())
+
+
+def _model_entry_watched(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Take the fakes away: ``tool_builder`` and ``tool_meta`` reach the real
+    ``llm.generate_structured`` again -- the entry every builder and summary
+    session goes through -- and the request it would send a model is refused and
+    recorded, by workflow."""
+    asked: list[str] = []
+
+    async def refuse(recorder: Any, *args: Any, **kwargs: Any) -> Any:
+        asked.append(recorder._workflow)
+        raise LLMNotConfiguredError("no model in this test")
+
+    monkeypatch.setattr(tool_builder, "generate_structured", llm.generate_structured)
+    monkeypatch.setattr(tool_meta, "generate_structured", llm.generate_structured)
+    monkeypatch.setattr(llm, "_run_structured", refuse)
+    return asked
+
+
+def _published_report(
+    draft_id: str,
+    generation: int,
+    *,
+    removed: bool = False,
+    reason: str | None = None,
+    retained: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "draft_id": draft_id,
+        "generation": generation,
+        "removed": removed,
+        "reason": reason,
+        "retained_path": retained,
+    }
+
+
+def test_a_draft_published_as_it_is_becomes_current_runs_its_examples_and_asks_no_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator finished the draft by hand: ``run.py`` rewritten, an
+    ``examples.json`` added. Published as it is, the draft's files become the
+    version ``current`` names, made from the version the draft was based on; the
+    version's examples run against it; the draft is removed, and the job says so.
+    Nothing reaches the shared model entry -- no builder session, no summary, so
+    the new version has none -- and the staging goes."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    (files / "run.py").write_text(_ECHO_RUN_PY, encoding="utf-8")
+    examples = {"examples": [{"name": "查詢", "args": {"q": "x"}}]}
+    (files / "examples.json").write_text(json.dumps(examples), encoding="utf-8")
+    draft_id, generation = _draft_identity(pkg)
+    asked = _model_entry_watched(monkeypatch)
+    logged = llm_log.list_summaries(1000)
+    records = _record_into(monkeypatch)
+
+    try:
+        job = _publish_draft_job(pkg)
+    finally:
+        tools.set_run_recorder(None)
+
+    assert (job["state"], job["outcome"], job["kind"], job["error"]) == (
+        "succeeded",
+        "published",
+        "publish_draft",
+        None,
+    )
+    assert (job["summary"], job["llm_log_id"], job["draft"]) == (None, None, None)
+    assert job["draft_publish"] == _published_report(draft_id, generation + 1, removed=True)
+    current = _current_version(pkg)
+    assert current.name != _TEST_VID
+    assert _versions(pkg) == sorted([_TEST_VID, current.name])
+    assert (current / "run.py").read_text(encoding="utf-8") == _ECHO_RUN_PY
+    assert json.loads((current / "examples.json").read_text(encoding="utf-8")) == examples
+    origin = tools.read_origin_meta(tools.VersionRoot(current))
+    assert origin is not None and origin["previous"] == _TEST_VID
+    assert not _summary_path(current).exists()
+    assert not os.path.lexists(_draft_dir(pkg))
+    verification = job["verification"]
+    assert verification is not None
+    assert (verification["status"], verification["finished"]) == ("ran", True)
+    assert verification["vid"] == current.name
+    assert [(run["name"], run["outcome"]) for run in verification["runs"]] == [("查詢", "ok")]
+    assert [(record.workflow, record.vid) for record in records] == [("verify", current.name)]
+    assert asked == []
+    assert llm_log.list_summaries(1000) == logged
+    assert _session_roots(tmp_path) == []
+
+
+def test_a_published_draft_that_stays_lists_as_published_by_the_line_its_origin_ends_with(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The draft was continued once, with a note, and the operator put a ``.env``
+    at its top holding a known secret, which no version receives. Published, the
+    draft stays with its mark, the job saying what it holds that the version does
+    not. The version's ``origin.feedback`` is the draft's request, the round's note
+    and, last and whole, the line naming the draft as published by the operator
+    without AI; the list finds the draft there and shows it as published. With
+    that line taken out of the origin, the list can no longer tell, and says so."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    _first_round(monkeypatch, pkg)
+    continued = asyncio.run(_continue_revise(pkg, "分頁從 1 開始"))
+    assert continued.draft is not None and continued.draft["saved"] is True
+    (_draft_files(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    draft_id, generation = _draft_identity(pkg)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["state"] == "succeeded"
+    assert job["draft_publish"] == _published_report(
+        draft_id,
+        generation + 1,
+        reason=tool_builder._DRAFT_KEPT_NOT_ALL_PUBLISHED
+        + tool_drafts.NOTE_NOT_BROUGHT_IN.format(paths=".env"),
+    )
+    manifest = _draft_manifest(pkg)
+    assert manifest["generation"] == generation + 1
+    assert manifest["publishing"]["job_id"] == job["job_id"]
+    current = _current_version(pkg)
+    assert not os.path.lexists(current / ".env")
+    origin_path = current / tools._META_DIRNAME / tools._ORIGIN_FILENAME
+    origin = json.loads(origin_path.read_text(encoding="utf-8"))
+    assert origin["previous"] == _TEST_VID
+    feedback = origin["feedback"]
+    assert feedback.startswith("加上分頁")
+    assert "分頁從 1 開始" in feedback
+    assert feedback.splitlines()[-1] == tool_drafts.operator_publish_line(draft_id)
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "published"
+
+    origin_path.write_text(
+        json.dumps({**origin, "feedback": origin["feedback"].replace(draft_id, "")}),
+        encoding="utf-8",
+    )
+
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "unknown"
+
+
+def _in_publish_workspace(relative: str) -> Callable[[str], bool]:
+    """A test of whether a path is ``relative`` inside a publish's staging workspace,
+    on the string alone: it runs inside a refused ``lstat``, which must not call it."""
+    ending = f"{os.sep}build{os.sep}{relative}"
+    return lambda path: f"{os.sep}.staging{os.sep}" in path and path.endswith(ending)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "a-secret-in-a-file",
+        "a-secret-in-an-env-below-the-top",
+        "a-file-the-scan-cannot-search-in-the-draft",
+        "a-file-the-scan-cannot-search-in-the-copy",
+        "a-look-on-a-link-s-way-fails-in-the-draft",
+        "a-look-on-a-link-s-way-fails-in-the-copy",
+        "the-scan-cannot-finish",
+        "an-env-alias-whose-identity-is-not-known",
+        "an-env-alias-whose-identity-is-not-known-holding-a-secret",
+    ],
+)
+def test_a_draft_that_may_not_be_published_as_it_is_is_left_as_it_was(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
+) -> None:
+    """Each stop the copy makes: the job fails naming why, the draft -- its
+    manifest byte for byte, its files -- is as it was, no version is added and
+    ``current`` stays, nothing reaches the model entry, and the staging is gone.
+    The look that fails is made to fail where it is made: the scan's search of one
+    file, the ``lstat`` of one directory."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    draft_id, generation = _draft_identity(pkg)
+    secret = f"KB_API_KEY={_DRAFT_SECRET}\n"
+    real_search = tools._search_file
+
+    def unsearchable(hit: Callable[[str], bool], answer: Any = "unreadable") -> None:
+        def search(path: str, secrets: list[str], overlap: int) -> Any:
+            if hit(path):
+                if isinstance(answer, BaseException):
+                    raise answer
+                return answer
+            return real_search(path, secrets, overlap)
+
+        monkeypatch.setattr(tools, "_search_file", search)
+
+    def in_the_draft(relative: str) -> Callable[[str], bool]:
+        return lambda path: path == os.fspath(files / relative)
+
+    if case == "a-secret-in-a-file":
+        (files / "notes.txt").write_text(secret, encoding="utf-8")
+        why = tool_drafts.REASON_PUBLISH_SECRETS.format(paths="notes.txt")
+    elif case == "a-secret-in-an-env-below-the-top":
+        (files / "sub").mkdir()
+        (files / "sub" / ".env").write_text(secret, encoding="utf-8")
+        why = tool_drafts.REASON_PUBLISH_SECRETS.format(paths="sub/.env")
+    elif case.startswith("a-file-the-scan-cannot-search"):
+        (files / "notes.txt").write_text("mine\n", encoding="utf-8")
+        why = tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths="notes.txt")
+    elif case.startswith("a-look-on-a-link-s-way-fails"):
+        (files / "sub").mkdir()
+        os.symlink("sub/../run.py", files / "l")
+        why = tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths="l")
+    elif case == "the-scan-cannot-finish":
+        (files / "notes.txt").write_text("mine\n", encoding="utf-8")
+        why = tool_drafts.REASON_SCAN_FAILED.format(reason="RuntimeError")
+    elif case == "an-env-alias-whose-identity-is-not-known":
+        (files / ".Env").write_text("HAND=placed-by-the-operator\n", encoding="utf-8")
+        why = tool_drafts.REASON_PUBLISH_UNLOOKED.format(paths=".Env")
+    else:
+        (files / ".Env").write_text(secret, encoding="utf-8")
+        why = tool_drafts.REASON_PUBLISH_SECRETS.format(paths=".Env")
+    before = _draft_as_it_is(pkg)
+    asked = _model_entry_watched(monkeypatch)
+    failed: list[str] = []
+    if case == "a-file-the-scan-cannot-search-in-the-draft":
+        unsearchable(in_the_draft("notes.txt"))
+    elif case == "a-file-the-scan-cannot-search-in-the-copy":
+        unsearchable(_in_publish_workspace("notes.txt"))
+    elif case == "a-look-on-a-link-s-way-fails-in-the-draft":
+        failed = _refuse_lstat(monkeypatch, files / "sub")
+    elif case == "a-look-on-a-link-s-way-fails-in-the-copy":
+        real_lstat = os.lstat
+        hit = _in_publish_workspace("sub")
+
+        def lstat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            spelled = os.fspath(path) if isinstance(path, str | os.PathLike) else None
+            if spelled is not None and hit(spelled):
+                failed.append(spelled)
+                raise OSError(errno.EIO, os.strerror(errno.EIO), spelled)
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", lstat)
+    elif case == "the-scan-cannot-finish":
+        unsearchable(in_the_draft("notes.txt"), RuntimeError("scan broke"))
+    elif case.startswith("an-env-alias-whose-identity-is-not-known"):
+        monkeypatch.setattr(tool_drafts, "_same_entry", lambda first, second: None)
+
+    job = _publish_draft_job(pkg)
+
+    assert (job["state"], job["outcome"]) == ("failed", "failed")
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=why)
+    assert job["draft_publish"] == _published_report(draft_id, generation)
+    assert bool(failed) == ("a-look-on-a-link-s-way-fails" in case)
+    assert _draft_as_it_is(pkg) == before
+    assert _versions(pkg) == [_TEST_VID]
+    assert _current_version(pkg).name == _TEST_VID
+    assert asked == []
+    assert _session_roots(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [
+        ("written-to", tool_drafts.START_CHANGED),
+        ("marked", tool_drafts.START_PUBLISHING),
+        ("base-moved", tool_builder._ERROR_PUBLISH_DRAFT_STALE),
+    ],
+)
+def test_a_draft_changed_between_its_judgment_and_its_job_is_not_published(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, change: str, why: str
+) -> None:
+    """After the submit judged the draft and before its job begins, the draft is
+    written to by hand, or marked as published from, or ``current`` moves off its
+    base. The job publishes nothing and writes nothing to the draft."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    judged = _publish_judged(pkg)
+    resolution = _current_resolution()
+    if change == "written-to":
+        _rewrite_draft(pkg, generation=judged["generation"] + 1)
+    elif change == "marked":
+        _rewrite_draft(pkg, publishing={"job_id": None, "at": "2026-10-30T00:00:00+00:00"})
+    else:
+        other_vid = "20260728T020304Z-fedcba"
+        _copy_committed_version(pkg, other_vid)
+        assert tools.publish_current(_package_root(pkg), other_vid)
+    versions = _versions(pkg)
+    current = _current_version(pkg).name
+    manifest = (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).read_bytes()
+
+    job = _publish_draft_job(pkg, judged=judged, resolution=resolution)
+
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_NOT_STARTED.format(reason=why)
+    assert job["draft_publish"] == _published_report(judged["draft_id"], judged["generation"])
+    assert (_draft_dir(pkg) / tool_drafts.MANIFEST_FILENAME).read_bytes() == manifest
+    assert (_versions(pkg), _current_version(pkg).name) == (versions, current)
+    assert _session_roots(tmp_path) == []
+
+
+def test_a_root_env_alias_where_case_is_not_told_apart_is_left_out_of_the_version(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a filesystem that does not tell case apart, a ``.ENV`` at the top of the
+    draft is its ``.env``: the known secret in it stops nothing, it is not in the
+    version, and the draft stays, the job naming it as what the version lacks."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    if _case_sensitive_filesystem(files):
+        pytest.skip("this filesystem tells case apart: .ENV is another file here, not the .env")
+    (files / ".ENV").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    draft_id, generation = _draft_identity(pkg)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["state"] == "succeeded"
+    assert job["draft_publish"] == _published_report(
+        draft_id,
+        generation + 1,
+        reason=tool_builder._DRAFT_KEPT_NOT_ALL_PUBLISHED
+        + tool_drafts.NOTE_NOT_BROUGHT_IN.format(paths=".ENV"),
+    )
+    current = _current_version(pkg)
+    assert sorted(os.listdir(current)) == sorted(["run.py", "tool.json", tools._META_DIRNAME])
+    assert (files / ".ENV").is_file()
+
+
+def test_a_root_env_spelled_another_way_where_case_is_told_apart_stops_the_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """On a filesystem that tells case apart, a ``.ENV`` at the top of the draft is
+    another file, content like any other: the known secret in it stops the
+    publish."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    (_package_path(pkg) / ".env").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    if not _case_sensitive_filesystem(files):
+        pytest.skip("this filesystem does not tell case apart: .ENV is the .env here")
+    (files / ".ENV").write_text(f"KB_API_KEY={_DRAFT_SECRET}\n", encoding="utf-8")
+
+    job = _publish_draft_job(pkg)
+
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_NOT_STARTED.format(
+        reason=tool_drafts.REASON_PUBLISH_SECRETS.format(paths=".ENV")
+    )
+    assert _versions(pkg) == [_TEST_VID]
+
+
+@pytest.mark.parametrize(
+    "more",
+    [
+        "an-entry-beside-the-files",
+        "a-directory-the-manifest-keeps-from-before",
+        "the-files-changed-while-it-was-published",
+    ],
+)
+def test_a_published_draft_holding_more_than_it_published_stays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, more: str
+) -> None:
+    """The publish went through, but ``draft/`` holds more than its manifest and the
+    files directory the copy took: a directory of the operator's beside them,
+    listed nowhere; a directory an earlier round left, which the manifest keeps;
+    or the files directory itself, changed while the version was published. The
+    draft stays with its mark, everything in it as it was, and the job says the
+    draft holds more than was published -- not that it changed during the
+    publish, which only the last of them did."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    extra: Path | None = None
+    if more == "an-entry-beside-the-files":
+        extra = _draft_dir(pkg) / "mine"
+        extra.mkdir()
+        (extra / "notes.txt").write_text("the operator's\n", encoding="utf-8")
+    elif more == "a-directory-the-manifest-keeps-from-before":
+        extra = _draft_dir(pkg) / ("files-" + "e" * 32)
+        extra.mkdir()
+        (extra / "run.py").write_text("print('an earlier round')\n", encoding="utf-8")
+        _rewrite_draft(pkg, kept=[extra.name])
+    else:
+        real_validate = tools.validate_tool_content
+
+        def validate(build_root: tools.BuildRoot, *, expected_name: str) -> str | None:
+            (files / "run.py").write_text("print('changed meanwhile')\n", encoding="utf-8")
+            return real_validate(build_root, expected_name=expected_name)
+
+        monkeypatch.setattr(tools, "validate_tool_content", validate)
+    draft_id, generation = _draft_identity(pkg)
+    placed = None if extra is None else tool_drafts.tree_digest(extra)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["state"] == "succeeded"
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 1, reason=tool_builder._DRAFT_KEPT_CHANGED
+    )
+    assert _current_version(pkg).name != _TEST_VID
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _draft_manifest(pkg)["publishing"]["job_id"] == job["job_id"]
+    if extra is not None:
+        assert placed
+        assert tool_drafts.same_tree(placed, tool_drafts.tree_digest(extra))
+    else:
+        assert (files / "run.py").read_text(encoding="utf-8") == "print('changed meanwhile')\n"
+
+
+def test_a_draft_file_swapped_and_swapped_back_during_the_copy_keeps_the_draft(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """While the publish copies the draft, ``run.py`` is swapped for other content
+    and swapped back once copied. The version holds what was copied; the draft
+    holds what it held before the copy, so its files match the digest taken then.
+    That the workspace did not receive the draft as it was is seen only by
+    comparing the copy's two digests, and the draft stays."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    run_py = _draft_files(pkg) / "run.py"
+    real_copy = tool_drafts._copy_regular
+
+    def copy_swapped(source: Path, destination: Path, budget: Any) -> None:
+        if source != run_py:
+            real_copy(source, destination, budget)
+            return
+        original = source.read_bytes()
+        source.write_text("print('swapped in')\n", encoding="utf-8")
+        try:
+            real_copy(source, destination, budget)
+        finally:
+            source.write_bytes(original)
+
+    monkeypatch.setattr(tool_drafts, "_copy_regular", copy_swapped)
+    draft_id, generation = _draft_identity(pkg)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["state"] == "succeeded"
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 1, reason=tool_builder._DRAFT_KEPT_NOT_ALL_PUBLISHED
+    )
+    assert (_current_version(pkg) / "run.py").read_text(encoding="utf-8") == (
+        "print('swapped in')\n"
+    )
+    assert run_py.read_text(encoding="utf-8") == _REVISED_RUN_PY
+
+
+@pytest.mark.parametrize(
+    "unknown", ["copied-out", "copied-in", "both", "the-draft-after-the-publish"]
+)
+def test_a_published_draft_whose_copy_cannot_be_compared_whole_stays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unknown: str
+) -> None:
+    """A digest the removal rests on cannot be taken: of the draft's files before
+    the copy, of the workspace after it, of both, or of the draft's files once the
+    version is published. Whether the draft holds only what was published is not
+    known, so it stays, and the job says that could not be confirmed."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    in_draft = os.fspath(_draft_files(pkg)) + os.sep
+    in_staging = os.fspath((tmp_path / "tools").resolve() / ".staging") + os.sep
+    published = [False]
+    real_digest = tool_drafts._file_digest
+    real_publish = tool_builder._publish_revised_version
+
+    def file_digest(path: str, budget: int | None) -> Any:
+        of_draft = path.startswith(in_draft)
+        of_copy = path.startswith(in_staging)
+        unseen = {
+            "copied-out": of_draft and not published[0],
+            "copied-in": of_copy,
+            "both": (of_draft or of_copy) and not published[0],
+            "the-draft-after-the-publish": of_draft and published[0],
+        }[unknown]
+        return None if unseen else real_digest(path, budget)
+
+    def publish(*args: Any) -> Any:
+        answer = real_publish(*args)
+        published[0] = True
+        return answer
+
+    monkeypatch.setattr(tool_drafts, "_file_digest", file_digest)
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+    draft_id, generation = _draft_identity(pkg)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["state"] == "succeeded"
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 1, reason=tool_builder._DRAFT_KEPT_UNCONFIRMED
+    )
+    assert _current_version(pkg).name != _TEST_VID
+    assert _draft_manifest(pkg)["publishing"]["job_id"] == job["job_id"]
+
+
+def _publish_cancelled_while_held(monkeypatch: pytest.MonkeyPatch, pkg: Path, step: str) -> None:
+    """Run one publish of the draft and cancel it while ``step`` -- ``"copy"``, the
+    copy of the draft into its staging, or ``"publish"``, the publisher -- is held
+    on its worker; then let that worker go on to its end. The worker held is the
+    real one, stopped where it is about to write the staging."""
+    entered = threading.Event()
+    release = threading.Event()
+    returned = threading.Event()
+
+    def hold() -> None:
+        entered.set()
+        release.wait(10)
+
+    if step == "copy":
+        real_carry_out = tool_drafts._carry_out
+
+        def carry_out(plan: Any, incoming: Path, known: list[str]) -> Any:
+            hold()
+            try:
+                return real_carry_out(plan, incoming, known)
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tool_drafts, "_carry_out", carry_out)
+    else:
+        real_validate = tools.validate_tool_content
+        real_publish = tool_builder._publish_revised_version
+
+        def validate(build_root: tools.BuildRoot, *, expected_name: str) -> str | None:
+            hold()
+            return real_validate(build_root, expected_name=expected_name)
+
+        def publish(*args: Any) -> Any:
+            try:
+                return real_publish(*args)
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(tools, "validate_tool_content", validate)
+        monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+    resolution = _current_resolution()
+    judged = _publish_judged(pkg)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(tool_builder.run_publish_draft("kbsearch", resolution, judged))
+        for _ in range(1000):
+            if entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert entered.is_set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(returned.wait, 10)
+
+    asyncio.run(scenario())
+
+
+def test_a_draft_publish_cancelled_while_its_copy_runs_leaves_the_staging_to_the_worker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while the copy of the draft runs on its worker: the worker goes
+    on and finishes the copy, so the staging is not removed beside it -- it holds
+    the whole copy afterwards. The draft, which the copy only read, is as it was,
+    and nothing is published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    before = _draft_as_it_is(pkg)
+
+    _publish_cancelled_while_held(monkeypatch, pkg, "copy")
+
+    [session] = _session_roots(tmp_path)
+    assert (session / "build" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (session / "build" / "tool.json").is_file()
+    assert _draft_as_it_is(pkg) == before
+    assert _versions(pkg) == [_TEST_VID]
+
+
+def test_a_draft_publish_cancelled_while_its_publisher_runs_lets_the_publish_finish(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelled while the publisher runs on its worker: the worker goes on, so the
+    staging it is publishing from is not removed beside it, and the version it
+    makes holds all of the draft's files. The mark stays -- whether the publish
+    went through was not known to the job -- and the list, finding the draft in
+    ``current``'s origin, shows it as published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+
+    _publish_cancelled_while_held(monkeypatch, pkg, "publish")
+
+    current = _current_version(pkg)
+    assert current.name != _TEST_VID
+    assert (current / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (current / "tool.json").is_file()
+    assert _draft_manifest(pkg)["publishing"] is not None
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "published"
+
+
+def test_a_draft_publish_the_publisher_refuses_takes_its_own_mark_back_and_leaves_the_rounds(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The operator broke the draft's ``tool.json``: the publisher refuses the
+    content and ``current`` stays. The job takes its own mark back -- the manifest
+    is as it was before the mark but for its generation, two on, the rounds above
+    all, since this publish was no round of theirs -- and the list shows the draft
+    open again. The draft holds what the staging did, so the staging goes and no
+    path is named."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    (_draft_files(pkg) / "tool.json").write_text("{broken", encoding="utf-8")
+    before = _draft_manifest(pkg)
+    draft_id, generation = before["draft_id"], before["generation"]
+
+    job = _publish_draft_job(pkg)
+
+    assert (job["state"], job["outcome"]) == ("failed", "failed")
+    assert job["error"].startswith(tool_builder._ERROR_PUBLISH_DRAFT_FAILED.format(reason=""))
+    assert job["draft_publish"] == _published_report(draft_id, generation + 2)
+    assert _draft_manifest(pkg) == {**before, "generation": generation + 2}
+    assert _versions(pkg) == [_TEST_VID]
+    assert _session_roots(tmp_path) == []
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "open"
+
+
+def test_a_draft_publish_meeting_a_base_moved_meanwhile_takes_its_mark_back_and_goes_stale(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``current`` is moved by hand while the publisher validates the content: it
+    does not publish over the move, and ``current`` stays where the hand put it.
+    The job says the tool changed during the publish, in words about a publish
+    rather than a revise, and takes its mark back; the list shows the draft as
+    stale, its base no longer current."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    draft_id, generation = _draft_identity(pkg)
+    other_vid = "20260728T020304Z-fedcba"
+    _copy_committed_version(pkg, other_vid)
+    real_validate = tools.validate_tool_content
+
+    def validate(build_root: tools.BuildRoot, *, expected_name: str) -> str | None:
+        assert tools.publish_current(_package_root(pkg), other_vid)
+        return real_validate(build_root, expected_name=expected_name)
+
+    monkeypatch.setattr(tools, "validate_tool_content", validate)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_FAILED.format(
+        reason=tool_builder._PUBLISH_DRAFT_REWORDED[tool_builder._ERROR_REVISE_TARGET_REPLACED]
+    )
+    assert job["draft_publish"] == _published_report(draft_id, generation + 2)
+    assert _current_version(pkg).name == other_vid
+    assert _versions(pkg) == sorted([_TEST_VID, other_vid])
+    assert _draft_manifest(pkg)["publishing"] is None
+    assert _session_roots(tmp_path) == []
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "stale"
+
+
+def test_a_failed_publish_from_a_draft_that_no_longer_holds_its_copy_keeps_the_staging(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The publisher fails once it has moved the content into the session's
+    ``shell``, and the draft's ``run.py`` was changed meanwhile: no draft holds
+    what the staging does, so the staging stays and the job names where the
+    content is. The mark is taken back all the same: nothing was published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    files = _draft_files(pkg)
+    draft_id, generation = _draft_identity(pkg)
+
+    def no_origin(build_root: tools.BuildRoot, origin: dict[str, Any]) -> bool:
+        (files / "run.py").write_text("print('changed meanwhile')\n", encoding="utf-8")
+        return False
+
+    monkeypatch.setattr(tools, "write_origin_meta", no_origin)
+
+    job = _publish_draft_job(pkg)
+
+    [session] = _session_roots(tmp_path)
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_FAILED.format(
+        reason=tool_builder._ERROR_ORIGIN_WRITE
+    )
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 2, retained=str(session / "shell")
+    )
+    assert (session / "shell" / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert (files / "run.py").read_text(encoding="utf-8") == "print('changed meanwhile')\n"
+    assert _draft_manifest(pkg)["publishing"] is None
+    assert _versions(pkg) == [_TEST_VID]
+
+
+def test_a_failed_publish_whose_content_became_a_version_leaves_it_and_names_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``current`` cannot be moved once the content is a version directory:
+    ``current`` stays, that directory stays where it is -- the job names it -- and
+    the session's staging goes. The mark is taken back: nothing was published."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    draft_id, generation = _draft_identity(pkg)
+    monkeypatch.setattr(
+        tools,
+        "publish_current",
+        lambda package_root, vid: tools.CurrentPublication(published=False, durable=False),
+    )
+
+    job = _publish_draft_job(pkg)
+
+    [made] = [vid for vid in _versions(pkg) if vid != _TEST_VID]
+    retained = _package_path(pkg) / tools._VERSIONS_DIRNAME / made
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_FAILED.format(
+        reason=tool_builder._ERROR_CURRENT_WRITE
+    )
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 2, retained=str(retained)
+    )
+    assert (retained / "run.py").read_text(encoding="utf-8") == _REVISED_RUN_PY
+    assert _current_version(pkg).name == _TEST_VID
+    assert _session_roots(tmp_path) == []
+    assert _draft_manifest(pkg)["publishing"] is None
+
+
+def test_a_mark_not_confirmed_on_disk_publishes_nothing_and_is_taken_back(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The mark is written, but its write is not confirmed on disk: the publisher is
+    never called -- ``current`` stays and ``versions/`` gains nothing -- the mark is
+    taken back, and the list shows the draft open."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    before = _draft_manifest(pkg)
+    draft_id, generation = before["draft_id"], before["generation"]
+    _manifest_writes_not_durable(monkeypatch)
+    publishes: list[Any] = []
+    real_publish = tool_builder._publish_revised_version
+
+    def publish(*args: Any) -> Any:
+        publishes.append(args)
+        return real_publish(*args)
+
+    monkeypatch.setattr(tool_builder, "_publish_revised_version", publish)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["error"] == tool_builder._ERROR_PUBLISH_DRAFT_MARK_UNCONFIRMED
+    assert job["draft_publish"] == _published_report(draft_id, generation + 2)
+    assert publishes == []
+    assert _versions(pkg) == [_TEST_VID]
+    assert _current_version(pkg).name == _TEST_VID
+    assert _draft_manifest(pkg) == {**before, "generation": generation + 2}
+    assert _session_roots(tmp_path) == []
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "open"
+
+
+def test_a_mark_that_cannot_be_taken_back_stays_and_the_job_says_so(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The publisher refuses the content, and the write taking the mark back is
+    refused too: the mark stays, the job names the draft at the generation the
+    mark wrote and says why it stays; the list shows the draft as not known."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    (_draft_files(pkg) / "tool.json").write_text("{broken", encoding="utf-8")
+    draft_id, generation = _draft_identity(pkg)
+    real_write = tools._write_package_file_atomic
+    manifest_writes: list[str] = []
+
+    def write(directory: Path, filename: str, data: bytes, expected: Any, **kwargs: Any) -> bool:
+        if filename == tool_drafts.MANIFEST_FILENAME:
+            manifest_writes.append(filename)
+            if len(manifest_writes) > 1:
+                return False
+        return real_write(directory, filename, data, expected, **kwargs)
+
+    monkeypatch.setattr(tools, "_write_package_file_atomic", write)
+
+    job = _publish_draft_job(pkg)
+
+    assert job["draft_publish"] == _published_report(
+        draft_id, generation + 1, reason=tool_builder._DRAFT_MARK_LEFT
+    )
+    assert len(manifest_writes) == 2
+    assert _draft_manifest(pkg)["publishing"]["job_id"] == job["job_id"]
+    [row] = client.get("/api/tools").json()["tools"]
+    assert row["draft"]["state"] == "unknown"
+
+
+def _hold_publish_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, Callable[[], Awaitable[InstallOutcome]], str]]:
+    """Admitted jobs are held rather than launched: each one's id, run and action."""
+    held: list[tuple[str, Callable[[], Awaitable[InstallOutcome]], str]] = []
+
+    def hold(job: Any, run: Callable[[], Awaitable[InstallOutcome]], action: str) -> str:
+        held.append((job.job_id, run, action))
+        return job.job_id
+
+    monkeypatch.setattr(tool_builder, "_launch_job", hold)
+    return held
+
+
+def _publish_body(pkg: Path, **overrides: Any) -> dict[str, Any]:
+    draft_id, generation = _draft_identity(pkg)
+    return {
+        "draft_id": draft_id,
+        "draft_generation": generation,
+        "expected_vid": _TEST_VID,
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize("name", ["kbsearch", "jobs", "draft"])
+def test_router_publishes_a_draft_as_it_is_and_its_job_is_polled_like_any_other(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str
+) -> None:
+    """202 with the job's id; the job is polled at the one endpoint every kind
+    shares, as a publish of a draft, and names the draft it removed. A tool may be
+    named ``jobs`` or ``draft``: its draft is published all the same."""
+    pkg = _seed_package(monkeypatch, tmp_path, name)
+    _first_round_of(monkeypatch, pkg, name)
+    draft_id, generation = _draft_identity(pkg)
+    held = _hold_publish_jobs(monkeypatch)
+
+    response = client.post(f"/api/tools/{name}/draft/publish", json=_publish_body(pkg))
+
+    assert response.status_code == 202
+    [(job_id, run, action)] = held
+    assert response.json() == {"job_id": job_id}
+    assert action == tool_builder._ACTION_PUBLISH_DRAFT
+    asyncio.run(tool_builder._run_job(job_id, run, action))
+    polled = client.get(f"/api/tools/jobs/{job_id}")
+    assert polled.status_code == 200
+    body = polled.json()
+    assert (body["state"], body["outcome"], body["kind"], body["tool_name"]) == (
+        "succeeded",
+        "published",
+        "publish_draft",
+        name,
+    )
+    assert body["draft"] is None
+    assert body["draft_publish"] == _published_report(draft_id, generation + 1, removed=True)
+    assert not tool_drafts.has_draft(_package_root(pkg))
+
+
+def test_no_route_declared_before_the_draft_publish_takes_its_requests() -> None:
+    """A tool may be named ``jobs`` or ``draft``, so ``POST /api/tools/jobs/draft/publish``
+    and ``POST /api/tools/draft/draft/publish`` must reach the draft publish:
+    Starlette serves the first route that matches path and method, so no route
+    declared before it may match both."""
+    routes = tools_router.router.routes
+    [index] = [
+        position
+        for position, route in enumerate(routes)
+        if getattr(route, "endpoint", None) is tools_router.publish_tool_draft
+    ]
+    for name in ("jobs", "draft"):
+        scope = {
+            "type": "http",
+            "path": f"/tools/{name}/draft/publish",
+            "root_path": "",
+            "method": "POST",
+        }
+        assert routes[index].matches(scope)[0] is Match.FULL
+        for route in routes[:index]:
+            assert route.matches(scope)[0] is not Match.FULL, getattr(route, "path", route)
+
+
+@pytest.mark.parametrize(
+    ("case", "status", "code"),
+    [
+        ("seen-gone", 409, "draft_gone"),
+        ("manifest-unreadable", 409, "draft_unusable"),
+        ("another-draft", 409, "draft_gone"),
+        ("another-generation", 409, "draft_changed"),
+        ("files-missing", 409, "draft_unusable"),
+        ("marked", 409, "draft_publishing"),
+        ("base-moved", 409, "version_mismatch"),
+        ("request-stale", 409, "version_mismatch"),
+        ("slot-taken", 409, "job_busy"),
+        ("no-such-tool", 404, None),
+        ("marked-while-waiting-for-the-slot", 409, "draft_changed"),
+    ],
+)
+def test_router_draft_publish_is_refused_by_the_first_case_that_holds(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    case: str,
+    status: int,
+    code: str | None,
+) -> None:
+    """Each refusal answers with its own status and code, its message telling the
+    operator about a publish, and makes no job. A draft whose base is not
+    ``current`` is refused although the request names ``current``; the draft is
+    judged once the slot is taken, so a change made while the request waited for
+    it is seen."""
+    pkg = _seed_package(monkeypatch, tmp_path)
+    _first_round(monkeypatch, pkg)
+    body = _publish_body(pkg)
+    name = "kbsearch"
+    draft = _draft_dir(pkg)
+    reservation: str | None = None
+    if case == "seen-gone":
+        shutil.rmtree(draft)
+    elif case == "manifest-unreadable":
+        (draft / tool_drafts.MANIFEST_FILENAME).write_text("{broken", encoding="utf-8")
+    elif case == "another-draft":
+        body["draft_id"] = "f" * 32
+    elif case == "another-generation":
+        body["draft_generation"] += 1
+    elif case == "files-missing":
+        shutil.rmtree(_draft_files(pkg))
+    elif case == "marked":
+        _rewrite_draft(pkg, publishing={"job_id": None, "at": "2026-10-30T00:00:00+00:00"})
+    elif case == "base-moved":
+        other_vid = "20260728T020304Z-fedcba"
+        _copy_committed_version(pkg, other_vid)
+        assert tools.publish_current(_package_root(pkg), other_vid)
+        body["expected_vid"] = other_vid
+    elif case == "request-stale":
+        body["expected_vid"] = "20260728T020304Z-fedcba"
+    elif case == "slot-taken":
+        reservation = tool_builder.reserve_sync_operation()
+        assert reservation is not None
+    elif case == "no-such-tool":
+        name = "nosuchtool"
+    else:
+        real_reserve = tool_builder.reserve_sync_operation
+
+        def reserve_while_marked() -> str | None:
+            tool_drafts.mark_publishing(
+                _package_root(pkg),
+                tool_drafts.directory_identity(_package_path(pkg)),
+                _draft_identity(pkg),
+                None,
+            )
+            return real_reserve()
+
+        monkeypatch.setattr(tool_builder, "reserve_sync_operation", reserve_while_marked)
+    held = _hold_publish_jobs(monkeypatch)
+
+    try:
+        response = client.post(f"/api/tools/{name}/draft/publish", json=body)
+    finally:
+        if reservation is not None:
+            tool_builder.release_sync_operation(reservation)
+
+    assert response.status_code == status
+    detail = response.json()["detail"]
+    if code is None:
+        assert detail == tools_router._TOOL_NOT_FOUND
+    else:
+        assert detail["code"] == code
+        if code == "draft_changed":
+            assert detail["message"] == tools_router._DRAFT_CHANGED_PUBLISH_MESSAGE
+        elif code == "draft_publishing":
+            assert detail["message"] == tools_router._DRAFT_PUBLISHING_PUBLISH_MESSAGE
+    assert held == []
+    assert tool_builder._JOBS == {}
+    assert tool_builder.any_job_active() is False
+
+
+def test_every_draft_publish_refusal_is_answered_by_the_route(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Whatever ``start_publish_draft_job`` refuses with -- every member of
+    ``PublishDraftRefusal`` -- the route answers it: 404 for a tool not found, 409
+    with the refusal as its code otherwise, never a 500."""
+    refusals: tuple[tool_builder.PublishDraftRefusal, ...] = typing.get_args(
+        tool_builder.PublishDraftRefusal
+    )
+    assert refusals
+    answered: dict[str, tuple[int, Any]] = {}
+    for refusal in refusals:
+
+        async def refusing(
+            name: str,
+            draft_id: str,
+            generation: int,
+            expected_vid: str,
+            *,
+            refusal: tool_builder.PublishDraftRefusal = refusal,
+        ) -> tool_builder.PublishDraftJobStart:
+            return tool_builder.PublishDraftJobStart(refusal=refusal)
+
+        monkeypatch.setattr(tool_builder, "start_publish_draft_job", refusing)
+        response = client.post(
+            "/api/tools/kbsearch/draft/publish",
+            json={"draft_id": "a" * 32, "draft_generation": 1, "expected_vid": _TEST_VID},
+        )
+        answered[refusal] = (response.status_code, response.json()["detail"])
+
+    assert set(answered) == set(refusals)
+    for refusal, (status, detail) in answered.items():
+        if refusal == "not_found":
+            assert (status, detail) == (404, tools_router._TOOL_NOT_FOUND)
+        else:
+            assert (status, detail["code"]) == (409, refusal)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"draft_generation": 1, "expected_vid": _TEST_VID},
+        {"draft_id": "a" * 32, "expected_vid": _TEST_VID},
+        {"draft_id": "a" * 32, "draft_generation": 1},
+        {"draft_id": "A" * 32, "draft_generation": 1, "expected_vid": _TEST_VID},
+        {"draft_id": "a" * 32 + "\n", "draft_generation": 1, "expected_vid": _TEST_VID},
+        {"draft_id": "a" * 32, "draft_generation": 0, "expected_vid": _TEST_VID},
+        {"draft_id": "a" * 32, "draft_generation": 1, "expected_vid": "current"},
+    ],
+    ids=[
+        "no-id",
+        "no-generation",
+        "no-version",
+        "uppercase",
+        "newline",
+        "generation-zero",
+        "version-out-of-shape",
+    ],
+)
+def test_router_draft_publish_refuses_a_body_out_of_shape_before_anything(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, body: dict[str, Any]
+) -> None:
+    _seed_package(monkeypatch, tmp_path)
+    started: list[Any] = []
+
+    async def start(*args: Any) -> Any:
+        started.append(args)
+        raise AssertionError("no submit is made for a body out of shape")
+
+    monkeypatch.setattr(tool_builder, "start_publish_draft_job", start)
+
+    response = client.post("/api/tools/kbsearch/draft/publish", json=body)
+
+    assert response.status_code == 422
+    assert started == []

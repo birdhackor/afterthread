@@ -20,8 +20,10 @@ monkeypatching ``llm_log.get_settings`` where a test needs a specific value.
 """
 
 import asyncio
+import errno
 import json
 import logging
+import os
 import re
 from collections.abc import Generator
 from types import SimpleNamespace
@@ -185,7 +187,7 @@ def test_stored_body_at_or_under_cap_is_unchanged(monkeypatch: pytest.MonkeyPatc
     untruncated -- the cap must never touch a body that already fits."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
     text = "x" * 1000
-    stored, truncated = llm_log._stored_body(text, [])
+    stored, truncated = llm_log._stored_body(text, llm_log._SecretSnapshot([], True))
     assert stored == text
     assert truncated is False
 
@@ -195,7 +197,7 @@ def test_stored_body_over_cap_is_hard_cut_with_marker(monkeypatch: pytest.Monkey
     marker appended in place of the last characters (not merely a bare
     slice), and reports truncated=True."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_body_max_chars=1000))
-    stored, truncated = llm_log._stored_body("y" * 5000, [])
+    stored, truncated = llm_log._stored_body("y" * 5000, llm_log._SecretSnapshot([], True))
     assert truncated is True
     assert len(stored) == 1000
     assert stored.endswith(llm_log._BODY_TRUNCATION_MARKER)
@@ -214,7 +216,7 @@ def test_stored_body_cap_smaller_than_marker_hard_cuts_without_it(
     Confirms the marker is DROPPED (not partially appended) and the result is
     a bare hard cut to exactly ``cap`` chars."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: SimpleNamespace(llm_log_body_max_chars=5))
-    stored, truncated = llm_log._stored_body("z" * 100, [])
+    stored, truncated = llm_log._stored_body("z" * 100, llm_log._SecretSnapshot([], True))
     assert truncated is True
     assert stored == "zzzzz"
 
@@ -346,8 +348,8 @@ def test_redaction_masks_known_secret_in_request_and_response(
 ) -> None:
     """A registered secret value is replaced by the redaction marker in BOTH a
     request message and the response, in the ring AND on the way to the JSONL
-    sink: the ONE choke point (_stored_body) covers every stored body, and both
-    sinks share the same already-redacted record, so the secret never lands in
+    sink: the ONE choke point (_stored_body) covers every stored body, and the
+    JSONL line is written from that stored record, so the secret never lands in
     memory OR on disk."""
     secret = "kb-live-key-abcdef123456"
     log_file = tmp_path / "llm.jsonl"
@@ -356,7 +358,7 @@ def test_redaction_masks_known_secret_in_request_and_response(
         "get_settings",
         lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
 
     _record(
@@ -377,10 +379,89 @@ def test_redaction_masks_known_secret_in_request_and_response(
     assert attempt["response_content"] is not None
     assert secret not in attempt["response_content"]
     assert llm_log._REDACTION_MARKER in attempt["response_content"]
-    # The JSONL sink wrote the SAME redacted record -- the secret never on disk.
+    # The JSONL line holds the marker too -- the secret never on disk.
     file_text = log_file.read_text(encoding="utf-8")
     assert secret not in file_text
     assert llm_log._REDACTION_MARKER in file_text
+
+
+def test_a_body_that_spells_a_secret_only_as_written_reaches_no_byte_of_the_jsonl_file(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PEM registered from a single-quoted ``.env`` line keeps ``\\n`` as two
+    characters; the bodies hold the key with a real line break, which a JSON line
+    writes as exactly those two characters. Each such body is stored as the
+    marker, and no byte of the file holds the secret."""
+    secret = "kb-pem-head\\nkb-pem-body"
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+    llm_log._reset_for_tests()
+
+    _record(messages=[{"role": "user", "content": text}], response=text)
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == llm_log._REDACTION_MARKER
+    assert attempt["response_content"] == llm_log._REDACTION_MARKER
+
+
+def _decoded_strings(value: Any) -> list[str]:
+    """Every string in a decoded JSON value, the keys of its objects included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for key, item in value.items() for s in (key, *_decoded_strings(item))]
+    if isinstance(value, list):
+        return [s for item in value for s in _decoded_strings(item)]
+    return []
+
+
+@pytest.mark.parametrize("entry", ["response", "request message", "advertised name"])
+def test_a_text_that_spells_a_secret_only_as_stored_reaches_no_string_the_detail_api_serves(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, entry: str
+) -> None:
+    """The text as received holds a lone surrogate where the known value has three
+    U+FFFD, so masking has nothing to find; ``_utf8_safe`` then makes the stored
+    string exactly the value. Its JSON literal writes the value's quote as ``\\"``,
+    so a check of the literal alone passes it. A response, a request message and an
+    advertised name go through the same choke point, and each is stored as the
+    redaction marker: no string the detail API serves holds the value."""
+    secret = 'abc\ufffd\ufffd\ufffd"'
+    text = 'abc\udcff"'
+    assert secret not in text
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+    llm_log._reset_for_tests()
+
+    if entry == "response":
+        _record(response=text)
+    elif entry == "request message":
+        _record(messages=[{"role": "user", "content": text}])
+    else:
+        _record(tools_advertised=[text])
+
+    log_id = client.get("/api/llm/logs").json()["logs"][0]["id"]
+    served = client.get(f"/api/llm/logs/{log_id}")
+    assert served.status_code == 200
+    detail = served.json()
+    attempt = detail["attempts"][0]
+    if entry == "response":
+        assert attempt["response_content"] == llm_log._REDACTION_MARKER
+    elif entry == "request message":
+        assert attempt["request_messages"][0]["content"] == llm_log._REDACTION_MARKER
+    else:
+        assert attempt["tools_advertised"] == [llm_log._REDACTION_MARKER]
+    # Decoded first: the response's own text escapes the quote, as a JSON literal
+    # does, so it would not hold the value even when a string served is the value.
+    assert [s for s in _decoded_strings(detail) if secret in s] == []
 
 
 def test_advertised_tool_names_go_through_the_same_redaction(
@@ -393,7 +474,7 @@ def test_advertised_tool_names_go_through_the_same_redaction(
     stored field that bypassed the redaction choke point -- and a name CAN
     legitimately be a registered value (a hand-edited ``.env`` holding
     ``TOKEN=kbsearch`` while ``kbsearch`` is an installed tool). Ordinary names
-    are untouched, and both sinks see the same masked record."""
+    are untouched, and the JSONL line holds the masked name too."""
     secret = "kbsearch-tool"  # also the name of an installed tool
     log_file = tmp_path / "llm.jsonl"
     monkeypatch.setattr(
@@ -401,7 +482,7 @@ def test_advertised_tool_names_go_through_the_same_redaction(
         "get_settings",
         lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
 
     _record(workflow="capture", tools_advertised=[secret, "notes"])
@@ -410,7 +491,7 @@ def test_advertised_tool_names_go_through_the_same_redaction(
     assert record is not None
     names = record["attempts"][0]["tools_advertised"]
     assert names == [llm_log._REDACTION_MARKER, "notes"]
-    # The JSONL sink wrote the SAME masked record -- the value never on disk.
+    # The JSONL line holds the masked name too -- the value never on disk.
     file_text = log_file.read_text(encoding="utf-8")
     assert secret not in file_text
 
@@ -423,7 +504,7 @@ def test_advertised_tool_names_keep_none_and_empty_apart(
     at all) stays None, and [] (a tools parameter rode, but nothing in it carried
     a readable name) stays []."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"kb-live-key-abcdef"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"kb-live-key-abcdef"}, True))
     llm_log._reset_for_tests()
 
     _record(workflow="capture", tools_advertised=[])
@@ -453,9 +534,9 @@ def test_one_secret_sweep_per_attempt_however_many_names(
     calls: list[int] = []
     secret = "kbsearch-tool"  # also the name of an installed tool
 
-    def counting_provider() -> set[str]:
+    def counting_provider() -> tuple[set[str], bool]:
         calls.append(1)
-        return {secret}
+        return {secret}, True
 
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
     monkeypatch.setattr(llm_log, "_secret_provider", counting_provider)
@@ -602,7 +683,7 @@ def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch
     """A too-short (<6 char) provider value is NEVER redacted: masking a 1-5 char
     value would shred ordinary prose, and a real key is never that short."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abc", "12345"})  # both < 6
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abc", "12345"}, True))  # both < 6
     llm_log._reset_for_tests()
 
     _record(response="abc appears here and 12345 too")
@@ -611,6 +692,40 @@ def test_redaction_skips_values_shorter_than_min(monkeypatch: pytest.MonkeyPatch
     body = record["attempts"][0]["response_content"]
     assert body == "abc appears here and 12345 too"  # untouched
     assert llm_log._REDACTION_MARKER not in body
+
+
+def test_redaction_adds_no_form_for_a_value_under_the_floor_though_it_holds_a_crlf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nc`` is five characters, under the floor: it adds no form -- not
+    itself, and not its normalized form -- so a body holding either is stored as
+    it is."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ab\r\nc"}, True))
+    llm_log._reset_for_tests()
+
+    _record(response="x ab\r\nc y ab\nc z")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["response_content"] == "x ab\r\nc y ab\nc z"
+
+
+def test_redaction_masks_a_value_and_its_normalized_form_in_one_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``ab\\r\\nab`` and its normalized form ``ab\\nab`` overlap in the body: the
+    value's occurrence ends where the form's begins. Both are found on the body as
+    it is and their ranges merged, so one marker covers the two, and the body's
+    other line breaks stay as they were."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ab\r\nab"}, True))
+    llm_log._reset_for_tests()
+
+    _record(response="head\r\nab\r\nab\nab tail\r\n")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    body = record["attempts"][0]["response_content"]
+    assert body == f"head\r\n{llm_log._REDACTION_MARKER} tail\r\n"
 
 
 def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -624,7 +739,7 @@ def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> No
         "get_settings",
         lambda: Settings(llm_log_body_max_chars=1000, llm_log_max_entries=50),
     )
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {secret})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
     llm_log._reset_for_tests()
     # 990 filler + the 16-char secret + trailing: the secret spans indices
     # 990..1006, so truncate-first would keep secret[:10] inside the 1000 cap.
@@ -637,47 +752,51 @@ def test_redaction_runs_before_truncation(monkeypatch: pytest.MonkeyPatch) -> No
     assert "SECRETABCD" not in body  # not even the prefix truncate-first would leak
 
 
-def test_redaction_provider_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_provider_that_raises_does_not_break_the_recording_and_stores_the_body_unrecorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A provider that RAISES must never break recording (the no-observer-failure
-    invariant): the interaction is still recorded, just unredacted."""
+    invariant): the interaction is still recorded, with its outcome. But a failure
+    to ask says nothing about what the secrets are, so the body is not checked
+    against nothing as if there were none: it is stored as the marker saying it
+    was not recorded."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
 
-    def _boom() -> set[str]:
+    def _boom() -> tuple[set[str], bool]:
         raise RuntimeError("secret provider exploded")
 
     monkeypatch.setattr(llm_log, "_secret_provider", _boom)
     llm_log._reset_for_tests()
 
     _record(response="a normal body with sk-secret-value inside")  # must not raise
-    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    summary = llm_log.list_summaries(1)[0]
+    record = llm_log.get_record(summary["id"])
     assert record is not None
-    # Recorded, and unredacted (provider failed -> degrade to raw text).
-    assert record["attempts"][0]["response_content"] == "a normal body with sk-secret-value inside"
+    assert summary["outcome"] == "ok"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
 
 
-def test_redaction_provider_iterator_raising_midyield_records_unredacted(
+def test_a_provider_whose_values_raise_midyield_stores_the_body_unrecorded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """F5: the provider values are materialized INSIDE _redact's guard, so a LAZY
-    provider (a generator) that raises PARTWAY through iteration -- not at call time --
-    still degrades to 'record unredacted' rather than breaking the recording. Without
-    the list() being inside the try, iterating the generator would raise straight into
-    the recorder."""
+    """The provider values are materialized INSIDE the snapshot's guard, so a
+    LAZY iterable that raises PARTWAY through iteration -- not at call time --
+    does not break the recording. What was yielded before it raised is not the
+    whole list either, so the body is stored as the marker saying it was not
+    recorded."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
 
-    def _lazy() -> Any:
+    def _values() -> Any:
         yield "first-secret-value-abcdef"
         raise RuntimeError("iterator exploded mid-yield")
 
-    monkeypatch.setattr(llm_log, "_secret_provider", _lazy)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: (_values(), True))
     llm_log._reset_for_tests()
 
     _record(response="body with first-secret-value-abcdef inside")  # must not raise
     record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
     assert record is not None
-    # Iteration raised before completing -> the whole redact degrades to raw text,
-    # so even the already-yielded value is left in place rather than half-masked.
-    assert record["attempts"][0]["response_content"] == "body with first-secret-value-abcdef inside"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
 
 
 def test_redaction_filters_non_string_provider_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -686,7 +805,7 @@ def test_redaction_filters_non_string_provider_values(monkeypatch: pytest.Monkey
     still masked."""
     secret = "real-secret-value-abcdef"
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: [None, 123456, secret])
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ([None, 123456, secret], True))
     llm_log._reset_for_tests()
 
     _record(response=f"body with {secret} inside")  # must not raise
@@ -702,7 +821,7 @@ def test_redaction_longest_first_leaves_no_suffix(monkeypatch: pytest.MonkeyPatc
     (a prefix of the longer) never leaves the longer's suffix exposed. Had the shorter
     run first, 'XYZ789' would survive after 'abcdef' was masked inside the longer."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdef", "abcdefXYZ789"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abcdef", "abcdefXYZ789"}, True))
     llm_log._reset_for_tests()
 
     _record(response="key=abcdefXYZ789 end")
@@ -719,7 +838,7 @@ def test_redaction_masks_trailing_prefix_fragment(monkeypatch: pytest.MonkeyPatc
     by an upstream boundary before _redact runs, so the full value never appears -- is
     masked at the tail, mirroring tools.redact_known_secrets."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"abcdefGHIJKLMN"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"abcdefGHIJKLMN"}, True))
     llm_log._reset_for_tests()
 
     _record(response="body ends with abcdefGHIJ")  # first 10 chars of the secret
@@ -737,7 +856,7 @@ def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPa
     ending in a 12-char prefix of the long secret must not leak a 6+-char run -- the old
     replace-first order masked the ``GHIJKL`` occurrence and stranded ``ABCDEF``."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"ABCDEFGHIJKLmnop", "GHIJKL"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"ABCDEFGHIJKLmnop", "GHIJKL"}, True))
     llm_log._reset_for_tests()
 
     _record(response="tail=ABCDEFGHIJKL")  # 12-char prefix of the long secret
@@ -748,15 +867,17 @@ def test_redaction_ranges_computed_on_original_text(monkeypatch: pytest.MonkeyPa
     assert body.endswith(llm_log._REDACTION_MARKER)
 
 
-def test_redaction_helper_failure_records_unredacted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """D36 round-5: ``_mask_known_secrets`` now runs INSIDE the same guard as the
-    provider call -- a MemoryError (or any other surprise) from the masking step
-    itself must still degrade to 'record unredacted', the SAME no-observer-failure
-    invariant the provider-failure tests above already cover for the provider side.
-    Before this fix the call sat OUTSIDE the try, so this exact failure would have
-    escaped straight into the recorder."""
+def test_a_masking_failure_does_not_break_the_recording_and_stores_the_body_unrecorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_mask_known_secrets`` runs inside guards -- a MemoryError (or
+    any other surprise) from the masking itself must not escape into the recorder.
+    ``_redact`` keeps the text when it fails; the last check, of the text as
+    stored and as written, fails the same way, and a body it could not check is
+    stored as the marker saying it was not recorded: no secret was found, none was
+    looked for."""
     monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
-    monkeypatch.setattr(llm_log, "_secret_provider", lambda: {"real-secret-value-abcdef"})
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"real-secret-value-abcdef"}, True))
 
     def _boom(text: str, secrets: list[str]) -> str:
         raise MemoryError("mask blew up")
@@ -767,7 +888,166 @@ def test_redaction_helper_failure_records_unredacted(monkeypatch: pytest.MonkeyP
     _record(response="a normal body, must not raise")  # must not raise
     record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
     assert record is not None
-    assert record["attempts"][0]["response_content"] == "a normal body, must not raise"
+    assert record["attempts"][0]["response_content"] == llm_log._UNCHECKED_MARKER
+
+
+def test_a_list_that_is_not_whole_stores_every_body_unrecorded_and_keeps_the_rest(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The provider says the values it gives are not all of them -- a ``.env`` could
+    not be read. Every body is stored as the marker saying it was not recorded: the
+    request messages, the advertised names and the response, in the ring and in
+    the JSONL file, and none of their text reaches either. What the record says
+    about the call itself is kept: its outcome, its usage, how many attempts."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"kb-live-key-abcdef"}, False))
+    llm_log._reset_for_tests()
+
+    recorder = llm_log.LlmInteractionRecorder(workflow="capture", model="m")
+    recorder.begin_attempt([{"role": "user", "content": "plain words"}], tools_advertised=["notes"])
+    recorder.record_usage(
+        SimpleNamespace(usage={"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8})
+    )
+    recorder.record_response("plain answer")
+    recorder.finish(outcome="ok", error=None)
+
+    summary = llm_log.list_summaries(1)[0]
+    record = llm_log.get_record(summary["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == llm_log._UNCHECKED_MARKER
+    assert attempt["tools_advertised"] == [llm_log._UNCHECKED_MARKER]
+    assert attempt["response_content"] == llm_log._UNCHECKED_MARKER
+    assert (summary["outcome"], summary["attempts"]) == ("ok", 1)
+    assert summary["usage"] == {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+    file_text = log_file.read_text(encoding="utf-8")
+    assert "plain words" not in file_text
+    assert "plain answer" not in file_text
+
+
+def test_a_whole_list_with_no_secrets_keeps_every_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No known secrets, and that is all of them: nothing to mask, nothing
+    withheld. The empty list that is whole is not the empty list that is not. Not
+    red at HEAD, which kept every body; red for a marker stored on any empty list."""
+    monkeypatch.setattr(llm_log, "get_settings", lambda: Settings(llm_log_max_entries=50))
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: (set(), True))
+    llm_log._reset_for_tests()
+
+    _record(messages=[{"role": "user", "content": "plain words"}], response="plain answer")
+
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    attempt = record["attempts"][0]
+    assert attempt["request_messages"][0]["content"] == "plain words"
+    assert attempt["response_content"] == "plain answer"
+
+
+def test_the_last_check_stores_a_body_unrecorded_for_a_list_that_is_not_whole() -> None:
+    """The last stage on its own: a body that holds nothing a partial list knows is
+    still not called clean, since the values the list lacks are unknown. The
+    recorder tests above show the same through the whole pipeline."""
+    whole = llm_log._SecretSnapshot(["kb-live-key-abcdef"], True)
+    partial = llm_log._SecretSnapshot(["kb-live-key-abcdef"], False)
+    check = llm_log._checked_as_stored_and_written
+
+    assert check("plain words", whole) == "plain words"
+    assert check("plain words", partial) == llm_log._UNCHECKED_MARKER
+    assert check("", partial) == llm_log._UNCHECKED_MARKER
+
+
+def test_the_last_check_keeps_a_body_only_when_neither_form_holds_a_known_value() -> None:
+    """The last stage on its own, with a whole list. The string as stored is what
+    the ring, the detail API and the AI 日誌 page hand on; its JSON literal is what
+    a JSONL line writes. A body that holds a known value in only one of the two is
+    the redaction marker either way, and one that holds none in either is kept."""
+    # Three U+FFFD and a quote. The literal writes the quote as \", so of the two
+    # forms of a body that is this value, only the string as stored holds it.
+    known_as_stored = 'abc\ufffd\ufffd\ufffd"'
+    # A backslash and an n, which is how the literal writes a real line break, so
+    # of a body holding that line break, only the literal holds this value.
+    known_as_written = "kb-pem-head\\nkb-pem-body"
+    secrets = llm_log._SecretSnapshot(sorted([known_as_stored, known_as_written]), True)
+    check = llm_log._checked_as_stored_and_written
+
+    def literal(text: str) -> str:
+        return json.dumps(text, ensure_ascii=False)[1:-1]
+
+    stored_only = known_as_stored
+    written_only = "it signs with kb-pem-head\nkb-pem-body"
+    assert known_as_stored not in literal(stored_only)
+    assert known_as_written not in written_only and known_as_written in literal(written_only)
+
+    assert check(stored_only, secrets) == llm_log._REDACTION_MARKER
+    assert check(written_only, secrets) == llm_log._REDACTION_MARKER
+    assert check("plain words", secrets) == "plain words"
+
+
+def test_the_last_check_counts_the_start_of_a_known_value_ending_the_stored_string() -> None:
+    """The string as stored is checked with the same matcher as its literal, so the
+    start of a known value at its end counts there too: the end of a body may be
+    where a value was cut off. This body ends with the first seven characters of the
+    value, a quote among them, which the literal writes as ``\\"``, so only the
+    string as stored ends with them; the value is not whole in either."""
+    known = 'abc\ufffd\ufffd\ufffd"-and-the-rest'
+    body = 'it ends abc\ufffd\ufffd\ufffd"'
+    secrets = llm_log._SecretSnapshot([known], True)
+    literal = json.dumps(body, ensure_ascii=False)[1:-1]
+    assert known not in body
+    assert llm_log._mask_known_secrets(literal, secrets.values) == literal
+
+    assert llm_log._checked_as_stored_and_written(body, secrets) == llm_log._REDACTION_MARKER
+
+
+def test_a_secret_found_and_a_body_not_checked_are_told_apart_in_the_log(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two recordings of the same body. With the whole list, the body spells a
+    known secret as written, so it is stored as the marker saying a secret was
+    found. With a list that is not whole, nothing was found -- nothing could be
+    looked for -- so it is stored as the marker saying it was not recorded, which
+    a reader cannot take for a secret having been there. Red before the fix: the
+    list that was not whole stored the marker saying a secret was found."""
+    secret = "kb-pem-head\\nkb-pem-body"
+    text = "it signs with kb-pem-head\nkb-pem-body"
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    stored: list[str] = []
+    for complete in (True, False):
+        monkeypatch.setattr(llm_log, "_secret_provider", lambda c=complete: ({secret}, c))
+        llm_log._reset_for_tests()
+        _record(response=text)
+        record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+        assert record is not None
+        stored.append(record["attempts"][0]["response_content"])
+
+    found, unchecked = stored
+    assert found == llm_log._REDACTION_MARKER
+    assert unchecked != llm_log._REDACTION_MARKER
+    assert unchecked == llm_log._UNCHECKED_MARKER
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+
+
+@pytest.mark.parametrize("name", ["_REDACTION_MARKER", "_UNCHECKED_MARKER"])
+def test_no_key_or_token_can_spell_a_marker(name: str) -> None:
+    """Each marker is a CJK body in the •••[…]••• fence, and no run of ASCII
+    characters in it is as long as the redactor's floor: a value of ASCII
+    characters, as keys and tokens are, can neither equal a marker nor be found
+    in one, so masking never cuts into a marker and a marker is never read as a
+    value. Red before the fix for the marker saying a body was not recorded, which
+    did not exist; the redaction marker was already written this way."""
+    marker = getattr(llm_log, name)
+
+    assert marker.startswith("•••[") and marker.endswith("]•••")
+    assert max(map(len, re.findall(r"[\x00-\x7f]+", marker)), default=0) < llm_log._MIN_SECRET_LEN
 
 
 def test_file_sink_writes_valid_jsonl(tmp_path: Any, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -875,6 +1155,236 @@ def test_file_sink_unicode_encode_error_does_not_break_the_call(
     assert "llm interaction workflow=capture" in caplog.text
 
 
+# --- a JSONL line checked as it is appended ---------------------------------
+
+
+def _file_sink_at(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> Any:
+    """Turn the JSONL sink on at a file under ``tmp_path`` and start an empty log."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(llm_log_file=str(log_file), llm_log_max_entries=50),
+    )
+    llm_log._reset_for_tests()
+    return log_file
+
+
+def _a_record(**overrides: Any) -> llm_log.LlmInteractionRecord:
+    """A finished record built by hand, every field set: two attempts, the second
+    with no response, escapes and non-ASCII in the texts."""
+    fields: dict[str, Any] = {
+        "id": 7,
+        "workflow": "capture",
+        "model": "gpt-x",
+        "started_at": "2026-10-31T01:02:03.456789+00:00",
+        "finished_at": "2026-10-31T01:02:04.000001+00:00",
+        "duration_ms": 543,
+        "outcome": "upstream_error",
+        "error": "APIConnectionError: the upstream LLM request failed",
+        "usage": {"prompt_tokens": 123456, "completion_tokens": 5, "total_tokens": 123461},
+        "attempts": [
+            llm_log.LlmAttempt(
+                request_messages=[
+                    {"role": "system", "content": 'sys "引號"\n'},
+                    {"role": "user", "content": "使用者\t\\"},
+                ],
+                request_chars=999,  # not the sum: the line keeps what the record holds
+                response_content="回覆\x01",
+                response_chars=3,
+                error="ValidationError",
+                usage={"prompt_tokens": 1, "completion_tokens": None, "total_tokens": None},
+                truncated=True,
+                tools_advertised=["notes", "kb"],
+            ),
+            llm_log.LlmAttempt(request_messages=[{"role": "user", "content": "again"}]),
+        ],
+    }
+    fields.update(overrides)
+    return llm_log.LlmInteractionRecord(**fields)
+
+
+def test_a_jsonl_line_in_which_nothing_known_occurs_is_the_detail_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Nothing known occurs: the line is ``json.dumps`` of the detail and a new
+    line, byte for byte, every field as the ring holds it -- counts that do not
+    add up, a missing response, names, errors and usage included."""
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({"kb-live-key-abcdef"}, True))
+    record = _a_record()
+
+    llm_log._write_file_sink(record)
+
+    expected = json.dumps(llm_log._record_detail(record), ensure_ascii=False) + "\n"
+    assert log_file.read_bytes() == expected.encode("utf-8")
+
+
+def test_a_known_value_only_in_a_timestamp_or_a_count_leaves_the_jsonl_line_as_the_detail(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The known values lie wholly in fixed content: a stretch of the start time,
+    and a token count with its key. The line holds them, and is the detail byte
+    for byte: no text of it is the marker."""
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    known = {"2026-10-31T01:02", '"prompt_tokens": 123456'}
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: (known, True))
+    record = _a_record()
+
+    llm_log._write_file_sink(record)
+
+    expected = json.dumps(llm_log._record_detail(record), ensure_ascii=False) + "\n"
+    assert log_file.read_bytes() == expected.encode("utf-8")
+
+
+def test_a_known_value_from_a_key_into_a_body_leaves_markers_in_the_jsonl_line_not_the_ring(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The value begins in the key and quote before a message body and runs into
+    the body: the body alone does not hold it, the line as appended does. Every
+    text of that line is the marker -- the bodies, the response, the names, the
+    model -- its counts are the marker's, and the backend's own words stay. The
+    ring and the detail API keep the record as it was stored."""
+    secret = 'content": "DO-NOT-STORE-12345'
+    body = "DO-NOT-STORE-12345 more"
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+
+    _record(
+        workflow="capture",
+        model="gpt-x",
+        messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": body}],
+        response="plain answer",
+        tools_advertised=["notes"],
+    )
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    line = json.loads(log_file.read_text(encoding="utf-8"))
+    marker = llm_log._REDACTION_MARKER
+    attempt = line["attempts"][0]
+    assert [m["role"] for m in attempt["request_messages"]] == ["system", "user"]
+    assert [m["content"] for m in attempt["request_messages"]] == [marker, marker]
+    assert (attempt["response_content"], attempt["tools_advertised"]) == (marker, [marker])
+    assert (attempt["request_chars"], attempt["response_chars"]) == (2 * len(marker), len(marker))
+    assert (line["workflow"], line["model"], line["outcome"]) == ("capture", marker, "ok")
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    kept = record["attempts"][0]
+    assert [m["content"] for m in kept["request_messages"]] == ["sys", body]
+    assert kept["request_chars"] == len("sys") + len(body)
+    assert (kept["response_content"], record["model"]) == ("plain answer", "gpt-x")
+
+
+def test_a_known_value_ending_in_the_new_line_after_the_jsonl_line_reaches_no_byte_of_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The line is checked with the new line the sink appends after it. The value
+    runs from the end of the last advertised name through the closing brackets
+    into that new line -- three characters of the name, fewer than the mask's
+    trailing guard covers -- so only a check of the line with its new line sees
+    it, and the name is the marker in the line."""
+    secret = 'abc"]}]}\n'
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+
+    _record(tools_advertised=["tool-abc"])
+
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    line = json.loads(log_file.read_text(encoding="utf-8"))
+    assert line["attempts"][0]["tools_advertised"] == [llm_log._REDACTION_MARKER]
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["tools_advertised"] == ["tool-abc"]
+
+
+def test_a_jsonl_line_whose_known_value_takes_in_a_field_nothing_vouched_for_is_not_written(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A field the line does not know -- one a later change adds to the detail --
+    is free text no marker replaces. A known value in it is still there once every
+    text is the marker, so the line is not written, and one warning says so with
+    the record's id and nothing it holds. The ring keeps the record."""
+    secret = "kb-extra-field-secret-abcdef"
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", lambda: ({secret}, True))
+    detail = llm_log._record_detail
+    monkeypatch.setattr(
+        llm_log, "_record_detail", lambda record: {**detail(record), "extra": f"holds {secret}"}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _record(messages=[{"role": "user", "content": "plain words"}])
+
+    assert not log_file.exists() or log_file.read_bytes() == b""
+    assert "llm log file sink left out record" in caplog.text
+    assert secret not in caplog.text
+    assert "plain words" not in caplog.text
+    assert len(llm_log.list_summaries(10)) == 1
+
+
+def test_the_jsonl_line_is_checked_with_every_value_the_record_knew(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The value is known while the attempt and its response are recorded, and no
+    longer when the line is written. The line is checked with it still: the seam
+    it makes with a key is found, and the body is the marker in the line."""
+    secret = 'content": "DO-NOT-STORE-12345'
+    calls: list[int] = []
+
+    def provider() -> tuple[set[str], bool]:
+        calls.append(1)
+        return ({secret} if len(calls) <= 2 else set()), True
+
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", provider)
+
+    _record(messages=[{"role": "user", "content": "DO-NOT-STORE-12345 more"}], response="ok")
+
+    assert len(calls) == 3  # the attempt, the response, the line
+    assert secret.encode("utf-8") not in log_file.read_bytes()
+    line = json.loads(log_file.read_text(encoding="utf-8"))
+    assert line["attempts"][0]["request_messages"][0]["content"] == llm_log._REDACTION_MARKER
+
+
+def test_a_list_not_whole_when_the_jsonl_line_is_written_keeps_every_text_of_the_line_unrecorded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """Whole while the steps are recorded, not whole when the line is written: no
+    text of the line can be called clean. Every text of it is the marker saying it
+    was not recorded -- the model and the error too -- while the backend's words,
+    the usage and the counts of what the line holds stay. The ring keeps every
+    body as it was stored."""
+    calls: list[int] = []
+
+    def provider() -> tuple[set[str], bool]:
+        calls.append(1)
+        return {"kb-live-key-abcdef"}, len(calls) <= 2
+
+    log_file = _file_sink_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(llm_log, "_secret_provider", provider)
+
+    _record(
+        model="gpt-x",
+        messages=[{"role": "user", "content": "plain words"}],
+        response="plain answer",
+        outcome="upstream_error",
+        error="APIConnectionError: the upstream LLM request failed",
+    )
+
+    unchecked = llm_log._UNCHECKED_MARKER
+    line = json.loads(log_file.read_text(encoding="utf-8"))
+    attempt = line["attempts"][0]
+    assert (line["model"], line["error"]) == (unchecked, unchecked)
+    assert (line["workflow"], line["outcome"]) == ("capture", "upstream_error")
+    assert attempt["request_messages"] == [{"role": "user", "content": unchecked}]
+    assert attempt["response_content"] == unchecked
+    assert (attempt["request_chars"], attempt["response_chars"]) == (len(unchecked),) * 2
+    record = llm_log.get_record(llm_log.list_summaries(1)[0]["id"])
+    assert record is not None
+    assert record["attempts"][0]["request_messages"][0]["content"] == "plain words"
+    assert record["attempts"][0]["response_content"] == "plain answer"
+
+
 # --- JSONL file-sink rotation (D34) -----------------------------------------
 
 
@@ -977,6 +1487,45 @@ def test_file_sink_rotation_same_second_uses_unique_targets(
     assert (tmp_path / "llm.jsonl.20260716-120000Z-1").read_text(encoding="utf-8").startswith("y")
     # The live file holds only the newest record.
     assert "second fresh line" in log_file.read_text(encoding="utf-8")
+
+
+def test_file_sink_rotation_that_cannot_look_at_its_target_name_rotates_nothing(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An earlier segment holds the stamped name, and the ``lstat`` of that name
+    fails with EIO: whether anything is there is not known, so this rotation does
+    not happen. The earlier segment keeps its content, nothing else is renamed, and
+    the record is appended to the oversized file."""
+    log_file = tmp_path / "llm.jsonl"
+    monkeypatch.setattr(
+        llm_log,
+        "get_settings",
+        lambda: Settings(
+            llm_log_file=str(log_file), llm_log_file_max_bytes=1_000_000, llm_log_max_entries=50
+        ),
+    )
+    monkeypatch.setattr(llm_log, "_rotation_stamp", lambda: "20260716-120000Z")
+    llm_log._reset_for_tests()
+    earlier = tmp_path / "llm.jsonl.20260716-120000Z"
+    earlier.write_text("earlier segment\n", encoding="utf-8")
+    log_file.write_text("x" * 1_000_050 + "\n", encoding="utf-8")
+    real_lstat = os.lstat
+
+    def lstat(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(target) == os.fspath(earlier):
+            raise OSError(errno.EIO, os.strerror(errno.EIO), os.fspath(target))
+        return real_lstat(target, *args, **kwargs)
+
+    monkeypatch.setattr(llm_log.os, "lstat", lstat)
+
+    _record(workflow="capture", response="appended without a rotation")
+
+    assert earlier.read_text(encoding="utf-8") == "earlier segment\n"
+    rotated = sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("llm.jsonl."))
+    assert rotated == ["llm.jsonl.20260716-120000Z"]
+    appended = log_file.read_text(encoding="utf-8")
+    assert appended.startswith("x" * 1_000_050 + "\n")
+    assert "appended without a rotation" in appended
 
 
 class _RaisingHandler(logging.Handler):

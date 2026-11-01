@@ -188,12 +188,15 @@ def _conflict() -> HTTPException:
 async def _advertised_tools_lock() -> AsyncIterator[list[tools.ToolFailure]]:
     """Hold the shared tools lock across one complete tool-advertising request.
 
-    Acquisition runs off-loop because a destroyer that won the race may hold the
-    exclusive side briefly. The synchronous binding lets ``enabled_llm_tools``
-    capture this exact descriptor into every handler. The ``finally`` covers
-    normal output, LLM/config errors, validation errors, and request
-    cancellation; a subprocess has its own inherited reference if it outlives
-    the backend-side close.
+    Acquisition runs off-loop (``tools.acquire_shared_tools_lock_async``) because
+    a destroyer that won the race may hold the exclusive side briefly; a request
+    cancelled while it waits leaves no lock behind. The synchronous binding lets
+    ``enabled_llm_tools`` capture this exact descriptor into every handler. The
+    ``finally`` closes the descriptor without an await, so it covers normal
+    output, LLM/config errors, validation errors, and request cancellation, an
+    anyio scope's included, which would stop an await there before it ran; a
+    subprocess has its own inherited reference if it outlives the backend-side
+    close.
 
     It also collects the request's tool failures (web-v6 §8.2) into the yielded
     list, which the route puts in its response as ``tool_failures``. The scope
@@ -201,12 +204,12 @@ async def _advertised_tools_lock() -> AsyncIterator[list[tools.ToolFailure]]:
     can call a tool without its failures being collected.
     """
 
-    fd = await run_in_threadpool(tools.acquire_shared_tools_lock)
+    fd = await tools.acquire_shared_tools_lock_async()
     try:
         with tools.bind_request_tools_lock(fd), tools.collect_tool_failures() as failures:
             yield failures
     finally:
-        await run_in_threadpool(tools.release_tools_lock, fd)
+        tools.release_tools_lock(fd)
 
 
 def _failure_entries(failures: list[tools.ToolFailure]) -> list[ToolFailureEntry]:
