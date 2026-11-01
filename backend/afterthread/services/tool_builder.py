@@ -1202,8 +1202,9 @@ def _workspace_kept_error(session_root: Path) -> str:
     """
     return (
         "工作階段結束後，有 run_shell 指令或 write_file 寫入無法確認已經停止：這次的成果不會發布，"  # noqa: RUF001
-        f"暫存工作區原地保留在 {session_root}。寫入可能還在後端裡進行：先重新啟動後端，"  # noqa: RUF001
-        "再確認沒有殘留的程序還在用它，之後可以手動刪除。"  # noqa: RUF001
+        f"暫存工作區原地保留在 {session_root}。先重新啟動後端；"  # noqa: RUF001
+        "AI 的指令可能留下後端看不到的背景程序，找出並停掉之後再刪，"  # noqa: RUF001
+        "做法見 README〈.staging 殘留清理〉。"
     )
 
 
